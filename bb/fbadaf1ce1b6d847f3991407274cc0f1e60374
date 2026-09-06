@@ -1,0 +1,27 @@
+src/ir.rs
+  s_8ae19895f34c5b::t_805355b79a884c 150,200
+src/paths.rs
+  s_8ae19895f34c5b::t_3888c6aa7ef3b6 45-49,52-71,73-84
+  s_8ae19895f34c5b::t_917aa6d082afc0 1-44,85
+  s_8ae19895f34c5b::t_6f355007847f68 50-51,72
+src/lib.rs
+  s_8ae19895f34c5b::t_e67f4343be600c 10
+.github/workflows/ci.yml
+  s_8ae19895f34c5b::t_fd6e053ebbb25a 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "bbfbadaf1ce1b6d847f3991407274cc0f1e60374",
+  "prompts": {},
+  "sessions": {
+    "s_8ae19895f34c5b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdfefb0f-547b-4a50-a50f-e923c1baf084",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": null
+    }
+  }
+}
