@@ -55,6 +55,10 @@ drove status
 
 `drove` with no subcommand is equivalent to `drove up`. Use `--profile review` for a named profile and `--session NAME` for a named Herdr session.
 
+## Development
+
+Run `make ci` to check formatting, clippy, tests, docs, and the security audit locally — the same checks CI runs.
+
 ## Safety model
 
 - Drove mutates only resources recorded in its machine-local ownership state.
