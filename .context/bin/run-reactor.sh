@@ -12,6 +12,7 @@
 # What it cannot survive: the pane, herdr session, or machine going away. After
 # a reboot, run the line above again — the reactor resumes from its last ack.
 set -uo pipefail
+set -m   # job control: a backgrounded child gets its own process group even without setsid
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REACTOR="${1:-cursor-commit-reactor.sh}"
 case "$REACTOR" in /*) ;; *) REACTOR="$HERE/$REACTOR" ;; esac
@@ -28,10 +29,20 @@ MAX_RAPID="${SUPERVISOR_MAX_RAPID:-5}"   # this many crashes inside RAPID_WINDOW
 RAPID_WINDOW=120
 
 rapid=0; window_start=$(date +%s)
-trap 'echo "supervisor: stopped by user"; exit 0' INT TERM
+child=""
+stop() {
+  echo "supervisor: stopped by user"
+  # `set -m` above puts the backgrounded reactor in its own process group
+  # (pgid == its pid), so signaling that group also reaches any cursor-agent
+  # or claude child it spawned, not just the reactor shell itself.
+  [ -n "$child" ] && kill -TERM -- "-$child" 2>/dev/null
+  exit 0
+}
+trap stop INT TERM
 
 while :; do
-  bash "$REACTOR"; rc=$?
+  bash "$REACTOR" & child=$!
+  wait "$child"; rc=$?; child=""
   case "$rc" in
     0)   echo "supervisor: reactor exited cleanly"; exit 0 ;;
     3)   echo "supervisor: another reactor holds the lock — not respawning"; exit 3 ;;

@@ -183,9 +183,10 @@ check_index_lock
 
 tail -n +1 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
   seq="$(jq -r '.seq // empty' <<<"$line" 2>/dev/null)"; [ -z "$seq" ] && continue
-  # 3. trigger only on completed work: controller results/commit decisions, or a
-  #    sanctioned reactor's result (doc-worker reports its doc edits this way)
-  jq -e '((.by==null) and (.type=="result" or (.type=="decision" and .key=="commit-message")))
+  # 3. trigger only on completed work: controller results/commit decisions
+  #    (by= absent, or by=controller per DECISIONS.md), or a sanctioned
+  #    reactor's result (doc-worker reports its doc edits this way)
+  jq -e '(((.by==null) or (.by=="controller")) and (.type=="result" or (.type=="decision" and .key=="commit-message")))
          or (.by=="doc-worker" and .type=="result")' \
     <<<"$line" >/dev/null 2>&1 || continue
   done_through="$(acked_through)"; done_through="${done_through:-0}"
