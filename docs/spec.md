@@ -1,15 +1,15 @@
-# Drove — Versioned Herdr Workspaces
+# Drove — Versioned Terminal Workspaces
 
 **Created:** 2026-09-05
 **Status:** Ready for implementation
 
 ## Core Value
 
-A repository can define, share, and recreate its Herdr working environment with one command without taking control of unrelated user resources.
+A repository can define, share, and recreate its terminal working environment with one command without taking control of unrelated user resources. Drove versions the workspace; the backend supplies the terminal. Herdr and the Radiator hub are backends, and Herdr is the first flavor — a backend's own placement and layout vocabulary sits alongside a shared core every backend honors in full.
 
 ## Problem Statement
 
-Herdr layouts are currently assembled through imperative scripts that create and connect workspaces, tabs, panes, agents, and supporting processes. Those scripts encode one layout well, but the resulting workspace is difficult to inspect, adapt, share, and version as part of a repository. Developers need a repository-owned `Drovefile` that can report drift and safely reconcile its managed resources on demand.
+Terminal layouts are currently assembled through imperative scripts that create and connect workspaces, panes, agents, and supporting processes. Those scripts encode one layout well, but the resulting workspace is difficult to inspect, adapt, share, and version as part of a repository. Developers need a repository-owned `Drovefile` that can report drift and safely reconcile its managed resources on demand, on whichever backend the project targets.
 
 ## Requirements
 
@@ -18,11 +18,11 @@ Herdr layouts are currently assembled through imperative scripts that create and
 - A repository can contain a human-readable, committable `Drovefile`.
 - A user can establish the repository's default workspace by running one command from that repository.
 - A repository can define a default profile and additional named profiles.
-- Running the command compares the selected profile with the current Herdr state before making changes.
+- Running the command compares the selected profile with the current state of the selected backend before making changes.
 - Running the command reconciles the selected profile and then exits.
 - Running the command repeatedly against an already-matching workspace makes no changes.
 - Drove reports whether a profile is `in sync`, `out of sync`, or `not running` without requiring reconciliation.
-- A `Drovefile` can declare Herdr workspaces, tabs, panes, agents, long-running commands, and health expectations.
+- A `Drovefile` can declare workspaces, panes, agents, long-running commands, and health expectations, using the core vocabulary every backend supports plus a backend's own flavor (Herdr's `tab` and split placement, for example).
 - A `Drovefile` can declare explicit, repeatable bootstrap tasks for local setup.
 - New or changed bootstrap tasks are shown to the user and require approval before execution.
 - Approval remains valid until the corresponding bootstrap task changes.
@@ -46,7 +46,6 @@ Herdr layouts are currently assembled through imperative scripts that create and
 - Rewriting tracked project files during reconciliation.
 - A public module registry.
 - Replacing supervision internal to reactors or agents.
-- Managing terminal environments outside Herdr.
 
 ## Constraints
 
@@ -58,6 +57,12 @@ Herdr layouts are currently assembled through imperative scripts that create and
 - **Compatibility:** Drove supports macOS, Linux, and Windows.
 
 ## Key Decisions
+
+### Core and Flavors
+
+- **Decision:** Drove has a core resource model — workspace, pane, task, profile — plus per-backend flavors for terminology only that backend understands. Herdr's flavor holds `tab`, split placement, and ratios. Not every core field is honored equally on every backend: a small set of graded capabilities (workspace `cwd`/`env` among them) can be partially supported, and a backend that can't honor one must report the affected action as `unsupported` rather than silently drop the field. Today Radiator drops workspace `cwd` and `env` without reporting `unsupported` (tracked as a follow-up); pane-level `cwd`/`env` are unaffected.
+- **Alternatives considered:** Making Herdr's tabs and splits part of the core resource model; one union trait covering every backend's verbs.
+- **Rationale:** Tabs and splits are Herdr's own display concept, not something every backend has. Treating them as core forced other backends to fake or silently drop them. Placement, not the resource itself, is the flavor concern.
 
 ### Reconciliation Model
 

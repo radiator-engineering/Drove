@@ -51,16 +51,18 @@ also carries the raw binaries and their SHA256 checksums.
 Add a `Drovefile` to a repository:
 
 ```python
+backend("herdr")
+
 profile(
     name = "default",
     workspaces = [
         workspace(
             name = "development",
-            tabs = [
-                tab(
+            panes = [
+                herdr.tab(
                     name = "main",
                     label = "editor + tests",
-                    split = "right",
+                    split = herdr.RIGHT,
                     ratios = [0.67],
                     panes = [
                         pane(name = "editor"),
@@ -73,7 +75,7 @@ profile(
 )
 ```
 
-A pane can run a command, host a coding agent, and gate its readiness on output or a port. A `task` runs a one-shot setup step with a `check` that lets Drove skip it once it has run. See the [Drovefile reference](docs/drovefile.md) for every resource and field, and `examples/log-driven/Drovefile` for a full multi-agent workspace.
+`backend(...)` declares which backend the project reconciles onto; `herdr` is the Herdr flavor's namespace for placement (tabs, splits, ratios). A pane can run a command, host a coding agent, and gate its readiness on output or a port. A `task` runs a one-shot setup step with a `check` that lets Drove skip it once it has run. See the [Drovefile reference](docs/drovefile.md) for every resource and field, and `examples/log-driven/Drovefile` for a full multi-agent workspace.
 
 Then run:
 
@@ -86,7 +88,7 @@ drove up
 
 `drove render` prints the compiled model as a flat, ordered list of resources, each with a content digest. It does no backend I/O. `drove plan` and `drove status` compare the model to the live backend and report drift. `drove up`, the default command, applies the plan. Reconciliation is being wired in backend by backend; see the reference for the current state of each command.
 
-Use `--profile NAME` for a named profile, `--session NAME` for a named backend session, and `--file PATH` when Drove cannot find the `Drovefile` by searching parent directories.
+Use `--profile NAME` for a named profile, `--backend ID` / `--target NAME` (or `--session NAME` on Herdr) to override the declared backend and instance, and `--file PATH` when Drove cannot find the `Drovefile` by searching parent directories. Run `drove lint` to catch a stale `was = "..."` rename or a task with no `check`.
 
 ## Development
 
@@ -108,4 +110,4 @@ Run `make ci` to check formatting, clippy, tests, docs, and the security audit l
 - `2`: a valid profile is out of sync
 - `3`: the backend is not running or its socket cannot be reached
 
-See the [Drovefile reference](docs/drovefile.md), [migration guide](docs/migration.md), and [product spec](docs/spec.md).
+See the [Drovefile reference](docs/drovefile.md), [migration guide](docs/migration.md), [v2 to v3 upgrade guide](docs/upgrading-v3.md), and [product spec](docs/spec.md).
