@@ -1,0 +1,49 @@
+tests/cli.rs
+  s_4ee0ab32fe4243::t_7b8bb12368aba8 30-103
+src/model.rs
+  s_4ee0ab32fe4243::t_97d5af3cbe263d 22-40,44-48,62-63
+  s_4ee0ab32fe4243::t_750e395f845c20 452-453,685-686
+  s_4ee0ab32fe4243::t_516373430c8eac 669-674
+src/backend/mod.rs
+  s_4ee0ab32fe4243::t_6b6c690fd75afd 7
+src/dsl.rs
+  s_4ee0ab32fe4243::t_a8805801e4e490 231-233
+  s_4ee0ab32fe4243::t_5eb6f2e299cede 116-132
+  s_4ee0ab32fe4243::t_6945260cbf8158 22
+  s_4ee0ab32fe4243::t_103d092307f3b3 143-151,163,166,168-175,180-187,192-197
+  s_4ee0ab32fe4243::t_9b3afcd3a4c00c 248-253,260
+  s_4ee0ab32fe4243::t_516373430c8eac 176-179,188-191,547-550
+  s_4ee0ab32fe4243::t_6e433839bac584 18
+  s_4ee0ab32fe4243::t_c2046aa2412038 167
+  s_4ee0ab32fe4243::t_586a77310abd1c 198,531-546,551-552
+  s_4ee0ab32fe4243::t_0f99304c9d6343 25
+  s_4ee0ab32fe4243::t_64c8b50bf9eebb 530
+src/cli.rs
+  s_4ee0ab32fe4243::t_7ff89ec4fcc9fa 265
+  s_4ee0ab32fe4243::t_b30e3056177c79 351-385
+  s_4ee0ab32fe4243::t_8e1ef22c6f98cc 38-49,53
+  s_4ee0ab32fe4243::t_faff38e033251b 135-137,150,152,158,161,166-167,179
+  s_4ee0ab32fe4243::t_516373430c8eac 141-142
+  s_4ee0ab32fe4243::t_b56c7c847ce04a 264,272,278
+  s_4ee0ab32fe4243::t_8b25348d6eb603 12
+src/backend/select.rs
+  s_4ee0ab32fe4243::t_516373430c8eac 194,287
+  s_4ee0ab32fe4243::t_dfb79bc6f394b4 129-131
+  s_4ee0ab32fe4243::t_aa6952bf1c29b1 1-128,132-193,195-286,288-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7a8fe38f30006b4c7a3fdf1abcf4ebb417b306f2",
+  "prompts": {},
+  "sessions": {
+    "s_4ee0ab32fe4243": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3224561f-f13f-47ad-aa09-9bb1365e8363",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
