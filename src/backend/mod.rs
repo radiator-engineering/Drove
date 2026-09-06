@@ -3,6 +3,7 @@
 //! ([`herdr::HerdrClient`]); Radiator's hub is the second (PR 5).
 
 pub mod herdr;
+pub mod radiator;
 
 use std::{collections::BTreeMap, path::Path};
 
