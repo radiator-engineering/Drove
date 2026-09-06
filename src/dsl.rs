@@ -8,17 +8,18 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value as JsonValue;
 use starlark::{
     any::ProvidesStaticType,
     environment::{FrozenModule, Globals, GlobalsBuilder, Module},
     eval::{Evaluator, FileLoader},
     starlark_module,
     syntax::{AstModule, Dialect},
-    values::{FrozenHeapName, Value, none::NoneType},
+    values::{FrozenHeapName, Value},
 };
 
 use crate::model::{DroveConfig, Profile, canonical_digest};
@@ -27,56 +28,91 @@ const PRELUDE: &str = r#"
 def _compact(values):
     return {k: v for (k, v) in values.items() if v != None and v != [] and v != {}}
 
-def pane(id, label = None, cwd = None, command = [], env = {}):
+def _serve_candidates(serve):
+    if serve == None or len(serve) == 0:
+        return []
+    if type(serve[0]) == "string":
+        return [serve]
+    return serve
+
+def any_of(*argvs):
+    return list(argvs)
+
+def output(text):
+    return {"kind": "output", "value": text}
+
+def port(n):
+    return {"kind": "port", "value": n}
+
+def cmd(argv):
+    return {"kind": "cmd", "value": argv}
+
+def file(path):
+    return {"kind": "file", "path": path}
+
+def agent(kind, args = [], prompt = None, name = None):
     return _compact({
-        "type": "pane",
-        "id": id,
+        "kind": kind,
+        "args": args,
+        "prompt": prompt,
+        "name": name,
+    })
+
+def pane(name, label = None, cwd = None, env = {}, serve = None, ready = None,
+         after = [], adopt = None, agent = None, on_start = None, on_stop = None):
+    return _compact({
+        "name": name,
         "label": label,
         "cwd": cwd,
-        "command": command,
         "env": env,
+        "serve": _serve_candidates(serve),
+        "ready": ready,
+        "after": after,
+        "adopt": adopt,
+        "agent": agent,
+        "on_start": on_start,
+        "on_stop": on_stop,
     })
 
-def split(direction, ratio, first, second):
-    return {
-        "type": "split",
-        "direction": direction,
-        "ratio": ratio,
-        "first": first,
-        "second": second,
-    }
-
-def tab(id, label, layout):
-    return {"id": id, "label": label, "layout": layout}
-
-def workspace(id, label, tabs, cwd = "."):
-    return {"id": id, "label": label, "cwd": cwd, "tabs": tabs}
-
-def agent(id, pane, kind, name = None, args = []):
+def tab(name, label = None, panes = [], split = "right", ratios = []):
     return _compact({
-        "id": id,
-        "pane": pane,
-        "kind": kind,
         "name": name,
-        "args": args,
+        "label": label,
+        "panes": panes,
+        "split": split,
+        "ratios": ratios,
     })
 
-def bootstrap(id, check, run, inputs = [], depends_on = []):
-    return {
-        "id": id,
-        "check": check,
-        "run": run,
-        "inputs": inputs,
-        "depends_on": depends_on,
-    }
+def workspace(name, label = None, cwd = ".", env = {}, tabs = []):
+    return _compact({
+        "name": name,
+        "label": label,
+        "cwd": cwd,
+        "env": env,
+        "tabs": tabs,
+    })
 
-def profile(name, workspaces = [], agents = [], bootstrap = []):
-    _emit_profile({
+def task(name, run = [], check = None, inputs = [], after = [], auto = True,
+         on_start = None, on_stop = None):
+    return _compact({
+        "name": name,
+        "run": run,
+        "check": check,
+        "inputs": inputs,
+        "after": after,
+        "auto": auto,
+        "on_start": on_start,
+        "on_stop": on_stop,
+    })
+
+def profile(name, workspaces = [], tasks = [], extends = None, without = []):
+    return _emit_profile(_compact({
         "name": name,
         "workspaces": workspaces,
-        "agents": agents,
-        "bootstrap": bootstrap,
-    })
+        "tasks": tasks,
+        "extends": extends,
+        "without": without,
+    }))
 "#;
 
 #[derive(Debug)]
@@ -87,17 +123,20 @@ pub struct CompiledDrovefile {
 }
 
 #[derive(Debug, ProvidesStaticType, Default)]
-struct ProfileStore(RefCell<Vec<serde_json::Value>>);
+struct ProfileStore(RefCell<Vec<JsonValue>>);
 
 #[starlark_module]
 fn drove_globals(builder: &mut GlobalsBuilder) {
-    fn _emit_profile(value: Value, eval: &mut Evaluator) -> anyhow::Result<NoneType> {
+    fn _emit_profile<'v>(
+        value: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
         let store = eval
             .extra
             .and_then(|extra| extra.downcast_ref::<ProfileStore>())
             .context("Drove evaluator profile store is missing")?;
         store.0.borrow_mut().push(value.to_json_value()?);
-        Ok(NoneType)
+        Ok(value)
     }
 }
 
@@ -146,21 +185,141 @@ pub fn compile(path: &Path) -> Result<CompiledDrovefile> {
         &mut stack,
     )?;
 
-    let values = store.0.into_inner();
-    if values.is_empty() {
+    let raw_profiles = store.0.into_inner();
+    if raw_profiles.is_empty() {
         bail!("Drovefile did not declare any profiles");
     }
-    let profiles = values
-        .into_iter()
-        .map(serde_json::from_value::<Profile>)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("invalid profile declaration")?;
+    let profiles = resolve_profiles(raw_profiles, &repo_root)?;
 
     Ok(CompiledDrovefile {
         config: DroveConfig::new(profiles)?,
         repo_root,
         source_digest: canonical_digest(&sources)?,
     })
+}
+
+/// Resolves `extends`/`without` composition and `file()` prompt references
+/// against already-emitted profiles, in declaration order, entirely in Rust
+/// after Starlark evaluation has finished (the sandbox never touches the
+/// filesystem or other profiles during evaluation itself).
+fn resolve_profiles(raw_profiles: Vec<JsonValue>, repo_root: &Path) -> Result<Vec<Profile>> {
+    let mut resolved: BTreeMap<String, (Vec<JsonValue>, Vec<JsonValue>)> = BTreeMap::new();
+    let mut profiles = Vec::with_capacity(raw_profiles.len());
+
+    for mut raw in raw_profiles {
+        resolve_file_prompts(&mut raw, repo_root)?;
+        let name = raw
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .context("profile declaration is missing `name`")?
+            .to_owned();
+        let mut workspaces = raw
+            .get("workspaces")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut tasks = raw
+            .get("tasks")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(extends) = raw.get("extends").and_then(JsonValue::as_str) {
+            let (base_workspaces, base_tasks) = resolved
+                .get(extends)
+                .with_context(|| format!("profile `{name}` extends unknown profile `{extends}`"))?;
+            let mut inherited_workspaces = base_workspaces.clone();
+            inherited_workspaces.append(&mut workspaces);
+            workspaces = inherited_workspaces;
+            let mut inherited_tasks = base_tasks.clone();
+            inherited_tasks.append(&mut tasks);
+            tasks = inherited_tasks;
+        }
+
+        if let Some(without) = raw.get("without").and_then(JsonValue::as_array) {
+            let excluded: Vec<&str> = without.iter().filter_map(JsonValue::as_str).collect();
+            for name_to_drop in &excluded {
+                if !workspaces.iter().any(|workspace| {
+                    workspace.get("name").and_then(JsonValue::as_str) == Some(*name_to_drop)
+                }) {
+                    bail!(
+                        "profile `{name}` declares without = [\"{name_to_drop}\"] for an unknown workspace"
+                    );
+                }
+            }
+            if !excluded.is_empty() {
+                workspaces.retain(|workspace| {
+                    let workspace_name = workspace.get("name").and_then(JsonValue::as_str);
+                    !workspace_name.is_some_and(|name| excluded.contains(&name))
+                });
+            }
+        }
+
+        resolved.insert(name.clone(), (workspaces.clone(), tasks.clone()));
+        profiles.push(serde_json::json!({
+            "name": name,
+            "workspaces": workspaces,
+            "tasks": tasks,
+        }));
+    }
+
+    profiles
+        .into_iter()
+        .map(serde_json::from_value::<Profile>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid profile declaration")
+}
+
+/// Recursively resolves `prompt = file("repo/relative/path")` into the file's
+/// text content (D25), validating the path stays inside the repository.
+fn resolve_file_prompts(value: &mut JsonValue, repo_root: &Path) -> Result<()> {
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(prompt) = map.get("prompt")
+                && let Some(file_path) = file_reference_path(prompt)
+            {
+                let text = read_repo_file(repo_root, file_path)?;
+                map.insert("prompt".to_owned(), JsonValue::String(text));
+            }
+            for child in map.values_mut() {
+                resolve_file_prompts(child, repo_root)?;
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items.iter_mut() {
+                resolve_file_prompts(item, repo_root)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn file_reference_path(value: &JsonValue) -> Option<&str> {
+    let object = value.as_object()?;
+    if object.get("kind").and_then(JsonValue::as_str) != Some("file") {
+        return None;
+    }
+    object.get("path").and_then(JsonValue::as_str)
+}
+
+fn read_repo_file(repo_root: &Path, relative: &str) -> Result<String> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        bail!("file(\"{relative}\") must stay inside the repository");
+    }
+    let path = repo_root.join(relative_path);
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve file(\"{relative}\")"))?;
+    if !canonical.starts_with(repo_root) {
+        bail!("file(\"{relative}\") escapes the repository");
+    }
+    fs::read_to_string(&canonical).with_context(|| format!("cannot read file(\"{relative}\")"))
 }
 
 fn compile_module(
@@ -271,9 +430,8 @@ profile(
     name = "default",
     workspaces = [
         workspace(
-            id = "dev",
-            label = "dev",
-            tabs = [tab(id = "main", label = "main", layout = pane(id = "shell"))],
+            name = "dev",
+            tabs = [tab(name = "main", panes = [pane(name = "shell")])],
         ),
     ],
 )
@@ -309,7 +467,7 @@ profile(
         let directory = tempdir().expect("tempdir");
         fs::write(
             directory.path().join("layout.star"),
-            "main_tab = tab(id = \"main\", label = \"main\", layout = pane(id = \"shell\"))",
+            "main_tab = tab(name = \"main\", panes = [pane(name = \"shell\")])",
         )
         .expect("write helper");
         fs::write(
@@ -318,7 +476,7 @@ profile(
 load("layout.star", "main_tab")
 profile(
     name = "default",
-    workspaces = [workspace(id = "dev", label = "dev", tabs = [main_tab])],
+    workspaces = [workspace(name = "dev", tabs = [main_tab])],
 )
 "#,
         )
@@ -327,14 +485,153 @@ profile(
         let first = compile(&directory.path().join("Drovefile")).expect("compile");
         fs::write(
             directory.path().join("layout.star"),
-            "main_tab = tab(id = \"main\", label = \"changed\", layout = pane(id = \"shell\"))",
+            "main_tab = tab(name = \"main\", label = \"changed\", panes = [pane(name = \"shell\")])",
         )
         .expect("change helper");
         let second = compile(&directory.path().join("Drovefile")).expect("recompile");
         assert_ne!(first.source_digest, second.source_digest);
         assert_eq!(
-            second.config.profiles["default"].workspaces[0].tabs[0].label,
+            second.config.profiles["default"].workspaces[0].tabs[0].label(),
             "changed"
         );
+    }
+
+    #[test]
+    fn profile_extends_and_without_compose_workspaces() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+default_ws = workspace(name = "control", tabs = [tab(name = "main", panes = [pane(name = "shell")])])
+files_ws = workspace(name = "files", tabs = [tab(name = "files", panes = [pane(name = "editor")])])
+
+profile(name = "default", workspaces = [default_ws, files_ws])
+profile(name = "core", extends = "default", without = ["files"])
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        let core = compiled.config.profile("core").expect("core profile");
+        assert_eq!(core.workspaces.len(), 1);
+        assert_eq!(core.workspaces[0].name, "control");
+    }
+
+    #[test]
+    fn profile_extends_composes_child_workspaces_with_inherited_ones() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+control_ws = workspace(name = "control", tabs = [tab(name = "main", panes = [pane(name = "shell")])])
+extra_ws = workspace(name = "extra", tabs = [tab(name = "extra", panes = [pane(name = "editor")])])
+
+profile(name = "default", workspaces = [control_ws])
+profile(name = "core", extends = "default", workspaces = [extra_ws])
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        let core = compiled.config.profile("core").expect("core profile");
+        let names: Vec<&str> = core
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.name.as_str())
+            .collect();
+        assert_eq!(names, ["control", "extra"]);
+    }
+
+    #[test]
+    fn without_an_unknown_workspace_fails() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+default_ws = workspace(name = "control", tabs = [tab(name = "main", panes = [pane(name = "shell")])])
+
+profile(name = "default", workspaces = [default_ws])
+profile(name = "core", extends = "default", without = ["typo"])
+"#,
+        )
+        .expect("write fixture");
+
+        let error = compile(&directory.path().join("Drovefile")).expect_err("unknown without");
+        assert!(error.to_string().contains("unknown workspace"));
+    }
+
+    #[test]
+    fn profile_extends_unknown_profile_fails() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\")\nprofile(name = \"core\", extends = \"missing\")",
+        )
+        .expect("write fixture");
+        let error = compile(&directory.path().join("Drovefile")).expect_err("unknown extends");
+        assert!(error.to_string().contains("extends unknown profile"));
+    }
+
+    #[test]
+    fn profile_returns_the_value_it_registers() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+result = profile(name = "default")
+_check = result["name"]
+"#,
+        )
+        .expect("write fixture");
+        compile(&directory.path().join("Drovefile")).expect("compile");
+    }
+
+    #[test]
+    fn resolves_file_prompt_at_compile_time() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(directory.path().join("prompt.md"), "Read the brief.").expect("write prompt");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review", agent = agent("claude", prompt = file("prompt.md"))),
+        ])]),
+    ],
+)
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        let profile = compiled.config.profile("default").expect("profile");
+        let agent = profile.workspaces[0].tabs[0].panes[0]
+            .agent
+            .as_ref()
+            .expect("agent");
+        assert_eq!(agent.prompt.as_deref(), Some("Read the brief."));
+    }
+
+    #[test]
+    fn file_prompt_cannot_escape_repository() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review", agent = agent("claude", prompt = file("../outside.md"))),
+        ])]),
+    ],
+)
+"#,
+        )
+        .expect("write fixture");
+        let error = compile(&directory.path().join("Drovefile")).expect_err("escape");
+        assert!(error.to_string().contains("repository") || error.to_string().contains("resolve"));
     }
 }

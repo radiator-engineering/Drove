@@ -12,6 +12,9 @@ use interprocess::local_socket::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::{Backend, Capabilities, ProcessInfo};
+use crate::model::SplitDirection;
+
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -169,6 +172,114 @@ impl HerdrClient {
             }),
         )?;
         Ok(())
+    }
+
+    pub fn report_metadata(
+        &self,
+        workspace_id: &str,
+        tokens: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.request(
+            "workspace.report_metadata",
+            json!({
+                "workspace_id": workspace_id,
+                "source": "drove",
+                "tokens": tokens,
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+impl Backend for HerdrClient {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            tabs: true,
+            // PR 3 implements split_pane/set_ratio/rename_pane.
+            splits_and_ratios: false,
+            workspace_env: true,
+            pane_command_at_create: true,
+            agent_start: true,
+            // PR 3 implements prompt_agent.
+            agent_prompt: false,
+            adopt_caller: true,
+            metadata_tokens: true,
+            // PR 3 implements process_info.
+            process_info: false,
+            events: true,
+        }
+    }
+
+    fn caller_pane_id(&self) -> Option<String> {
+        env::var("HERDR_PANE_ID").ok().filter(|id| !id.is_empty())
+    }
+
+    fn snapshot(&self) -> Result<SessionSnapshot> {
+        HerdrClient::snapshot(self)
+    }
+
+    fn create_workspace(&self, label: &str, cwd: &Path) -> Result<String> {
+        HerdrClient::create_workspace(self, label, cwd)
+    }
+
+    fn create_tab(
+        &self,
+        workspace_id: &str,
+        tab_label: &str,
+        root: Value,
+    ) -> Result<ExportedLayout> {
+        HerdrClient::apply_layout(self, workspace_id, None, tab_label, root)
+    }
+
+    fn split_pane(
+        &self,
+        _pane_id: &str,
+        _direction: SplitDirection,
+        _ratio: f64,
+        _command: Option<&[String]>,
+        _cwd: Option<&Path>,
+    ) -> Result<String> {
+        bail!("pane.split is not implemented yet (PR 3)")
+    }
+
+    fn close_pane(&self, _pane_id: &str) -> Result<()> {
+        bail!("pane.close is not implemented yet (PR 3)")
+    }
+
+    fn set_ratio(&self, _tab_id: &str, _ratios: &[f64]) -> Result<()> {
+        bail!("layout.set_split_ratio is not implemented yet (PR 3)")
+    }
+
+    fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<()> {
+        HerdrClient::rename_workspace(self, workspace_id, label)
+    }
+
+    fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+        HerdrClient::rename_tab(self, tab_id, label)
+    }
+
+    fn rename_pane(&self, _pane_id: &str, _label: &str) -> Result<()> {
+        bail!("pane.rename is not implemented yet (PR 3)")
+    }
+
+    fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()> {
+        HerdrClient::start_agent(self, pane_id, name, kind, args)
+    }
+
+    fn prompt_agent(&self, _pane_id: &str, _prompt: &str) -> Result<()> {
+        bail!("agent.prompt is not implemented yet (PR 3)")
+    }
+
+    fn process_info(&self, _pane_id: &str) -> Result<Option<ProcessInfo>> {
+        bail!("process info via pane inspection is not implemented yet (PR 3)")
+    }
+
+    fn report_tokens(
+        &self,
+        address: &str,
+        tokens: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        HerdrClient::report_metadata(self, address, tokens)
     }
 }
 
@@ -357,7 +468,7 @@ fn connect(path: &Path) -> std::io::Result<Stream> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::BufReader, thread};
+    use std::thread;
 
     use interprocess::local_socket::{Listener, ListenerOptions, traits::Listener as _};
 

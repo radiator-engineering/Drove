@@ -1,8 +1,8 @@
-# Drovefile reference
+# Drovefile reference (schema version 2)
 
 `Drovefile` is deterministic Starlark evaluated from the repository root. It can use ordinary Starlark expressions and repository-local `load()` statements, but Drove exposes no network, clock, environment, filesystem, or command-execution functions during evaluation.
 
-Every file must declare a `default` profile. Logical IDs are stable ownership addresses and must be unique in their scope.
+Every file must declare a `default` profile. Five resource kinds — `workspace`, `tab`, `pane`, `agent`, `task` — share one profile-scoped namespace for `after`, `on_start`/`on_stop`, and adoption references. Names must match `[a-z][a-z0-9_-]{0,31}`, except tab names, which are free-form placement labels (tabs are a Herdr display hint, not part of the shared reference namespace).
 
 ## `profile`
 
@@ -10,107 +10,115 @@ Every file must declare a `default` profile. Logical IDs are stable ownership ad
 profile(
     name = "default",
     workspaces = [],
-    agents = [],
-    bootstrap = [],
+    tasks = [],
+    extends = None,
+    without = [],
 )
 ```
 
-Additional profiles can share values loaded from `.star` files:
+`extends` composes profiles by name; `without` removes named workspaces from the composed list:
 
 ```python
-load("drove/common.star", "development_workspace")
-
-profile(name = "default", workspaces = [development_workspace])
-profile(name = "review", workspaces = [development_workspace])
+profile("default", workspaces = [control, maintenance, files])
+profile("core", extends = "default", without = ["files"])
 ```
 
-Load paths are repository-root-relative. Absolute paths, missing files, escaping symlinks, duplicate IDs, missing references, and dependency cycles are errors.
+`extends` must reference an already-declared profile. `profile()` returns the value it registers. Composition is resolved after the whole file evaluates — the sandbox never touches other profiles or the filesystem during Starlark evaluation itself.
 
 ## Workspaces and tabs
 
 ```python
 workspace(
-    id = "development",
-    label = "development",
+    name = "development",
+    label = None,      # defaults to `name`
     cwd = ".",
+    env = {},
     tabs = [
         tab(
-            id = "main",
-            label = "main",
-            layout = pane(id = "shell", label = "shell"),
+            name = "main",
+            label = "editor + tests",
+            split = "right",       # "right" or "down"
+            ratios = [0.67],       # len(panes) - 1 entries, each in [0.05, 0.95]
+            panes = [
+                pane(name = "editor"),
+                pane(name = "tests"),
+            ],
         ),
     ],
 )
 ```
 
-`cwd` values are repository-relative. The `id` is Drove's stable logical identity; `label` is Herdr presentation and can be reconciled independently.
+A tab lists its panes and a split direction; there is no binary split tree on the surface. A backend without tabs or splits flattens the layout and warns.
 
-## Pane layouts
-
-A tab has one pane or a binary split tree:
+## Panes
 
 ```python
-split(
-    direction = "right",
-    ratio = 0.67,
-    first = pane(id = "editor", label = "editor"),
-    second = split(
-        direction = "down",
-        ratio = 0.5,
-        first = pane(id = "tests", label = "tests"),
-        second = pane(
-            id = "server",
-            label = "server",
-            cwd = "server",
-            command = ["cargo", "run"],
-            env = {"RUST_LOG": "info"},
-        ),
+pane(
+    name = "server",
+    label = None,           # defaults to `name`
+    cwd = "server",
+    env = {"RUST_LOG": "info"},
+    serve = ["cargo", "run"],
+    ready = None,            # output("text"), port(n), or cmd([...])
+    after = [],               # names of panes/tasks that must be ready first
+    adopt = None,             # "caller", at most one pane per profile
+    agent = None,
+    on_start = None,
+    on_stop = None,
+)
+```
+
+`serve` is the long-running process; a pane without `serve` is a plain terminal. `serve = any_of([argv1], [argv2])` tries each candidate argv in order and records the first whose executable is on `PATH`. Exactly one pane per profile may declare `adopt = "caller"`; Drove never creates, moves, or replaces that pane — it is the invoking terminal.
+
+Readiness gates `after`: `output("watching")` matches pane output, `port(8080)` probes a TCP port, `cmd(["curl", "-f", "..."])` runs a command. The reconciler is planned to re-check readiness on every reconcile, not just at start; this PR only compiles readiness into the IR.
+
+`on_start` and `on_stop` are argv hooks Drove is planned to run once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and backend ids in the environment. Task and hook execution are not implemented yet — the planner in this PR always reports the profile as in sync.
+
+## Agents
+
+An agent is a property of its pane:
+
+```python
+pane(
+    name = "review",
+    agent = agent(
+        kind = "claude",
+        args = ["--model", "sonnet"],
+        prompt = "Read .context/handoffs/review.md and do only that.",
     ),
 )
 ```
 
-Directions are `right` and `down`; ratios must be between `0.05` and `0.95`. Commands are argv arrays, not shell strings. They must remain running for the pane to remain part of the desired layout.
+`prompt` is either an inline string (capped at 2 KB) or `file("repo/relative/path")`, resolved into the prompt text at compile time. The available `kind` and argument values are defined by the installed backend.
 
-## Agents
+## Tasks
 
-Agents reference a logical pane ID and start after Herdr returns its runtime pane ID:
-
-```python
-agent(
-    id = "review",
-    pane = "review-pane",
-    kind = "cursor",
-    name = "review",
-    args = ["--model", "composer-2.5-fast"],
-)
-```
-
-The available `kind` and argument values are defined by the installed Herdr version.
-
-## Bootstrap tasks
-
-Bootstrap tasks are one-shot, convergent setup actions:
+Tasks are one-shot, convergent setup actions:
 
 ```python
-bootstrap(
-    id = "install-hooks",
-    check = ["./scripts/install-hooks", "--check"],
+task(
+    name = "install-hooks",
     run = ["./scripts/install-hooks"],
+    check = ["./scripts/install-hooks", "--check"],
     inputs = ["scripts/install-hooks"],
-    depends_on = [],
+    after = [],
+    auto = True,
+    on_start = None,
+    on_stop = None,
 )
 ```
 
-Both `check` and `run` are argv arrays. Drove requires approval for the task declaration, the complete loaded Drovefile source, and every declared input before it executes either command. If the approved check succeeds, Drove skips the run command. After running, the check must succeed.
-
-Task dependencies form a directed acyclic graph and run in dependency order.
+If `check` succeeds, Drove is planned to skip `run`. `auto = True` (the default) is planned to run the task during reconciliation once its `after` set is ready; `auto = False` requires an explicit `drove run <name>`. Task dependencies (`after`) form a directed acyclic graph together with pane `after` references, since both live in the same namespace. This PR validates that graph but does not execute tasks; the planner always reports the profile as in sync.
 
 ## Commands
 
 ```sh
 drove status [--profile NAME] [--json]
-drove plan [--profile NAME] [--json]
-drove up [--profile NAME] [--yes] [--allow-replace]
+drove plan   [--profile NAME] [--json]
+drove up     [--profile NAME] [--yes] [--allow-replace]
+drove render [--profile NAME] [--json]
 ```
+
+`drove render` prints the compiled intermediate representation (schema version 2): a flat, deterministically ordered list of typed resources, each carrying a content digest. It performs no backend I/O.
 
 Use `--file PATH`, `--socket PATH`, or `--session NAME` when discovery defaults are not appropriate.
