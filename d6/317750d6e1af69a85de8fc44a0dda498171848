@@ -1,0 +1,22 @@
+.context/DECISIONS.md
+  s_5213c0d852466f::t_547b6c4a749fa3 83-85
+  s_5213c0d852466f::t_ec9b878925ded7 78-82
+docs/superpowers/specs/2026-09-06-drove-v2-design.md
+  s_5213c0d852466f::t_547b6c4a749fa3 217-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d6317750d6e1af69a85de8fc44a0dda498171848",
+  "prompts": {},
+  "sessions": {
+    "s_5213c0d852466f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "97ba7d22-31ef-4bde-ad62-eca25a35ad1a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
