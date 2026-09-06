@@ -31,21 +31,43 @@ changed="$(git status --porcelain --untracked-files=all 2>/dev/null \
 [ -n "$changed" ] || exit 0
 
 # newest change vs the controller's last result (controller lines carry no by=, or by=controller)
-now="$(date +%s)"; newest=0
+# Compare at nanosecond resolution: whole-second timestamps let a write land in
+# the same second as the result and compare equal, silently passing the gate.
+# file mtime in nanoseconds (BSD stat gives "<secs>.<nsecs>"; GNU stat's %.9Y matches)
+mtime_ns() {
+  local s
+  s="$(stat -f '%Fm' "$1" 2>/dev/null || stat -c '%.9Y' "$1" 2>/dev/null)" || { echo 0; return; }
+  printf '%s\n' "${s/./}"
+}
+now="$(date +%s%N 2>/dev/null || echo 0)"; newest=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  if [ -e "$f" ]; then m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "$now")"; else m="$now"; fi
+  if [ -e "$f" ]; then m="$(mtime_ns "$f")"; else m="$now"; fi
+  [ -n "$m" ] || m="$now"
   [ "$m" -gt "$newest" ] && newest="$m"
 done <<<"$changed"
-last_ts="$(jq -r 'select(.type=="result" and ((.by==null) or (.by=="controller"))) | .ts' "$LOG" 2>/dev/null | tail -1)"
+last_line="$(tail -1 "$LOG" 2>/dev/null)"
 last=0
-if [ -n "$last_ts" ]; then
-  last="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$last_ts" +%s 2>/dev/null || date -d "$last_ts" +%s 2>/dev/null || echo 0)"
+if jq -e 'select(.type=="result" and ((.by==null) or (.by=="controller")))' <<<"$last_line" >/dev/null 2>&1; then
+  # append-event.sh's ts field is second-resolution only, so when the matching
+  # result is the log's own last line, use the LOG FILE's mtime instead: the
+  # append (a single atomic >>) stamps it with real nanosecond resolution, so
+  # a later write to any other file compares strictly greater, collision-free.
+  last="$(mtime_ns "$LOG")"
+else
+  # the matching result isn't the newest line (something else was appended
+  # after it) — fall back to its second-resolution ts; same-second writes are
+  # still ambiguous here, but this is a narrow, uncommon path.
+  last_ts="$(jq -r 'select(.type=="result" and ((.by==null) or (.by=="controller"))) | .ts' "$LOG" 2>/dev/null | tail -1)"
+  if [ -n "$last_ts" ]; then
+    last_s="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$last_ts" +%s 2>/dev/null || date -d "$last_ts" +%s 2>/dev/null || echo 0)"
+    last="${last_s}999999999"
+  fi
 fi
 [ "$newest" -gt "$last" ] || exit 0
 
 list="$(tr '\n' ',' <<<"$changed" | sed 's/,$//')"
-reason="Changed files have no result event yet: $list. This repo is log-driven: the commit reactor only commits what a result names. Before you finish, run: append-event.sh result ref=<main file> paths=$list summary=\"<one line>\" (do not git commit; do not ping the reactors). If you did not make some of these changes, still list them or tell the user they are uncommitted."
+reason="Changed files have no result event yet: $list. This repo is log-driven: the commit reactor only commits what a result names. Before you finish, run: append-event.sh result ref=<main file> paths=\"$list\" summary=\"<one line>\" (do not git commit; do not ping the reactors). If you did not make some of these changes, still list them or tell the user they are uncommitted."
 if command -v jq >/dev/null; then jq -nc --arg r "$reason" '{decision:"block",reason:$r}'
 else printf '{"decision":"block","reason":%s}\n' "\"$(sed 's/"/\\"/g' <<<"$reason")\""; fi
 exit 0

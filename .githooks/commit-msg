@@ -8,7 +8,9 @@ set -euo pipefail
 msg_file="$1"
 tmp="$(mktemp)"
 # drop the Cursor/Composer co-author line(s)
-grep -viE '^Co-authored-by: (Cursor|Composer)\b' "$msg_file" > "$tmp" || true
+# \b is a GNU-grep word boundary; BSD grep (macOS default) has no such escape
+# and would match it literally, so use a POSIX delimiter class instead.
+grep -viE '^Co-authored-by: (Cursor|Composer)([[:space:]]|<|$)' "$msg_file" > "$tmp" || true
 # drop any blank lines left dangling at the end, keep the rest verbatim
 awk 'NF{last=NR} {line[NR]=$0} END{for(i=1;i<=last;i++) print line[i]}' "$tmp" > "$msg_file"
 rm -f "$tmp"

@@ -18,7 +18,8 @@
 #
 # Env: EVENTLOG_PATH, DOC_MODEL (default sonnet), PASS_TIMEOUT s (600),
 #      RETRIES (2), RETRY_SLEEP s (30), DOC_BUDGET_USD (2), DOC_PATHS
-#      (default "docs,README.md" — comma list of doc roots this worker owns).
+#      (default "docs,README.md,AGENTS.md" — comma list of doc roots this
+#      worker owns; AGENTS.md enables the context-engineering pass).
 set -uo pipefail
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "doc-sync: not in a git repo" >&2; exit 1; }
@@ -59,10 +60,14 @@ acked_through() {
   jq -r --arg me "$ME" 'select(.type=="ack" and .by==$me) | .seq_done // empty' "$LOG" 2>/dev/null | sort -n | tail -1
 }
 
-# files currently dirty under the doc roots (sorted, one per line)
+# files currently dirty under the doc roots (sorted, one per line).
+# -z + strip the two-char status prefix (and any "old -> new" rename arrow)
+# keeps paths with spaces intact; `awk '{print $NF}'` on porcelain text output
+# would instead return a fragment of a quoted, space-containing path.
 dirty_docs() {
-  git status --porcelain 2>/dev/null | awk '{print $NF}' | while IFS= read -r f; do
-    while IFS= read -r p; do [ -n "$p" ] || continue; case "$f" in $p|$p/*) echo "$f"; break ;; esac; done <<<"$(tr ',' '\n' <<<"$DOC_PATHS")"
+  git status --porcelain -z 2>/dev/null | tr '\0' '\n' | sed 's/^...//; s/^.* -> //' | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    while IFS= read -r p; do [ -n "$p" ] || continue; case "$f" in "$p"|"$p"/*) echo "$f"; break ;; esac; done <<<"$(tr ',' '\n' <<<"$DOC_PATHS")"
   done | sort -u
 }
 
