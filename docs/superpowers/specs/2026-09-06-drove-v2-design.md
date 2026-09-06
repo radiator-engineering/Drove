@@ -145,7 +145,7 @@ pane("review", agent = agent("claude", args = ["--model", "sonnet"],
 ```
 
 Rules the compiler enforces: names match `[a-z][a-z0-9_-]{0,31}`; one
-`adopt` per profile; `ratios` has `len(panes) - 1` entries in `(0.05, 0.95)`;
+`adopt` per profile; `ratios` has `len(panes) - 1` entries each between 0.05 and 0.95 inclusive;
 `after` targets exist and form a DAG; `extends` targets exist; `profile()`
 returns the profile value it registers.
 
