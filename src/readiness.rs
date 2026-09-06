@@ -105,7 +105,7 @@ fn kill_process_group(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, thread};
+    use std::{fs, net::TcpListener, thread};
 
     use super::*;
 
@@ -194,22 +194,48 @@ mod tests {
 
     #[test]
     fn cmd_probe_kills_a_descendant_spawned_by_a_shell_probe() {
+        // The descendant reports its own pid immediately (well within the
+        // probe's timeout) so this test can check liveness directly with
+        // `kill -0`, rather than racing a fixed sleep against how long the
+        // descendant would otherwise run for.
         let directory = tempfile::tempdir().expect("tempdir");
-        let marker = directory.path().join("still-alive");
+        let pid_file = directory.path().join("descendant-pid");
         let script = format!(
-            "(sleep 5; touch {}) & wait",
-            marker.to_str().expect("utf8 path")
+            "sleep 30 & echo $! > {}; wait",
+            pid_file.to_str().expect("utf8 path")
         );
         let ready = probe_cmd(
             &["sh".into(), "-c".into(), script],
-            Duration::from_millis(200),
+            Duration::from_millis(300),
         )
         .expect("probe");
         assert!(!ready);
-        std::thread::sleep(Duration::from_secs(6));
+
+        let pid = fs::read_to_string(&pid_file)
+            .expect("descendant pid file")
+            .trim()
+            .to_owned();
+
+        // The kill signal and reaping happen asynchronously with respect to
+        // probe_cmd's return, so poll briefly rather than asserting at a
+        // single instant.
+        let mut still_alive = true;
+        for _ in 0..20 {
+            still_alive = Command::new("kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("check descendant")
+                .success();
+            if !still_alive {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(
-            !marker.exists(),
-            "descendant survived the timeout and created the marker file"
+            !still_alive,
+            "descendant (pid {pid}) survived the probe's timeout"
         );
     }
 
