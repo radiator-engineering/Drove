@@ -30,6 +30,20 @@ done
 }
 
 export DROVE_STATE_HOME="$tmp/state"
-"$root/target/debug/drove" --file "$root/examples/basic/Drovefile" --session "$session" up
-"$root/target/debug/drove" --file "$root/examples/basic/Drovefile" --session "$session" up
-"$root/target/debug/drove" --file "$root/examples/basic/Drovefile" --session "$session" status
+
+# `drove up` does not yet execute or record ownership (planner v2 plans
+# against an empty Snapshot until a later PR wires in local state and live
+# discovery), so it truthfully reports the same drift every run; only exit
+# codes 0 (in sync) and 2 (out of sync) mean the CLI itself ran correctly.
+run_allowing_drift() {
+  local status=0
+  "$root/target/debug/drove" --file "$root/examples/basic/Drovefile" --session "$session" "$@" || status=$?
+  if [[ "$status" != 0 && "$status" != 2 ]]; then
+    echo "drove $* exited $status" >&2
+    exit "$status"
+  fi
+}
+
+run_allowing_drift up
+run_allowing_drift up
+run_allowing_drift status

@@ -110,24 +110,51 @@ impl LocalState {
 pub struct ManagedProfile {
     #[serde(default)]
     pub desired_digest: String,
+    /// One entry per resource identity (D5: a plain name, except a tab's
+    /// `workspace/tab`), the source of ownership `to_snapshot` reads back
+    /// (spec §5: "observed digest at apply time, runtime ids").
     #[serde(default)]
-    pub workspaces: BTreeMap<String, ManagedWorkspace>,
+    pub resources: BTreeMap<String, ManagedResource>,
+}
+
+impl ManagedProfile {
+    /// Builds the [`crate::planner::Snapshot`] the planner diffs the IR
+    /// against, from what was recorded the last time this profile was
+    /// applied (D16: tokens first, then local state, as the fallback).
+    pub fn to_snapshot(
+        &self,
+        profile: &str,
+        caller_pane_id: Option<String>,
+    ) -> crate::planner::Snapshot {
+        let mut snapshot = crate::planner::Snapshot {
+            caller_pane_id,
+            ..Default::default()
+        };
+        for (identity, resource) in &self.resources {
+            snapshot = snapshot.owned(
+                &resource.kind,
+                identity,
+                &resource.backend_id,
+                resource.parent.as_deref(),
+                profile,
+                &resource.digest,
+            );
+        }
+        snapshot
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagedWorkspace {
-    pub workspace_id: String,
-    pub desired_digest: String,
+pub struct ManagedResource {
+    /// IR resource kind (`workspace`, `tab`, `pane`, `agent`, `task`).
+    pub kind: String,
+    pub backend_id: String,
     #[serde(default)]
-    pub tabs: BTreeMap<String, ManagedTab>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagedTab {
-    pub tab_id: String,
-    pub desired_digest: String,
+    pub parent: Option<String>,
+    pub digest: String,
+    /// Set only for a pane declaring `adopt = "caller"` (D24).
     #[serde(default)]
-    pub panes: BTreeMap<String, String>,
+    pub adopted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
