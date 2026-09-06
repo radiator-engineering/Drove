@@ -25,10 +25,12 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::Stream;
+use interprocess::local_socket::traits::Stream as _StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -113,14 +115,30 @@ impl RadiatorClient {
         method: &str,
         params: Value,
     ) -> Result<std::result::Result<Value, RpcError>> {
+        self.request_raw_with_timeout(method, params, None)
+    }
+
+    /// Like [`Self::request_raw`], but bounds how long the response read may
+    /// block. Used by `tail()` so an `output()` readiness probe (D23)
+    /// cannot hang forever on a hub response that never arrives.
+    fn request_raw_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<std::result::Result<Value, RpcError>> {
         let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let request = json!({"id": id, "method": method, "params": params});
-        let mut stream = BufReader::new(connect(&self.socket_path).with_context(|| {
+        let stream = connect(&self.socket_path).with_context(|| {
             format!(
                 "cannot connect to Radiator hub at {}",
                 self.socket_path.display()
             )
-        })?);
+        })?;
+        stream
+            .set_recv_timeout(timeout)
+            .context("cannot set Radiator hub response timeout")?;
+        let mut stream = BufReader::new(stream);
         serde_json::to_writer(stream.get_mut(), &request)
             .context("cannot encode Radiator hub request")?;
         stream
@@ -296,22 +314,50 @@ impl RadiatorClient {
         let Some(process) = find_pane_field(&snapshot, id, "process") else {
             return Ok(None);
         };
-        let argv = process
-            .get("argv")
+        Ok(Some(process_info_from_value(process)))
+    }
+
+    /// Recent pane text via the hub's `pane.tail` (landed in the hub
+    /// protocol PR, `radiator-hub-protocol`, event seq 127/169), the
+    /// host-side input to an `output()` readiness probe (D23). `timeout`
+    /// bounds the hub round trip so a withheld response cannot hang the
+    /// probe forever.
+    pub fn tail(&self, id: &str, timeout: Duration) -> Result<String> {
+        let result =
+            match self.request_raw_with_timeout("pane.tail", json!({"id": id}), Some(timeout))? {
+                Ok(result) => result,
+                Err(error) => bail!("Radiator API error {}: {}", error.code, error.message),
+            };
+        let lines = result
+            .get("lines")
             .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let pid = process
-            .get("pid")
-            .and_then(Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok());
-        Ok(Some(ProcessInfo { command: argv, pid }))
+            .context("pane.tail response omitted lines")?;
+        Ok(lines
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    /// `address`'s tokens as reported by the hub's `metadata` field on the
+    /// already-fetched `raw` snapshot, falling back to the local journal
+    /// only when the hub has no `metadata` field at all (an older hub that
+    /// predates `pane.set_metadata`/`workspace.set_metadata`) — mirrors
+    /// [`Self::resolve_ownership`]'s hub-wins rule without a second
+    /// `hub.snapshot` round trip per resource.
+    fn tokens_from_snapshot_or_journal(
+        &self,
+        address: &str,
+        reported: Option<&Value>,
+    ) -> BTreeMap<String, String> {
+        match reported.and_then(|value| serde_json::from_value(value.clone()).ok()) {
+            Some(tokens) => tokens,
+            None => self
+                .load_journal()
+                .ok()
+                .and_then(|journal| journal.panes.get(address).cloned())
+                .unwrap_or_default(),
+        }
     }
 
     fn journal_path(&self) -> PathBuf {
@@ -384,6 +430,9 @@ impl Backend for RadiatorClient {
             // item 3).
             process_info: false,
             events: true,
+            // `pane.tail` landed in the hub protocol PR (radiator-hub-
+            // protocol, event seq 127/169), so `tail()` calls it directly.
+            readiness_output: true,
         }
     }
 
@@ -411,9 +460,12 @@ impl Backend for RadiatorClient {
                 .and_then(Value::as_str)
                 .unwrap_or(workspace_id)
                 .to_owned();
+            let workspace_tokens =
+                self.tokens_from_snapshot_or_journal(workspace_id, workspace.get("metadata"));
             snapshot.workspaces.push(WorkspaceInfo {
                 workspace_id: workspace_id.to_owned(),
                 label,
+                tokens: workspace_tokens,
             });
 
             // Radiator has no tab layer (recon-radiator-report §2): every
@@ -435,11 +487,16 @@ impl Backend for RadiatorClient {
                 let Some(pane_id) = pane.get("id").and_then(Value::as_str) else {
                     continue;
                 };
+                let pane_tokens =
+                    self.tokens_from_snapshot_or_journal(pane_id, pane.get("metadata"));
+                let process_info = pane.get("process").map(process_info_from_value);
                 snapshot.panes.push(PaneInfo {
                     pane_id: pane_id.to_owned(),
                     tab_id: tab_id.clone(),
                     workspace_id: workspace_id.to_owned(),
                     cwd: None,
+                    tokens: pane_tokens,
+                    process_info,
                 });
                 if pane.get("kind").and_then(Value::as_str) == Some("chat") {
                     snapshot.agents.push(AgentInfo {
@@ -578,6 +635,10 @@ impl Backend for RadiatorClient {
     fn report_tokens(&self, address: &str, tokens: &BTreeMap<String, String>) -> Result<()> {
         RadiatorClient::report_tokens(self, address, tokens)
     }
+
+    fn output(&self, pane_id: &str, timeout: Duration) -> Result<String> {
+        RadiatorClient::tail(self, pane_id, timeout)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -653,6 +714,25 @@ fn pane_spec_from(node: &Value) -> PaneSpec {
 
 fn flat_tab_id(workspace_id: &str) -> String {
     format!("{workspace_id}:panes")
+}
+
+fn process_info_from_value(process: &Value) -> ProcessInfo {
+    let argv = process
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let pid = process
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    ProcessInfo { command: argv, pid }
 }
 
 fn find_pane_field<'a>(snapshot: &'a Value, pane_id: &str, field: &str) -> Option<&'a Value> {
@@ -1185,6 +1265,88 @@ mod tests {
         let error = Backend::start_agent(&client, "w0:p1", "review", "claude", &[])
             .expect_err("no agent.start");
         assert!(error.to_string().contains("agent.start"));
+    }
+
+    #[test]
+    fn tail_joins_the_returned_lines_with_newlines() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-tail.sock");
+        fake_hub(path.clone(), |request| {
+            assert_eq!(request["method"], "pane.tail");
+            assert_eq!(request["params"]["id"], "w0:p1");
+            json!({
+                "id": request["id"],
+                "result": {"lines": ["scaffold: watching for changes", "ready"], "matched": false}
+            })
+        });
+
+        let text = RadiatorClient::new(path)
+            .tail("w0:p1", Duration::from_secs(1))
+            .expect("tail");
+        assert_eq!(text, "scaffold: watching for changes\nready");
+    }
+
+    #[test]
+    fn tail_times_out_on_a_withheld_response() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-tail-timeout.sock");
+        let listener = bind(&path).expect("bind fake hub");
+        thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let error = RadiatorClient::new(path)
+            .tail("w0:p1", Duration::from_millis(100))
+            .expect_err("withheld response times out");
+        assert!(error.to_string().contains("Radiator hub response"));
+    }
+
+    #[test]
+    fn snapshot_reads_pane_and_workspace_tokens_from_hub_metadata() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-snapshot-tokens.sock");
+        fake_hub(path.clone(), |request| {
+            assert_eq!(request["method"], "hub.snapshot");
+            json!({
+                "id": request["id"],
+                "result": {
+                    "workspaces": [{
+                        "id": "w0",
+                        "name": "dev",
+                        "runner": "idle",
+                        "metadata": {"drove_name": "default"},
+                        "panes": [{
+                            "id": "w0:p1",
+                            "kind": "term",
+                            "title": "shell",
+                            "runner": "idle",
+                            "metadata": {"drove_digest": "abc123"},
+                            "process": {"pid": 99, "argv": ["bash"]},
+                        }],
+                    }],
+                    "seq": 1,
+                }
+            })
+        });
+
+        let snapshot = RadiatorClient::new(path).snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.workspaces[0].tokens.get("drove_name"),
+            Some(&"default".to_owned())
+        );
+        assert_eq!(
+            snapshot.panes[0].tokens.get("drove_digest"),
+            Some(&"abc123".to_owned())
+        );
+        let process_info = snapshot.panes[0]
+            .process_info
+            .as_ref()
+            .expect("process info present");
+        assert_eq!(process_info.pid, Some(99));
     }
 
     #[cfg(unix)]
