@@ -13,27 +13,27 @@ protect_log = task(
     auto = False,
 )
 
-control = workspace("control", panes = [
-    herdr.tab("coordinator", split = herdr.DOWN, ratios = [0.5], panes = [
-        caller_pane("controller"),
+control = workspace("control", tabs = [
+    tab("coordinator", split = "down", ratios = [0.5], panes = [
+        pane("controller", adopt = "caller"),
         pane("eventlog", serve = ["eventlog-view.sh", "-f"]),
     ]),
-    herdr.tab("monitor: system + agents", panes = [
+    tab("monitor: system + agents", panes = [
         pane("agentmon", serve = any_of(["agentmon", "--since", "launch"], ["htop"])),
     ]),
 ])
 
-maintenance = workspace("maintenance", panes = [
-    herdr.tab("lazygit", panes = [pane("gitlog", serve = any_of(["lazygit"], ["bash"]))]),
+maintenance = workspace("maintenance", tabs = [
+    tab("lazygit", panes = [pane("gitlog", serve = any_of(["lazygit"], ["bash"]))]),
     reactor("commit", agent = "cursor-committer", model = "composer-2.5-fast",
             script = "cursor-commit-reactor.sh"),
     reactor("doc-sync", agent = "doc-worker", model = "sonnet",
             script = "doc-sync-reactor.sh", after = ["commit-reactor"]),
 ])
 
-files = workspace("files", panes = [
-    herdr.tab("files", panes = [pane("spiceedit", serve = any_of(["spiceedit"], ["bash"]))]),
+files = workspace("files", tabs = [
+    tab("files", panes = [pane("spiceedit", serve = any_of(["spiceedit"], ["bash"]))]),
 ])
 
-default = profile("default", workspaces = [control, maintenance, files], tasks = [scaffold, protect_log])
-profile("core", extends = default, without = [files])
+profile("default", workspaces = [control, maintenance, files], tasks = [scaffold, protect_log])
+profile("core", extends = "default", without = ["files"])

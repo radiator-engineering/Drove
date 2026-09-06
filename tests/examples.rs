@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use drove::dsl::compile;
@@ -8,6 +9,27 @@ fn example_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join(relative)
+}
+
+fn fixture_path(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(relative)
+}
+
+/// Every pane's `(name, content digest)` in the `default` profile's IR.
+fn pane_content_digests(drovefile: &std::path::Path) -> BTreeMap<String, String> {
+    let compiled = compile(drovefile).expect("compile");
+    let ir = compiled
+        .config
+        .profile("default")
+        .expect("default profile")
+        .to_ir();
+    ir.resources
+        .iter()
+        .filter(|resource| resource.kind == "pane")
+        .map(|resource| (resource.name.clone(), resource.digest.clone()))
+        .collect()
 }
 
 /// The pane content digest each example must still produce (D30): these are
@@ -141,6 +163,50 @@ fn example_pane_content_digests_equal_the_v2_values() {
             &pane_digest(&log_driven, name),
             expected,
             "log-driven pane `{name}` content digest drifted from its v2 value"
+        );
+    }
+}
+
+#[test]
+fn migrated_examples_are_in_v3_form_with_no_warnings() {
+    // The shipped examples use only the v3 surface: no deprecation warnings.
+    for example in ["basic/Drovefile", "log-driven/Drovefile"] {
+        let compiled = compile(&example_path(example)).expect("compile example");
+        assert!(
+            compiled.warnings.is_empty(),
+            "{example} still uses a v2 form: {:?}",
+            compiled.warnings
+        );
+    }
+}
+
+#[test]
+fn v2_fixtures_still_compile_but_warn() {
+    // The frozen v2 copies exercise the shims; each must still compile and, by
+    // definition, raise at least one deprecation warning.
+    for fixture in ["v2/basic/Drovefile", "v2/log-driven/Drovefile"] {
+        let compiled = compile(&fixture_path(fixture)).expect("compile v2 fixture");
+        assert!(
+            !compiled.warnings.is_empty(),
+            "{fixture} is a v2 form but raised no warning"
+        );
+    }
+}
+
+#[test]
+fn v2_and_v3_forms_share_every_pane_content_digest() {
+    // D30: upgrading a Drovefile from its v2 form to the migrated v3 form must
+    // leave every pane's content digest identical, so `drove up` after the
+    // upgrade proposes no restarts.
+    for (v2, v3) in [
+        ("v2/basic/Drovefile", "basic/Drovefile"),
+        ("v2/log-driven/Drovefile", "log-driven/Drovefile"),
+    ] {
+        let v2_digests = pane_content_digests(&fixture_path(v2));
+        let v3_digests = pane_content_digests(&example_path(v3));
+        assert_eq!(
+            v2_digests, v3_digests,
+            "pane content digests drifted between the v2 form `{v2}` and the v3 form `{v3}`"
         );
     }
 }
