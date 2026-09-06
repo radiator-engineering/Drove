@@ -1,0 +1,19 @@
+tests/herdr_smoke_live.rs
+  s_930a7d7fbae4d7::t_92d398b63fc912 1-7,15-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f9b03b2e30b820e043c8e87b03b8b4afe829e44f",
+  "prompts": {},
+  "sessions": {
+    "s_930a7d7fbae4d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5dc7ab27-cb51-4e9a-a77c-bc5ce14c09f1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
