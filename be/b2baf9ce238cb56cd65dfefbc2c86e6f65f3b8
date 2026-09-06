@@ -1,0 +1,22 @@
+src/backend/radiator.rs
+  s_3d46c94e71262b::t_40762a36899350 1198-1218
+  s_3d46c94e71262b::t_8d213d26f3c9f6 111-119,121-122,125-131
+  s_3d46c94e71262b::t_9f1a710927c9dd 343-347,349
+  s_3d46c94e71262b::t_978bb465fe755e 1197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "beb2baf9ce238cb56cd65dfefbc2c86e6f65f3b8",
+  "prompts": {},
+  "sessions": {
+    "s_3d46c94e71262b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e47a21ff-8235-41ef-867b-fc356c943c30",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
