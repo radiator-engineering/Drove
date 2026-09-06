@@ -125,10 +125,10 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
             })
         }
         Command::Up { .. } => {
+            // Executing the plan is out of scope here (PR 4); `up` only
+            // reports it, so it does not yet fail on out-of-sync drift the
+            // way `status`/`plan` do.
             print_plan(&plan, cli.json)?;
-            if !cli.json {
-                println!("in sync: profile `{}`", cli.profile);
-            }
             Ok(ExitCode::SUCCESS)
         }
     }
