@@ -4,6 +4,7 @@
 
 pub mod herdr;
 pub mod radiator;
+pub mod select;
 
 use std::{collections::BTreeMap, path::Path, time::Duration};
 

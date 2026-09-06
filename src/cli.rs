@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::{
-    backend::{Backend, herdr::HerdrClient},
+    backend::{Backend, herdr, radiator, select},
     dsl::{compile, find_drovefile},
     executor::{
         ExecutionContext, HostCommandRunner, TaskOutcome, down, execute_plan_tasks, list_tasks,
@@ -35,11 +35,22 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "default")]
     profile: String,
 
-    /// Explicit Herdr API socket path.
+    /// Backend to reconcile onto (`herdr`, `radiator`); overrides `backend(...)`
+    /// in the Drovefile (D32).
+    #[arg(long, global = true)]
+    backend: Option<String>,
+
+    /// Named target instance for the selected backend (Herdr session,
+    /// Radiator hub); overrides `herdr.session(...)`/`radiator.hub(...)`
+    /// in the Drovefile (D32).
+    #[arg(long, global = true)]
+    target: Option<String>,
+
+    /// Explicit backend socket path override.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
-    /// Named Herdr session.
+    /// Named Herdr session; an alias of `--target` for the Herdr backend.
     #[arg(long, global = true)]
     session: Option<String>,
 
@@ -121,11 +132,14 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
     if let Some(Command::Run { task, yes }) = &cli.command {
         return run_command(profile, &repo_root, task.as_deref(), *yes, cli.json);
     }
+
+    let (backend_id, target) = resolve_backend(&cli, &compiled.config);
+
     if let Some(Command::Down { purge, yes }) = &cli.command {
         return down_command(
             profile,
-            cli.socket.as_deref(),
-            cli.session.as_deref(),
+            &backend_id,
+            &target,
             &repo_root,
             *purge,
             *yes,
@@ -133,22 +147,24 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
         );
     }
 
-    let client = HerdrClient::discover(cli.socket.as_deref(), cli.session.as_deref());
+    let client = select::open(&backend_id, &target)?;
     if let Err(error) = client.snapshot() {
+        let socket = backend_socket_display(&backend_id, &target);
         if cli.json {
             println!(
                 "{}",
                 serde_json::json!({
                     "profile": cli.profile,
+                    "backend": backend_id,
                     "status": "not_running",
                     "error": error.to_string(),
-                    "socket": client.socket_path(),
+                    "socket": socket,
                 })
             );
         } else {
             println!(
-                "not running: cannot reach Herdr at {} ({error})",
-                client.socket_path().display()
+                "not running: cannot reach {backend_id} at {} ({error})",
+                socket.display()
             );
         }
         return Ok(ExitCode::from(3));
@@ -160,7 +176,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
     // apply (D16's declared fallback) until live discovery lands.
     let snapshot = state
         .profile(&cli.profile)
-        .map(|managed| managed.to_snapshot(&cli.profile, Backend::caller_pane_id(&client)))
+        .map(|managed| managed.to_snapshot(&cli.profile, client.caller_pane_id()))
         .unwrap_or_default();
     let plan = build_plan(profile, &snapshot)?;
 
@@ -245,21 +261,21 @@ fn run_command(
 
 fn down_command(
     profile: &Profile,
-    socket: Option<&Path>,
-    session: Option<&str>,
+    backend_id: &str,
+    target: &select::Target,
     repo_root: &Path,
     purge: bool,
     yes: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let mut state = LocalState::load(repo_root)?;
-    let client = HerdrClient::discover(socket, session);
+    let client = select::open(backend_id, target)?;
     let ctx = ExecutionContext {
         repo_root,
         profile: &profile.name,
         runner: &HostCommandRunner,
     };
-    let backend: Option<&dyn Backend> = if purge { Some(&client) } else { None };
+    let backend: Option<&dyn Backend> = if purge { Some(client.as_ref()) } else { None };
     let report = down(profile, &ctx, &mut state, yes, purge, backend)?;
     if json {
         println!(
@@ -329,6 +345,41 @@ fn describe_outcome(name: &str, outcome: TaskOutcome) -> String {
         TaskOutcome::Blocked => {
             format!("{name}: blocked (needs approval; re-run with --yes)")
         }
+    }
+}
+
+/// Resolves the backend id and target per D32's four-level order, gathering
+/// the CLI/environment/Drovefile inputs the pure `select::resolve` needs.
+fn resolve_backend(cli: &Cli, config: &crate::model::DroveConfig) -> (String, select::Target) {
+    let cli_inputs = select::CliInputs {
+        backend: cli.backend.as_deref(),
+        target: cli.target.as_deref(),
+        session: cli.session.as_deref(),
+        socket: cli.socket.as_deref(),
+    };
+    let env_inputs = select::EnvInputs {
+        drove_backend: std::env::var("DROVE_BACKEND").ok(),
+        herdr_session: std::env::var("HERDR_SESSION").ok(),
+        radiator_hub: std::env::var("RADIATOR_HUB").ok(),
+        ambient_radiator: radiator::selected_by_environment(),
+    };
+    select::resolve(
+        cli_inputs,
+        &env_inputs,
+        config.backend.as_deref(),
+        &config.target,
+    )
+}
+
+/// The socket path a backend will actually connect to, for diagnostics —
+/// computed with the same pure resolvers `select::open` calls internally,
+/// since `Backend` (out of scope here) exposes no `socket_path()` accessor.
+fn backend_socket_display(backend_id: &str, target: &select::Target) -> PathBuf {
+    match backend_id {
+        select::RADIATOR_BACKEND => {
+            radiator::resolve_socket_path(target.socket.as_deref(), target.name.as_deref())
+        }
+        _ => herdr::resolve_socket_path(target.socket.as_deref(), target.name.as_deref()),
     }
 }
 
