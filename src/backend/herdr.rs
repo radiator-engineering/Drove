@@ -85,7 +85,7 @@ impl HerdrClient {
         let mut snapshot: SessionSnapshot =
             serde_json::from_value(snapshot).context("invalid Herdr session snapshot")?;
         for pane in &mut snapshot.panes {
-            pane.process_info = self.pane_process_info(&pane.pane_id).unwrap_or(None);
+            pane.process_info = self.pane_process_info(&pane.pane_id)?;
         }
         snapshot.caller_pane_id = caller_pane_id_from_env();
         Ok(snapshot)
@@ -995,6 +995,86 @@ mod tests {
         let text = HerdrClient::new(path).output("w1:p1").expect("pane output");
         assert_eq!(text, "scaffold: watching for changes");
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn close_pane_sends_the_target_pane_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-close.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({"id": request["id"], "result": {"type": "ok"}});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            request
+        });
+
+        HerdrClient::new(path)
+            .close_pane("w1:p2")
+            .expect("close pane");
+
+        let request = server.join().expect("server thread");
+        assert_eq!(request["method"], "pane.close");
+        assert_eq!(request["params"]["pane_id"], "w1:p2");
+    }
+
+    #[test]
+    fn rename_pane_sends_the_pane_id_and_label() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-rename-pane.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({"id": request["id"], "result": {"type": "ok"}});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            request
+        });
+
+        HerdrClient::new(path)
+            .rename_pane("w1:p2", "renamed")
+            .expect("rename pane");
+
+        let request = server.join().expect("server thread");
+        assert_eq!(request["method"], "pane.rename");
+        assert_eq!(request["params"]["pane_id"], "w1:p2");
+        assert_eq!(request["params"]["label"], "renamed");
+    }
+
+    #[test]
+    fn prompt_agent_sends_the_target_and_text() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-prompt.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({"id": request["id"], "result": {"type": "agent_prompted"}});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            request
+        });
+
+        HerdrClient::new(path)
+            .prompt_agent("review", "fix the bug")
+            .expect("prompt agent");
+
+        let request = server.join().expect("server thread");
+        assert_eq!(request["method"], "agent.prompt");
+        assert_eq!(request["params"]["target"], "review");
+        assert_eq!(request["params"]["text"], "fix the bug");
     }
 
     #[test]
