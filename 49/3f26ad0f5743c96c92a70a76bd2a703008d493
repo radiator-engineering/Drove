@@ -1,0 +1,21 @@
+src/planner.rs
+  s_75ee3e56050b5c::t_d91c42f08f5ae1 683-689
+  s_75ee3e56050b5c::t_b94f354455ec3c 552-558
+  s_75ee3e56050b5c::t_4486b400b31291 1286-1294,1296-1310,1312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "493f26ad0f5743c96c92a70a76bd2a703008d493",
+  "prompts": {},
+  "sessions": {
+    "s_75ee3e56050b5c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b3a3cfcc-1a82-4f3d-8d73-c1148c2e79d4",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
