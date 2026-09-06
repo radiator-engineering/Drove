@@ -1,0 +1,21 @@
+src/cli.rs
+  s_75ee3e56050b5c::t_3b950ea67c16ac 128-130
+scripts/smoke-herdr.sh
+  s_75ee3e56050b5c::t_68b29a36dbdf9f 33-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d3bf8765fc40b95d38e93ae72b8914dd002d453c",
+  "prompts": {},
+  "sessions": {
+    "s_75ee3e56050b5c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b3a3cfcc-1a82-4f3d-8d73-c1148c2e79d4",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
