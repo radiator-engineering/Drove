@@ -16,22 +16,46 @@
 //! path (`/repo/sub` became `//repo/sub`, `C:\repo\sub` became
 //! `C://repo/sub`) — host-dependent digest content, exactly what this
 //! module exists to prevent.
+//!
+//! The root prefix is rendered explicitly, before segments are joined, so
+//! different kinds of root can't collide: a POSIX absolute path (`/repo`),
+//! a Windows drive-absolute path (`C:/repo`) and a UNC path (`//server/repo`,
+//! from `\\server\repo`) each keep a distinct prefix. Naively stripping `\\`
+//! down to a single `/` would otherwise render a UNC path identically to a
+//! POSIX absolute path with the same segments.
 
 use std::path::Path;
 
 pub fn normalize_for_digest(path: &Path) -> String {
     let forward = path.to_string_lossy().replace('\\', "/");
-    let is_absolute = forward.starts_with('/');
-    let rendered = forward
+    let (prefix, rest) = root_prefix(&forward);
+    let joined = rest
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join("/");
-    if is_absolute {
-        format!("/{rendered}")
-    } else {
-        rendered
+    format!("{prefix}{joined}")
+}
+
+/// Splits a separator-normalized path into its root prefix, rendered so a
+/// different kind of root can never collide with it, and the remaining
+/// segments still to be joined.
+fn root_prefix(forward: &str) -> (String, &str) {
+    if let Some(rest) = forward.strip_prefix("//") {
+        return ("//".to_owned(), rest);
     }
+    if let Some(rest) = forward.strip_prefix('/') {
+        return ("/".to_owned(), rest);
+    }
+    let bytes = forward.as_bytes();
+    let has_drive_letter =
+        bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':');
+    if has_drive_letter {
+        let drive = &forward[..2];
+        let rest = forward[2..].strip_prefix('/').unwrap_or(&forward[2..]);
+        return (format!("{drive}/"), rest);
+    }
+    (String::new(), forward)
 }
 
 #[cfg(test)]
@@ -66,6 +90,23 @@ mod tests {
         assert_eq!(
             normalize_for_digest(Path::new("C:\\repo\\sub")),
             "C:/repo/sub"
+        );
+    }
+
+    /// Exact-output regression: a Windows drive-root, a bare drive letter,
+    /// and a UNC path each render to a distinct, stable value, and none of
+    /// them collides with a POSIX absolute path of the same segments.
+    #[test]
+    fn windows_root_and_unc_paths_do_not_collide_with_posix_absolute_paths() {
+        assert_eq!(normalize_for_digest(Path::new("C:\\")), "C:/");
+        assert_eq!(normalize_for_digest(Path::new("C:")), "C:/");
+        assert_eq!(
+            normalize_for_digest(Path::new("\\\\server\\share")),
+            "//server/share"
+        );
+        assert_ne!(
+            normalize_for_digest(Path::new("\\\\server\\share")),
+            normalize_for_digest(Path::new("/server/share"))
         );
     }
 
