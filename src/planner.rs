@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::{
     ir::{Ir, PlacementGroup, Resource},
-    model::Profile,
+    model::{Pane, Profile, Workspace},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -272,9 +272,20 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
         }
     }
 
+    // D34: identities a `was =` rename claims from the backend this plan.
+    // Excluded from `declared` below's complement so `plan_detach` never
+    // proposes detaching an identity a rename just migrated away from.
+    let mut consumed_by_rename: BTreeSet<String> = BTreeSet::new();
+
     for resource in &ir.resources {
         if resource.kind == "workspace" {
-            plan_workspace(resource, profile, snapshot, &mut ranked);
+            plan_workspace(
+                resource,
+                profile,
+                snapshot,
+                &mut consumed_by_rename,
+                &mut ranked,
+            );
         }
     }
 
@@ -296,6 +307,7 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
                     profile,
                     snapshot,
                     fresh,
+                    &mut consumed_by_rename,
                     &mut ranked,
                     &mut adopted,
                 );
@@ -306,6 +318,7 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
     }
 
     plan_tasks(&ir, profile, snapshot, &mut ranked);
+    declared.extend(consumed_by_rename);
     plan_detach(&declared, profile, snapshot, &mut ranked);
 
     ranked.sort_by(|left, right| {
@@ -327,13 +340,83 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
     })
 }
 
+fn workspace_by_name<'a>(profile: &'a Profile, name: &str) -> Option<&'a Workspace> {
+    profile.workspaces.iter().find(|w| w.name == name)
+}
+
+fn pane_by_name<'a>(profile: &'a Profile, name: &str) -> Option<&'a Pane> {
+    profile
+        .workspaces
+        .iter()
+        .flat_map(|w| &w.tabs)
+        .flat_map(|t| &t.panes)
+        .find(|p| p.name == name)
+}
+
+/// D34: both the `was`-declared old identity and the new one are live —
+/// ambiguous, so the planner refuses to guess and flags it instead of
+/// silently picking a side.
+fn identity_conflict(rank: u8, new_name: &str, old_name: &str, kind: &str) -> RankedAction {
+    (
+        rank,
+        PHASE_CONFLICT,
+        new_name.to_owned(),
+        PlannedAction {
+            kind: Action::Core(CoreAction::Conflict),
+            address: new_name.to_owned(),
+            backend_id: None,
+            destructive: false,
+            reason: format!(
+                "{kind} `{new_name}` declares `was = \"{old_name}\"` but both identities are live"
+            ),
+        },
+    )
+}
+
 fn plan_workspace(
     resource: &Resource,
     profile: &Profile,
     snapshot: &Snapshot,
+    consumed_by_rename: &mut BTreeSet<String>,
     ranked: &mut Vec<RankedAction>,
 ) {
     let id = resource.name.clone();
+
+    if let Some(was) = workspace_by_name(profile, &id).and_then(|w| w.was.as_deref()) {
+        let has_new = snapshot.resources.contains_key(&id);
+        let old_owned = snapshot
+            .resources
+            .get(was)
+            .and_then(|observed| effective_owner(observed, &profile.name))
+            .is_some();
+        if old_owned {
+            if has_new {
+                ranked.push(identity_conflict(RANK_WORKSPACE, &id, was, "workspace"));
+                // Both identities are live and ambiguous: leave the old one
+                // alone rather than detaching it out from under the conflict.
+                consumed_by_rename.insert(was.to_owned());
+                return;
+            }
+            let backend_id = snapshot.resources[was].backend_id.clone();
+            ranked.push((
+                RANK_WORKSPACE,
+                PHASE_RENAME,
+                id.clone(),
+                PlannedAction {
+                    kind: Action::Core(CoreAction::RenameWorkspace),
+                    address: id,
+                    backend_id: Some(backend_id),
+                    destructive: false,
+                    reason: format!(
+                        "`was = \"{was}\"` matched a live workspace; migrating identity instead of creating"
+                    ),
+                },
+            ));
+            consumed_by_rename.insert(was.to_owned());
+            return;
+        }
+    }
+
     match snapshot.resources.get(&id) {
         None => ranked.push((
             RANK_WORKSPACE,
@@ -447,6 +530,7 @@ fn plan_pane(
     profile: &Profile,
     snapshot: &Snapshot,
     group_fresh: bool,
+    consumed_by_rename: &mut BTreeSet<String>,
     ranked: &mut Vec<RankedAction>,
     adopted: &mut BTreeMap<String, bool>,
 ) {
@@ -482,7 +566,15 @@ fn plan_pane(
             (None, _) => {
                 adopted.insert(resource.name.clone(), false);
                 if !group_fresh {
-                    plan_normal_pane(resource, &id, profile, snapshot, serves, ranked);
+                    plan_normal_pane(
+                        resource,
+                        &id,
+                        profile,
+                        snapshot,
+                        serves,
+                        consumed_by_rename,
+                        ranked,
+                    );
                 }
             }
         }
@@ -492,7 +584,15 @@ fn plan_pane(
     if group_fresh {
         return;
     }
-    plan_normal_pane(resource, &id, profile, snapshot, serves, ranked);
+    plan_normal_pane(
+        resource,
+        &id,
+        profile,
+        snapshot,
+        serves,
+        consumed_by_rename,
+        ranked,
+    );
 }
 
 fn plan_normal_pane(
@@ -501,8 +601,44 @@ fn plan_normal_pane(
     profile: &Profile,
     snapshot: &Snapshot,
     serves: bool,
+    consumed_by_rename: &mut BTreeSet<String>,
     ranked: &mut Vec<RankedAction>,
 ) {
+    if let Some(was) = pane_by_name(profile, id).and_then(|p| p.was.as_deref()) {
+        let has_new = snapshot.resources.contains_key(id);
+        let old_owned = snapshot
+            .resources
+            .get(was)
+            .and_then(|observed| effective_owner(observed, &profile.name))
+            .is_some();
+        if old_owned {
+            if has_new {
+                ranked.push(identity_conflict(RANK_PANE, id, was, "pane"));
+                // Both identities are live and ambiguous: leave the old one
+                // alone rather than detaching it out from under the conflict.
+                consumed_by_rename.insert(was.to_owned());
+                return;
+            }
+            let backend_id = snapshot.resources[was].backend_id.clone();
+            ranked.push((
+                RANK_PANE,
+                PHASE_RENAME,
+                id.to_owned(),
+                PlannedAction {
+                    kind: Action::Core(CoreAction::RenamePane),
+                    address: id.to_owned(),
+                    backend_id: Some(backend_id),
+                    destructive: false,
+                    reason: format!(
+                        "`was = \"{was}\"` matched a live pane; migrating identity instead of creating"
+                    ),
+                },
+            ));
+            consumed_by_rename.insert(was.to_owned());
+            return;
+        }
+    }
+
     let Some(observed) = snapshot.resources.get(id) else {
         ranked.push((
             RANK_PANE,
@@ -1062,6 +1198,92 @@ mod tests {
         assert_eq!(kinds(&plan), [Action::Core(CoreAction::Detach)]);
         assert_eq!(plan.actions[0].address, "gone");
         assert!(!plan.actions[0].destructive);
+    }
+
+    #[test]
+    fn pane_was_matches_live_identity_renames_instead_of_creating() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "review", "was": "shell"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "shell",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            "old-digest",
+        );
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
+        assert_eq!(plan.actions[0].address, "review");
+        assert_eq!(plan.actions[0].backend_id.as_deref(), Some("w1:p1"));
+    }
+
+    #[test]
+    fn workspace_was_matches_live_identity_renames_instead_of_creating() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "was": "legacy",
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let snapshot =
+            Snapshot::default().owned("workspace", "legacy", "w1", None, "default", "old-digest");
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(plan.actions.iter().any(|action| action.kind
+            == Action::Core(CoreAction::RenameWorkspace)
+            && action.address == "dev"
+            && action.backend_id.as_deref() == Some("w1")));
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|action| action.kind == Action::Core(CoreAction::Detach))
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|action| action.kind == Action::Core(CoreAction::CreateWorkspace))
+        );
+    }
+
+    #[test]
+    fn was_matching_a_pane_already_live_under_the_new_name_is_a_conflict() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "review", "was": "shell"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        let snapshot = converged_shell(&ir)
+            .owned(
+                "pane",
+                "review",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&ir, "review"),
+            )
+            .owned(
+                "pane",
+                "shell",
+                "w1:p2",
+                Some("dev/main"),
+                "default",
+                "any-digest",
+            );
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::Conflict)]);
     }
 
     #[test]

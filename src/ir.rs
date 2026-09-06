@@ -307,8 +307,10 @@ mod tests {
                         }),
                         on_start: None,
                         on_stop: None,
+                        was: None,
                     }],
                 }],
+                was: None,
             }],
             tasks: vec![],
         }

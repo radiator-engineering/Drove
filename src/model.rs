@@ -164,7 +164,55 @@ impl Profile {
             }
         }
 
+        self.validate_was(&workspace_names, &pane_names, &agent_names, &task_names)?;
         self.validate_after(&pane_names, &agent_names, &task_names)
+    }
+
+    /// D34: `was` must not equal the resource's own name, and must not
+    /// collide with any name currently declared in the profile — a `was`
+    /// that pointed at a live declared name would be ambiguous with a real
+    /// resource rather than a ghost of a rename.
+    fn validate_was(
+        &self,
+        workspace_names: &BTreeSet<&str>,
+        pane_names: &BTreeSet<&str>,
+        agent_names: &BTreeSet<&str>,
+        task_names: &BTreeSet<&str>,
+    ) -> Result<()> {
+        for workspace in &self.workspaces {
+            if let Some(was) = &workspace.was {
+                if was == &workspace.name {
+                    bail!(
+                        "workspace `{}` declares `was` equal to its own name",
+                        workspace.name
+                    );
+                }
+                if workspace_names.contains(was.as_str()) {
+                    bail!(
+                        "workspace `{}` declares `was = \"{was}\"` which is also a declared workspace name",
+                        workspace.name
+                    );
+                }
+            }
+            for tab in &workspace.tabs {
+                for pane in &tab.panes {
+                    let Some(was) = &pane.was else { continue };
+                    if was == &pane.name {
+                        bail!("pane `{}` declares `was` equal to its own name", pane.name);
+                    }
+                    if pane_names.contains(was.as_str())
+                        || agent_names.contains(was.as_str())
+                        || task_names.contains(was.as_str())
+                    {
+                        bail!(
+                            "pane `{}` declares `was = \"{was}\"` which is also a declared name",
+                            pane.name
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_after(
@@ -251,6 +299,11 @@ pub struct Workspace {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub tabs: Vec<Tab>,
+    /// The name this workspace was previously declared under (D34). When a
+    /// live resource is still identified by `was`, the planner migrates its
+    /// identity to `name` instead of creating anew and detaching the old one.
+    #[serde(default)]
+    pub was: Option<String>,
 }
 
 impl Workspace {
@@ -334,6 +387,10 @@ pub struct Pane {
     pub on_start: Option<Vec<String>>,
     #[serde(default)]
     pub on_stop: Option<Vec<String>>,
+    /// The name this pane was previously declared under (D34). See
+    /// [`Workspace::was`].
+    #[serde(default)]
+    pub was: Option<String>,
 }
 
 impl Pane {
@@ -708,6 +765,50 @@ mod tests {
         }));
         let error = profile.validate().expect_err("oversized prompt");
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn rejects_was_equal_to_own_name() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "review", "was": "review"}]}]
+            }]
+        }));
+        let error = profile.validate().expect_err("was equal to own name");
+        assert!(error.to_string().contains("equal to its own name"));
+    }
+
+    #[test]
+    fn rejects_was_colliding_with_a_declared_name() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "ratios": [0.5], "panes": [
+                    {"name": "review", "was": "shell"},
+                    {"name": "shell"}
+                ]}]
+            }]
+        }));
+        let error = profile
+            .validate()
+            .expect_err("was collides with a declared name");
+        assert!(error.to_string().contains("also a declared name"));
+    }
+
+    #[test]
+    fn accepts_a_valid_was_declaration() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "was": "legacy-dev",
+                "tabs": [{"name": "main", "panes": [{"name": "review", "was": "shell"}]}]
+            }]
+        }));
+        profile.validate().expect("valid was declaration");
     }
 
     #[test]

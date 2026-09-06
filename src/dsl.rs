@@ -74,7 +74,7 @@ def agent(kind, args = [], prompt = None, name = None):
         "name": name,
     })
 
-def _pane(name, label, cwd, env, serve, ready, after, adopt, agent, on_start, on_stop):
+def _pane(name, label, cwd, env, serve, ready, after, adopt, agent, on_start, on_stop, was):
     return _compact({
         "name": name,
         "label": label,
@@ -87,18 +87,20 @@ def _pane(name, label, cwd, env, serve, ready, after, adopt, agent, on_start, on
         "agent": agent,
         "on_start": on_start,
         "on_stop": on_stop,
+        "was": was,
     })
 
 def pane(name, label = None, cwd = None, env = {}, serve = None, ready = None,
-         after = [], adopt = None, agent = None, on_start = None, on_stop = None):
+         after = [], adopt = None, agent = None, on_start = None, on_stop = None,
+         was = None):
     if adopt != None:
         _warn("pane(\"" + name + "\", adopt = \"" + adopt + "\") is a v2 form; " +
               "rewrite as caller_pane(\"" + name + "\", ...)")
-    return _pane(name, label, cwd, env, serve, ready, after, adopt, agent, on_start, on_stop)
+    return _pane(name, label, cwd, env, serve, ready, after, adopt, agent, on_start, on_stop, was)
 
 def caller_pane(name, label = None, cwd = None, env = {}, serve = None, ready = None,
-                after = [], agent = None, on_start = None, on_stop = None):
-    return _pane(name, label, cwd, env, serve, ready, after, "caller", agent, on_start, on_stop)
+                after = [], agent = None, on_start = None, on_stop = None, was = None):
+    return _pane(name, label, cwd, env, serve, ready, after, "caller", agent, on_start, on_stop, was)
 
 # `herdr.RIGHT` / `herdr.DOWN` are the split constants. They carry a sentinel
 # value so the prelude can tell them apart from the raw "right"/"down" strings,
@@ -147,7 +149,7 @@ def _as_group(item):
         "panes": [item],
     })
 
-def workspace(name, panes = None, label = None, cwd = ".", env = {}, tabs = None):
+def workspace(name, panes = None, label = None, cwd = ".", env = {}, tabs = None, was = None):
     if tabs != None:
         _warn("workspace(\"" + name + "\", tabs = [...]) is a v2 form; " +
               "rewrite as workspace(\"" + name + "\", panes = [herdr.tab(...)])")
@@ -162,6 +164,7 @@ def workspace(name, panes = None, label = None, cwd = ".", env = {}, tabs = None
         "cwd": cwd,
         "env": env,
         "tabs": [_as_group(item) for item in source],
+        "was": was,
     })
 
 def task(name, run = [], check = None, inputs = [], after = [], auto = True,
