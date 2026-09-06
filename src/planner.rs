@@ -549,6 +549,13 @@ fn push_pane_content_change(
     serves: bool,
     ranked: &mut Vec<RankedAction>,
 ) {
+    // `model.rs` doesn't forbid declaring both `adopt = "caller"` and
+    // `serve` on the same pane. If it did, a content change here would
+    // propose restarting the command in the pane running the controller
+    // itself. No Drovefile in this repo combines them, and the example
+    // fixtures never exercise it; a validation rule belongs in `model.rs`
+    // if this combination needs to be rejected outright (out of scope for
+    // this PR — see PR 2 review on #4, finding 3).
     let backend_id = observed.map(|observed| observed.backend_id.clone());
     if serves {
         ranked.push((
@@ -673,6 +680,13 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 /// The v2 model has no declared `writes` for a task yet, so `inputs` stands
 /// in for both reads and writes (spec §5's `RunTask` row): two tasks that
 /// touch the same path without an `after` edge between them race.
+// The hazard pass here only checks task-vs-task overlap (spec §5's
+// `RunTask` row). Task-vs-pane hazards (a task's `inputs` overlapping a
+// running pane's `cwd`) are intentionally out of scope for this PR: the
+// brief's paraphrase of this item names only task ordering, and pane
+// `cwd` isn't tracked as a read/write surface anywhere else in this
+// module. Confirmed deferred, not dropped — see PR 2 review on #4,
+// finding 2.
 fn plan_tasks(ir: &Ir, profile: &Profile, snapshot: &Snapshot, ranked: &mut Vec<RankedAction>) {
     let task_resources: Vec<&Resource> = ir
         .resources
@@ -1269,13 +1283,33 @@ mod tests {
 
     #[test]
     fn moved_checkout_does_not_change_any_digest() {
-        // The v2 model never records an absolute repository path (cwd
-        // defaults to the relative `.`, D21 excludes backend ids), so
-        // planning the same profile twice — as if from two different
-        // checkout locations — always yields the same desired digest.
+        // D21: "digests never include the repository path". `Workspace.cwd`
+        // defaults to the relative `.` (see `default_cwd`) and `to_ir`
+        // never reads `std::env::current_dir()` or `Profile`'s own
+        // `repo_root` (that field doesn't exist — `dsl::compile` resolves
+        // `repo_root` only to read `file()` prompts, and never stores it
+        // on `Profile`). So the IR field itself — not just two identical
+        // builds of the same in-memory value — must stay the declared
+        // relative `.`, regardless of where the checkout that produced
+        // this `Profile` lives on disk.
         let profile = one_pane_profile();
+        let ir = profile.to_ir();
+        let workspace = ir
+            .resources
+            .iter()
+            .find(|resource| resource.kind == "workspace" && resource.name == "dev")
+            .expect("workspace resource");
+        assert_eq!(workspace.fields["cwd"], serde_json::json!("."));
+
+        // A second `Profile` built from a fixture that only varies in an
+        // absolute path having nothing to do with any declared field (here:
+        // two structurally identical profiles, standing in for the same
+        // Drovefile loaded from two different checkout directories) must
+        // still converge on the same digest, since nothing in the model
+        // carries that path into `fields`.
+        let moved = one_pane_profile();
         let first = build_plan(&profile, &Snapshot::default()).expect("plan");
-        let second = build_plan(&profile, &Snapshot::default()).expect("plan");
+        let second = build_plan(&moved, &Snapshot::default()).expect("plan");
         assert_eq!(first.desired_digest, second.desired_digest);
     }
 
