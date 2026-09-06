@@ -1,0 +1,33 @@
+.context/bin/controller-stop-hook.sh
+  s_f3085e9decf778::t_0117f8fa99c8cb 49,51-65
+  s_f3085e9decf778::t_8ee1f4f7c51682 42,46
+  s_f3085e9decf778::t_ecf9b30ebc71db 34-41,45
+  s_f3085e9decf778::t_847521ed28243b 70
+.context/bin/cursor-commit-reactor.sh
+  s_f3085e9decf778::t_7cfc41946c3ee7 186-189
+.context/bin/doc-sync-reactor.sh
+  s_f3085e9decf778::t_54cdac4db415e6 63-66,68-70
+  s_f3085e9decf778::t_fa5dd7bcde9cc3 21-22
+.context/bin/run-reactor.sh
+  s_f3085e9decf778::t_076940f591bf34 32-34,38-41,45
+  s_f3085e9decf778::t_59ffc90ebbc2c3 35-37,44
+  s_f3085e9decf778::t_75a0f7ed9c8fa3 15
+.githooks/commit-msg
+  s_f3085e9decf778::t_a51483e182d764 11-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e57bc126f35a0e35ba23c49cd5cb1e63184f1aa3",
+  "prompts": {},
+  "sessions": {
+    "s_f3085e9decf778": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "084616e2-2764-4ca6-8f18-e0d3cf2c70f2",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
