@@ -1,0 +1,29 @@
+src/backend/herdr.rs
+  s_8ae19895f34c5b::t_721c7031fe7dda 60-65,77
+  s_8ae19895f34c5b::t_2af123fe28feb0 8-9
+  s_8ae19895f34c5b::t_e6676c31fe8a80 732-768
+src/backend/radiator.rs
+  s_8ae19895f34c5b::t_3769e6e959dbf3 793-829
+  s_8ae19895f34c5b::t_ff9a0e34243e27 34,36
+  s_8ae19895f34c5b::t_b6768f130769ad 190-195,208
+.github/workflows/ci.yml
+  s_8ae19895f34c5b::t_ad4dc59fb4a402 45
+src/readiness.rs
+  s_8ae19895f34c5b::t_bb7fdb7ef59683 101,103-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f37a241ac8a9c08d596ddc386d3b8f579a8eb469",
+  "prompts": {},
+  "sessions": {
+    "s_8ae19895f34c5b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdfefb0f-547b-4a50-a50f-e923c1baf084",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
