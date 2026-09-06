@@ -98,9 +98,17 @@ fn kill_process_group(child: &mut Child) {
         .status();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn kill_process_group(child: &mut Child) {
-    let _ = child.kill();
+    // `Child::kill()` only kills the direct child (e.g. `sh.exe`), not
+    // descendants spawned by a shell script probe (e.g. `sleep 30 &`).
+    // `taskkill /T` kills the whole process tree rooted at the child's pid.
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 #[cfg(test)]

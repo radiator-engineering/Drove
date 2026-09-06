@@ -5,6 +5,8 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 
@@ -55,9 +57,12 @@ impl HerdrClient {
         let stream = connect(&self.socket_path).with_context(|| {
             format!("cannot connect to Herdr at {}", self.socket_path.display())
         })?;
-        stream
-            .set_recv_timeout(timeout)
-            .context("cannot set Herdr response timeout")?;
+        // Best-effort: Windows named pipes (interprocess 2.4.4) don't
+        // support socket-level receive timeouts and return `Unsupported`
+        // for this call regardless of `timeout`, so a failure here must not
+        // be fatal. The timeout is enforced independently below, on every
+        // platform, via a bounded read on a helper thread.
+        let _ = stream.set_recv_timeout(timeout);
         let mut stream = BufReader::new(stream);
         serde_json::to_writer(stream.get_mut(), &request).context("cannot encode Herdr request")?;
         stream
@@ -69,16 +74,7 @@ impl HerdrClient {
             .flush()
             .context("cannot flush Herdr request")?;
 
-        let mut line = String::new();
-        let read = stream
-            .read_line(&mut line)
-            .context("cannot read Herdr response")?;
-        if read == 0 {
-            bail!("Herdr closed the socket without a response");
-        }
-        if !line.ends_with('\n') {
-            bail!("Herdr returned a truncated response without an NDJSON newline");
-        }
+        let line = read_line_with_timeout(stream, timeout, "Herdr")?;
         let response: ApiResponse =
             serde_json::from_str(&line).context("Herdr returned invalid JSON")?;
         if response.id != request["id"] {
@@ -731,6 +727,43 @@ fn herdr_config_dir() -> PathBuf {
         return PathBuf::from(home).join(".config").join("herdr");
     }
     env::temp_dir().join("herdr")
+}
+
+/// Reads one NDJSON line, bounded by `timeout` regardless of whether the
+/// platform's local-socket backend honors a socket-level receive timeout
+/// (Windows named pipes, as of interprocess 2.4.4, do not). The blocking
+/// read runs on a helper thread; the caller waits on a channel instead of
+/// the read itself, so the bound applies on every OS. If the timeout
+/// elapses, the helper thread is left to finish (or leak) on its own —
+/// the socket has no way to be pulled out from under a blocking read.
+fn read_line_with_timeout(
+    mut stream: BufReader<Stream>,
+    timeout: Option<Duration>,
+    label: &str,
+) -> Result<String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let outcome = stream.read_line(&mut line).map(|read| (read, line));
+        let _ = sender.send(outcome);
+    });
+    let (read, line) = match timeout {
+        Some(duration) => receiver
+            .recv_timeout(duration)
+            .map_err(|_| anyhow::anyhow!("{label} response timed out after {duration:?}"))?
+            .with_context(|| format!("cannot read {label} response"))?,
+        None => receiver
+            .recv()
+            .context("response reader thread disconnected without a result")?
+            .with_context(|| format!("cannot read {label} response"))?,
+    };
+    if read == 0 {
+        bail!("{label} closed the socket without a response");
+    }
+    if !line.ends_with('\n') {
+        bail!("{label} returned a truncated response without an NDJSON newline");
+    }
+    Ok(line)
 }
 
 #[cfg(unix)]
