@@ -201,6 +201,13 @@ mod tests {
     }
 
     #[test]
+    // MSYS sh.exe fork emulation does not preserve the native parent-pid
+    // chain that taskkill /T walks, so the kill cannot be observed through
+    // this test on Windows; see D39.
+    #[cfg_attr(
+        windows,
+        ignore = "MSYS sh.exe fork emulation does not preserve the native parent-pid chain that taskkill /T walks, so the kill cannot be observed through this test on Windows; see D39"
+    )]
     fn cmd_probe_kills_a_descendant_spawned_by_a_shell_probe() {
         // The descendant reports its own pid immediately (well within the
         // probe's timeout) so this test can check liveness directly with
