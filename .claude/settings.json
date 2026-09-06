@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.context/bin/controller-stop-hook.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

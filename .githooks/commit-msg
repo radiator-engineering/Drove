@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Strip cursor-agent's auto-injected co-author trailer from commit messages.
+# The autonomous committer runs Composer 2.5 Fast via cursor-agent, which appends
+# `Co-authored-by: Cursor <cursoragent@cursor.com>`; this repo does not want that
+# AI attribution in history. (Claude's trailer is left intact on purpose.)
+# Enabled via:  git config core.hooksPath .githooks
+set -euo pipefail
+msg_file="$1"
+tmp="$(mktemp)"
+# drop the Cursor/Composer co-author line(s)
+grep -viE '^Co-authored-by: (Cursor|Composer)\b' "$msg_file" > "$tmp" || true
+# drop any blank lines left dangling at the end, keep the rest verbatim
+awk 'NF{last=NR} {line[NR]=$0} END{for(i=1;i<=last;i++) print line[i]}' "$tmp" > "$msg_file"
+rm -f "$tmp"
