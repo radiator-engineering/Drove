@@ -1,0 +1,23 @@
+.context/DECISIONS.md
+  s_5213c0d852466f::t_a7484c5f331d27 86
+  s_5213c0d852466f::t_29160a538b9db1 87
+  s_5213c0d852466f::t_5d9c74fe67c094 90
+  s_5213c0d852466f::t_ee999bfadcf9e4 88
+  s_5213c0d852466f::t_b484be0c08aea7 89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "cd88b18945af052dacdba9d17677bf26eb78bf9d",
+  "prompts": {},
+  "sessions": {
+    "s_5213c0d852466f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "97ba7d22-31ef-4bde-ad62-eca25a35ad1a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
