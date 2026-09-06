@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod cli;
 pub mod dsl;
+pub mod executor;
 pub mod ir;
 pub mod model;
 pub mod planner;

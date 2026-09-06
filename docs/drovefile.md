@@ -72,7 +72,7 @@ pane(
 
 Readiness gates `after`: `output("watching")` matches pane output, `port(8080)` probes a TCP port, `cmd(["curl", "-f", "..."])` runs a command. The reconciler is planned to re-check readiness on every reconcile, not just at start; this PR only compiles readiness into the IR.
 
-`on_start` and `on_stop` are argv hooks Drove is planned to run once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and backend ids in the environment. Task and hook execution are not implemented yet — the planner in this PR always reports the profile as in sync.
+`on_start` and `on_stop` are argv hooks Drove runs once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and (when known) `DROVE_BACKEND_ID` in the environment. `task()` hooks run around `run`: `on_start` fires once `run` has executed, whether or not it succeeded. Pane hooks fire once pane reconciliation against a live backend exists; today `on_start` on a pane is parsed and carried into the IR but not yet run, and `on_stop` on a pane runs only from `drove down`. Every hook argv is approval-gated the same way a task's `run` is (`drove run --yes` / `drove up --yes` / `drove down --yes` to approve on the spot).
 
 ## Agents
 
@@ -108,7 +108,9 @@ task(
 )
 ```
 
-If `check` succeeds, Drove is planned to skip `run`. `auto = True` (the default) is planned to run the task during reconciliation once its `after` set is ready; `auto = False` requires an explicit `drove run <name>`. Task dependencies (`after`) form a directed acyclic graph together with pane `after` references, since both live in the same namespace. This PR validates that graph but does not execute tasks; the planner always reports the profile as in sync.
+If `check` succeeds, `drove up` skips `run` (early cutoff). `auto = True` (the default) runs the task during `drove up` once its `after` set is ready; `auto = False` requires an explicit `drove run <name>`. Task dependencies (`after`) form a directed acyclic graph together with pane `after` references, since both live in the same namespace.
+
+Running `run` is approval-gated on the digest of its argv: the first time it needs to run, `drove up`/`drove run` reports it as blocked until re-run with `--yes` (or the same digest is approved again after the task's declared `run` changes).
 
 ## Commands
 
@@ -117,8 +119,12 @@ drove status [--profile NAME] [--json]
 drove plan   [--profile NAME] [--json]
 drove up     [--profile NAME] [--yes] [--allow-replace]
 drove render [--profile NAME] [--json]
+drove run    [NAME] [--yes]
+drove down   [--profile NAME] [--purge] [--yes]
 ```
 
 `drove render` prints the compiled intermediate representation (schema version 2): a flat, deterministically ordered list of typed resources, each carrying a content digest. It performs no backend I/O.
+
+`drove up` also runs every `auto = True` task the plan proposes (`RunTask` actions), in `after` order; reconciling workspaces, tabs, panes and agents against a live backend is a later PR. `drove run NAME` runs one task and its `after` prerequisites, and nothing else declared in the profile; with no `NAME`, it lists every declared task and its last recorded outcome. `drove down` runs each owned resource's `on_stop` hook, then stops tracking it (`--purge` also closes owned panes on the backend); it never touches a pane the backend doesn't report as owned by this profile.
 
 Use `--file PATH`, `--socket PATH`, or `--session NAME` when discovery defaults are not appropriate.
