@@ -1,0 +1,19 @@
+docs/superpowers/specs/2026-09-06-drove-v3-core-and-flavors-design.md
+  s_34df9ea78db233::t_a845efa636e131 1-329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "14c0e1779ee6865155ad187c44f375b79196c8f2",
+  "prompts": {},
+  "sessions": {
+    "s_34df9ea78db233": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2c3c33b4-b117-4c88-98fc-34a51f420019",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
