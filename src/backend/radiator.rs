@@ -43,10 +43,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Backend, Capabilities, ProcessInfo,
-    herdr::{AgentInfo, ExportedLayout, PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo},
+    Backend, Capabilities, PaneSpec, ProcessInfo,
+    herdr::{AgentInfo, PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo},
 };
-use crate::model::SplitDirection;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -475,17 +474,10 @@ impl Backend for RadiatorClient {
     fn capabilities(&self) -> Capabilities {
         let hub = self.hub_capabilities();
         Capabilities {
-            tabs: false,
-            splits_and_ratios: false,
             // `workspace.open` takes only `name`; no `cwd`/`env` param
             // exists to verify against (recon-radiator-report §6).
             workspace_env: false,
             pane_command_at_create: true,
-            // No `agent.start`; an agent is run as a `serve` command instead
-            // (spec §3 capability table).
-            agent_start: false,
-            agent_prompt: true,
-            adopt_caller: true,
             // From `hub.capabilities` (D35): tokens live in the local
             // journal only when the hub reports no metadata support.
             metadata_tokens: hub.metadata,
@@ -578,70 +570,22 @@ impl Backend for RadiatorClient {
         self.open_workspace(label)
     }
 
-    fn create_tab(
-        &self,
-        workspace_id: &str,
-        tab_label: &str,
-        root: Value,
-    ) -> Result<ExportedLayout> {
-        let mut specs = Vec::new();
-        collect_pane_specs(&root, &mut specs);
-        if specs.is_empty() {
-            specs.push(PaneSpec::default());
-        }
-        if specs.len() > 1 || has_split(&root) {
-            eprintln!(
-                "warning: Radiator hub has no tabs or splits; flattening tab `{tab_label}` in workspace `{workspace_id}` into {} pane(s)",
-                specs.len()
-            );
-        }
-
-        let mut pane_ids = Vec::new();
-        for spec in &specs {
-            let title = spec.title.as_deref().unwrap_or(tab_label);
-            let command = spec.command.first().map(String::as_str);
-            let args = spec.command.get(1..).unwrap_or(&[]);
-            let pane_id = self.open_pane(
-                workspace_id,
-                "term",
-                title,
-                command,
-                args,
-                spec.cwd.as_deref(),
-                &spec.env,
-            )?;
-            pane_ids.push(pane_id);
-        }
-
-        let root = pane_ids
-            .into_iter()
-            .rev()
-            .fold(None, |acc, pane_id| {
-                let node = json!({"type": "pane", "pane_id": pane_id});
-                Some(match acc {
-                    None => node,
-                    Some(rest) => json!({"type": "split", "first": node, "second": rest}),
-                })
-            })
-            .unwrap_or_else(|| json!({"type": "pane", "pane_id": Value::Null}));
-
-        Ok(ExportedLayout {
-            workspace_id: workspace_id.to_owned(),
-            tab_id: flat_tab_id(workspace_id),
-            root,
-        })
-    }
-
-    fn split_pane(
-        &self,
-        _pane_id: &str,
-        _direction: SplitDirection,
-        _ratio: f64,
-        _command: Option<&[String]>,
-        _cwd: Option<&Path>,
-    ) -> Result<String> {
-        bail!(
-            "Radiator hub has no pane splits (capabilities().splits_and_ratios is false); open a new pane in the workspace instead"
+    /// Opens one pane in the workspace from a placement-free [`PaneSpec`].
+    /// The hub has no tab or split layer, so every Drove pane is a flat hub
+    /// pane; the argv's head is the command and its tail the args.
+    fn create_pane(&self, workspace_id: &str, spec: &PaneSpec) -> Result<String> {
+        let argv = spec.command.clone().unwrap_or_default();
+        let command = argv.first().map(String::as_str);
+        let args = argv.get(1..).unwrap_or(&[]);
+        let title = spec.label.as_deref().unwrap_or("pane");
+        self.open_pane(
+            workspace_id,
+            "term",
+            title,
+            command,
+            args,
+            spec.cwd.as_deref(),
+            &spec.env,
         )
     }
 
@@ -649,34 +593,22 @@ impl Backend for RadiatorClient {
         RadiatorClient::close_pane(self, pane_id)
     }
 
-    fn set_ratio(&self, _tab_id: &str, _ratios: &[f64]) -> Result<()> {
-        bail!("Radiator hub has no split ratios (capabilities().splits_and_ratios is false)")
-    }
-
     fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<()> {
         RadiatorClient::rename_workspace(self, workspace_id, label)
-    }
-
-    fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<()> {
-        // Radiator has no tab layer to rename; the tab's label is carried
-        // only on the panes Drove opens under it (create_tab's `title`).
-        Ok(())
     }
 
     fn rename_pane(&self, pane_id: &str, label: &str) -> Result<()> {
         RadiatorClient::rename_pane(self, pane_id, label)
     }
 
-    fn start_agent(
-        &self,
-        _pane_id: &str,
-        _name: &str,
-        _kind: &str,
-        _args: &[String],
-    ) -> Result<()> {
-        bail!(
-            "Radiator hub has no agent.start (capabilities().agent_start is false); declare the agent's argv as the pane's `serve` command instead"
-        )
+    /// Re-runs the command in an existing pane by typing the argv and
+    /// submitting it; the hub has no in-place restart verb.
+    fn restart_command(&self, pane_id: &str, argv: &[String]) -> Result<()> {
+        if argv.is_empty() {
+            return Ok(());
+        }
+        self.send_text(pane_id, &shell_join(argv))?;
+        self.send_keys(pane_id, &["enter"])
     }
 
     fn prompt_agent(&self, pane_id: &str, prompt: &str) -> Result<()> {
@@ -697,75 +629,13 @@ impl Backend for RadiatorClient {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-struct PaneSpec {
-    title: Option<String>,
-    command: Vec<String>,
-    cwd: Option<PathBuf>,
-    env: BTreeMap<String, String>,
-}
-
-/// Walk an IR tab's `root` layout tree, collecting one [`PaneSpec`] per leaf
-/// pane in left-to-right order. The exact shape of `root` is the planner's
-/// (PR 2); this accepts the same `{"type": "split"|"pane", ...}` shape
-/// [`ExportedLayout::pane_ids_preorder`] already reads, plus a `panes` list
-/// for a flat tab with no split at all, and falls back to treating an
-/// unrecognized leaf as one pane rather than dropping it.
-fn collect_pane_specs(node: &Value, out: &mut Vec<PaneSpec>) {
-    if let Some(panes) = node.get("panes").and_then(Value::as_array) {
-        for pane in panes {
-            collect_pane_specs(pane, out);
-        }
-        return;
-    }
-    if let (Some(first), Some(second)) = (node.get("first"), node.get("second")) {
-        collect_pane_specs(first, out);
-        collect_pane_specs(second, out);
-        return;
-    }
-    out.push(pane_spec_from(node));
-}
-
-fn has_split(node: &Value) -> bool {
-    node.get("type").and_then(Value::as_str) == Some("split")
-        || (node.get("first").is_some() && node.get("second").is_some())
-}
-
-fn pane_spec_from(node: &Value) -> PaneSpec {
-    let title = node
-        .get("title")
-        .or_else(|| node.get("label"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let command = node
-        .get("command")
-        .or_else(|| node.get("serve"))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let cwd = node.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-    let env = node
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|object| {
-            object
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
-                .collect()
-        })
-        .unwrap_or_default();
-    PaneSpec {
-        title,
-        command,
-        cwd,
-        env,
-    }
+/// Quotes each argument for a POSIX shell so a typed `restart_command` argv
+/// survives word splitting when the hub submits it as a line of text.
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn flat_tab_id(workspace_id: &str) -> String {
@@ -1094,38 +964,35 @@ mod tests {
     }
 
     #[test]
-    fn create_tab_flattens_multiple_panes_into_preorder_ids() {
+    fn create_pane_opens_one_flat_hub_pane_from_the_spec() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("hub-flatten.sock");
+        let path = directory.path().join("hub-create-pane.sock");
         let listener = bind(&path).expect("bind fake hub");
         thread::spawn(move || {
-            for expected_id in ["w0:p1", "w0:p2"] {
-                let stream = listener.accept().expect("accept");
-                let mut stream = BufReader::new(stream);
-                let mut line = String::new();
-                stream.read_line(&mut line).expect("read");
-                let request: Value = serde_json::from_str(&line).expect("request JSON");
-                assert_eq!(request["method"], "pane.open");
-                let response = json!({
-                    "id": request["id"],
-                    "result": {"id": expected_id, "kind": "term", "title": "p", "runner": "idle"}
-                });
-                serde_json::to_writer(stream.get_mut(), &response).expect("write");
-                stream.get_mut().write_all(b"\n").expect("newline");
-            }
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            assert_eq!(request["method"], "pane.open");
+            assert_eq!(request["params"]["command"], "lazygit");
+            assert_eq!(request["params"]["args"], json!(["--all"]));
+            let response = json!({
+                "id": request["id"],
+                "result": {"id": "w0:p1", "kind": "term", "title": "gitlog", "runner": "idle"}
+            });
+            serde_json::to_writer(stream.get_mut(), &response).expect("write");
+            stream.get_mut().write_all(b"\n").expect("newline");
         });
 
         let client = RadiatorClient::new(path);
-        let root = json!({
-            "type": "split",
-            "first": {"type": "pane", "command": ["bash"]},
-            "second": {"type": "pane", "command": ["lazygit"]},
-        });
-        let layout = client
-            .create_tab("w0", "lazygit", root)
-            .expect("create tab");
-        assert_eq!(layout.pane_ids_preorder(), ["w0:p1", "w0:p2"]);
-        assert_eq!(layout.tab_id, "w0:panes");
+        let spec = PaneSpec {
+            label: Some("gitlog".into()),
+            command: Some(vec!["lazygit".into(), "--all".into()]),
+            ..PaneSpec::default()
+        };
+        let pane_id = Backend::create_pane(&client, "w0", &spec).expect("create pane");
+        assert_eq!(pane_id, "w0:p1");
     }
 
     #[test]
@@ -1412,22 +1279,13 @@ mod tests {
     }
 
     #[test]
-    fn split_pane_and_set_ratio_report_the_missing_capability() {
+    fn radiator_offers_no_herdr_flavor() {
+        // Tabs, splits, ratios and agent start are the Herdr flavor (D28).
+        // Radiator does not implement it, so the accessor is `None` and the
+        // executor answers `Unsupported` for any `Herdr(..)` action rather
+        // than the backend faking a degraded no-op.
         let client = RadiatorClient::new(PathBuf::from("/nonexistent.sock"));
-        let split_error =
-            Backend::split_pane(&client, "w0:p1", SplitDirection::Right, 0.5, None, None)
-                .expect_err("no splits");
-        assert!(split_error.to_string().contains("splits"));
-        let ratio_error = Backend::set_ratio(&client, "w0:panes", &[0.5]).expect_err("no ratios");
-        assert!(ratio_error.to_string().contains("ratios"));
-    }
-
-    #[test]
-    fn start_agent_reports_the_missing_capability() {
-        let client = RadiatorClient::new(PathBuf::from("/nonexistent.sock"));
-        let error = Backend::start_agent(&client, "w0:p1", "review", "claude", &[])
-            .expect_err("no agent.start");
-        assert!(error.to_string().contains("agent.start"));
+        assert!(client.herdr().is_none());
     }
 
     #[test]

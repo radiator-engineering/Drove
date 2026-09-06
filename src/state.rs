@@ -112,8 +112,9 @@ impl LocalState {
 pub struct ManagedProfile {
     #[serde(default)]
     pub desired_digest: String,
-    /// One entry per resource identity (D5: a plain name, except a tab's
-    /// `workspace/tab`), the source of ownership `to_snapshot` reads back
+    /// One entry per resource identity (D5: a plain name; a Herdr placement
+    /// group's identity is `workspace/<name>` and its digest is the group's
+    /// topology digest, D30), the source of ownership `to_snapshot` reads back
     /// (spec §5: "observed digest at apply time, runtime ids").
     #[serde(default)]
     pub resources: BTreeMap<String, ManagedResource>,
@@ -148,7 +149,8 @@ impl ManagedProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedResource {
-    /// IR resource kind (`workspace`, `tab`, `pane`, `agent`, `task`).
+    /// IR resource kind (`workspace`, `pane`, `agent`, `task`) or
+    /// `placement` for a Herdr group (D29).
     pub kind: String,
     pub backend_id: String,
     #[serde(default)]

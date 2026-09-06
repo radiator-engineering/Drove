@@ -1,38 +1,35 @@
 //! Plans the reconciliation actions needed to converge a `Profile`'s
 //! compiled IR against a backend-observed [`Snapshot`] (spec §5, D5, D9,
-//! D16, D17, D21, D22).
+//! D16, D17, D21, D22, D29, D30).
 //!
 //! Ownership is decided by comparing each resource's declared identity
-//! (`drove_name`/`drove_profile`) and content digest (`drove_digest`,
-//! D21) against what the snapshot reports for that identity:
+//! (`drove_name`/`drove_profile`) and content digest (`drove_digest`, D21)
+//! against what the snapshot reports for that identity:
 //!
 //! - no observed entry: the resource is declared but absent -> create it.
 //! - observed, no owner token: unmanaged -> never touched.
 //! - observed, owned by this profile, same digest: converged -> no action.
 //! - observed, owned by this profile, different digest: a content change
-//!   (`RestartCommand`/`RenamePane`/`RenameWorkspace`/...) unless the
-//!   resource's structural parent moved, which is a topology change and is
-//!   handled as a destructive `ClosePane` followed by a fresh `SplitPane`
-//!   (D22).
+//!   (`RestartCommand`/`RenamePane`/`RenameWorkspace`/...) unless the pane's
+//!   placement group moved, which is a topology change handled as a
+//!   destructive `ClosePane` followed by a fresh `SplitPane` (D22).
 //! - owned by this profile, no longer declared: `Detach` (leave it running,
 //!   stop tracking it; only `drove down` closes owned resources).
 //!
-//! A resource's identity is its own declared name (D5) except a tab, whose
-//! identity is `workspace/tab` (its scope per the model in spec §3); this is
-//! deliberately not the same as [`crate::ir::Resource::parent`]-chained
-//! address `to_ir` builds for content-digest aggregation.
+//! A resource's identity is its own declared name (D5). A Herdr placement
+//! group's identity is `workspace/<name>`, the scope its panes share; the
+//! group is derived from the panes' placements (D29), not a resource of its
+//! own, so the IR carries it in [`crate::ir::Ir::placements`].
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ir::{Ir, Resource},
+    ir::{Ir, PlacementGroup, Resource},
     model::Profile,
 };
 
@@ -44,9 +41,9 @@ pub enum SyncStatus {
 }
 
 /// What the backend currently reports for one resource identity. Real
-/// backends read ownership tokens back (D16); until that lands (PR 3),
-/// callers build this from [`crate::state::LocalState`], which is the
-/// declared fallback in the same discovery order.
+/// backends read ownership tokens back (D16); until that lands, callers build
+/// this from [`crate::state::LocalState`], the declared fallback in the same
+/// discovery order.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     /// The pane id of the invoking terminal, if any (`Backend::caller_pane_id`).
@@ -56,13 +53,13 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone)]
 pub struct Observed {
-    /// IR resource kind (`workspace`, `tab`, `pane`, `agent`, `task`),
-    /// needed only to order a `Detach` action for a resource that is no
-    /// longer declared at all.
+    /// IR resource kind (`workspace`, `pane`, `agent`, `task`) or `placement`
+    /// for a Herdr group, needed only to order a `Detach` for a resource no
+    /// longer declared.
     pub kind: String,
     pub backend_id: String,
-    /// The identity of this resource's current structural parent, used to
-    /// detect a topology change (a pane moved to a different tab).
+    /// The identity of this resource's current placement group, used to
+    /// detect a topology change (a pane moved to a different group).
     pub parent: Option<String>,
     pub owner: Option<Owner>,
 }
@@ -134,7 +131,7 @@ pub struct Plan {
     /// adopted, or created normally because no caller pane was found (D24).
     #[serde(default)]
     pub adopted: BTreeMap<String, bool>,
-    pub actions: Vec<Action>,
+    pub actions: Vec<PlannedAction>,
 }
 
 impl Plan {
@@ -170,11 +167,13 @@ impl Plan {
     }
 }
 
+/// One planned reconciliation action. `kind` nests by flavor (D29): a core
+/// verb every backend honors, or a flavor verb that yields `Unsupported` on a
+/// backend without that flavor.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Action {
-    pub kind: ActionKind,
-    /// The target resource's IR identity (D5): a plain name, except a tab's
-    /// `workspace/tab`.
+pub struct PlannedAction {
+    pub kind: Action,
+    /// The target resource's IR identity (D5).
     pub address: String,
     /// The backend id, when the resource (or, for a fresh create, its
     /// neighbour) is already known to the backend.
@@ -183,25 +182,47 @@ pub struct Action {
     pub reason: String,
 }
 
+/// An action nested by flavor (spec §4, D29).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ActionKind {
+pub enum Action {
+    Core(CoreAction),
+    Herdr(HerdrAction),
+    Radiator(RadiatorAction),
+}
+
+/// Verbs every backend implements fully (spec §4).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreAction {
     CreateWorkspace,
     RenameWorkspace,
-    CreateTab,
-    RenameTab,
-    SplitPane,
+    CreatePane,
     ClosePane,
-    SetRatio,
     RenamePane,
     RestartCommand,
     AdoptPane,
-    StartAgent,
     PromptAgent,
     RunTask,
     Detach,
     Conflict,
 }
+
+/// Verbs only the Herdr flavor implements (spec §4).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrAction {
+    CreateTab,
+    RenameTab,
+    SplitPane,
+    SetRatio,
+    StartAgent,
+}
+
+/// Verbs only the Radiator flavor implements. None yet (spec §8, D37).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RadiatorAction {}
 
 const RANK_WORKSPACE: u8 = 0;
 const RANK_TAB: u8 = 1;
@@ -220,21 +241,7 @@ const PHASE_UPDATE: u8 = 3;
 const PHASE_DETACH: u8 = 4;
 const PHASE_CONFLICT: u8 = 5;
 
-type RankedAction = (u8, u8, String, Action);
-
-/// A resource's identity for ownership purposes (D5): its own name, except
-/// a tab, whose identity is scoped to its workspace.
-fn identity(resource: &Resource) -> String {
-    if resource.kind == "tab" {
-        format!(
-            "{}/{}",
-            resource.parent.as_deref().unwrap_or(""),
-            resource.name
-        )
-    } else {
-        resource.name.clone()
-    }
-}
+type RankedAction = (u8, u8, String, PlannedAction);
 
 fn effective_owner<'a>(observed: &'a Observed, profile: &str) -> Option<&'a Owner> {
     observed
@@ -247,32 +254,43 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
     let ir = profile.to_ir();
     let mut ranked: Vec<RankedAction> = Vec::new();
     let mut adopted: BTreeMap<String, bool> = BTreeMap::new();
-    let declared: BTreeSet<String> = ir.resources.iter().map(identity).collect();
 
-    let mut tabs_with_adopt: BTreeSet<String> = BTreeSet::new();
+    let mut declared: BTreeSet<String> = ir.resources.iter().map(|r| r.name.clone()).collect();
+    for group in &ir.placements {
+        declared.insert(group.id.clone());
+    }
+
+    // A placement group that holds an `adopt = "caller"` pane already exists
+    // in the backend around that live pane, even on a first run.
+    let mut groups_with_adopt: BTreeSet<String> = BTreeSet::new();
     for resource in &ir.resources {
         if resource.kind == "pane"
             && resource.fields.get("adopt").and_then(Value::as_str) == Some("caller")
-            && let Some(tab_id) = &resource.parent
+            && let Some(group_id) = &resource.parent
         {
-            tabs_with_adopt.insert(tab_id.clone());
+            groups_with_adopt.insert(group_id.clone());
         }
     }
 
-    let mut tab_fresh: BTreeMap<String, bool> = BTreeMap::new();
+    for resource in &ir.resources {
+        if resource.kind == "workspace" {
+            plan_workspace(resource, profile, snapshot, &mut ranked);
+        }
+    }
+
+    let mut group_fresh: BTreeMap<String, bool> = BTreeMap::new();
+    for group in &ir.placements {
+        let has_adopt_caller =
+            groups_with_adopt.contains(&group.id) && snapshot.caller_pane_id.is_some();
+        let fresh = plan_group(group, profile, snapshot, has_adopt_caller, &mut ranked);
+        group_fresh.insert(group.id.clone(), fresh);
+    }
+
     for resource in &ir.resources {
         match resource.kind.as_str() {
-            "workspace" => plan_workspace(resource, profile, snapshot, &mut ranked),
-            "tab" => {
-                let id = identity(resource);
-                let has_adopt_caller =
-                    tabs_with_adopt.contains(&id) && snapshot.caller_pane_id.is_some();
-                let fresh = plan_tab(resource, profile, snapshot, has_adopt_caller, &mut ranked);
-                tab_fresh.insert(id, fresh);
-            }
             "pane" => {
-                let tab_id = resource.parent.clone().unwrap_or_default();
-                let fresh = *tab_fresh.get(&tab_id).unwrap_or(&false);
+                let group_id = resource.parent.clone().unwrap_or_default();
+                let fresh = *group_fresh.get(&group_id).unwrap_or(&false);
                 plan_pane(
                     resource,
                     profile,
@@ -283,7 +301,6 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
                 );
             }
             "agent" => plan_agent(resource, profile, snapshot, &mut ranked),
-            "task" => {}
             _ => {}
         }
     }
@@ -294,7 +311,7 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
     ranked.sort_by(|left, right| {
         (left.0, left.1, left.2.as_str()).cmp(&(right.0, right.1, right.2.as_str()))
     });
-    let actions: Vec<Action> = ranked.into_iter().map(|(_, _, _, action)| action).collect();
+    let actions: Vec<PlannedAction> = ranked.into_iter().map(|(_, _, _, action)| action).collect();
     let status = if actions.is_empty() {
         SyncStatus::InSync
     } else {
@@ -316,14 +333,14 @@ fn plan_workspace(
     snapshot: &Snapshot,
     ranked: &mut Vec<RankedAction>,
 ) {
-    let id = identity(resource);
+    let id = resource.name.clone();
     match snapshot.resources.get(&id) {
         None => ranked.push((
             RANK_WORKSPACE,
             PHASE_CREATE,
             id.clone(),
-            Action {
-                kind: ActionKind::CreateWorkspace,
+            PlannedAction {
+                kind: Action::Core(CoreAction::CreateWorkspace),
                 address: id,
                 backend_id: None,
                 destructive: false,
@@ -338,8 +355,8 @@ fn plan_workspace(
                     RANK_WORKSPACE,
                     PHASE_RENAME,
                     id.clone(),
-                    Action {
-                        kind: ActionKind::RenameWorkspace,
+                    PlannedAction {
+                        kind: Action::Core(CoreAction::RenameWorkspace),
                         address: id,
                         backend_id: Some(observed.backend_id.clone()),
                         destructive: false,
@@ -351,34 +368,32 @@ fn plan_workspace(
     }
 }
 
-/// Plans the tab itself. Returns whether the tab is freshly created this
-/// plan, in which case its panes and agents are subsumed into the one
+/// Plans a Herdr placement group. Returns whether the group is freshly
+/// created this plan, in which case its panes are subsumed into the one
 /// `CreateTab` layout application (item 4) rather than planned individually.
-fn plan_tab(
-    resource: &Resource,
+fn plan_group(
+    group: &PlacementGroup,
     profile: &Profile,
     snapshot: &Snapshot,
     has_adopt_caller: bool,
     ranked: &mut Vec<RankedAction>,
 ) -> bool {
-    let id = identity(resource);
+    let id = group.id.clone();
     let observed = snapshot.resources.get(&id);
 
-    // A tab holding an `adopt = "caller"` pane with a live caller already
-    // exists in the backend around that pane, even on a first run where the
-    // planner has no snapshot entry for it yet.
     let is_fresh = observed.is_none() && !has_adopt_caller;
     if is_fresh {
         ranked.push((
             RANK_TAB,
             PHASE_CREATE,
             id.clone(),
-            Action {
-                kind: ActionKind::CreateTab,
+            PlannedAction {
+                kind: Action::Herdr(HerdrAction::CreateTab),
                 address: id,
                 backend_id: None,
                 destructive: false,
-                reason: "tab declared but not observed; applying as a new layout".into(),
+                reason: "placement group declared but not observed; applying as a new layout"
+                    .into(),
             },
         ));
         return true;
@@ -386,31 +401,31 @@ fn plan_tab(
 
     if let Some(observed) = observed
         && let Some(owner) = effective_owner(observed, &profile.name)
-        && owner.digest != resource.digest
+        && owner.digest != group.topology_digest
     {
         let backend_id = Some(observed.backend_id.clone());
         ranked.push((
             RANK_TAB,
             PHASE_RENAME,
             id.clone(),
-            Action {
-                kind: ActionKind::RenameTab,
+            PlannedAction {
+                kind: Action::Herdr(HerdrAction::RenameTab),
                 address: id.clone(),
                 backend_id: backend_id.clone(),
                 destructive: false,
-                reason: "tab label changed".into(),
+                reason: "placement group label changed".into(),
             },
         ));
         ranked.push((
             RANK_TAB,
             PHASE_UPDATE,
             id.clone(),
-            Action {
-                kind: ActionKind::SetRatio,
+            PlannedAction {
+                kind: Action::Herdr(HerdrAction::SetRatio),
                 address: id,
                 backend_id,
                 destructive: false,
-                reason: "tab layout ratios changed".into(),
+                reason: "placement group ratios changed".into(),
             },
         ));
     }
@@ -431,11 +446,11 @@ fn plan_pane(
     resource: &Resource,
     profile: &Profile,
     snapshot: &Snapshot,
-    tab_fresh: bool,
+    group_fresh: bool,
     ranked: &mut Vec<RankedAction>,
     adopted: &mut BTreeMap<String, bool>,
 ) {
-    let id = identity(resource);
+    let id = resource.name.clone();
     let is_adopt = resource.fields.get("adopt").and_then(Value::as_str) == Some("caller");
     let serves = pane_serves(resource);
     let observed = snapshot.resources.get(&id);
@@ -449,8 +464,8 @@ fn plan_pane(
                     RANK_PANE,
                     PHASE_CREATE,
                     id.clone(),
-                    Action {
-                        kind: ActionKind::AdoptPane,
+                    PlannedAction {
+                        kind: Action::Core(CoreAction::AdoptPane),
                         address: id,
                         backend_id: Some(caller_id.clone()),
                         destructive: false,
@@ -461,12 +476,12 @@ fn plan_pane(
             (Some(_), Some(owner)) => {
                 adopted.insert(resource.name.clone(), true);
                 if owner.digest != resource.digest {
-                    push_pane_content_change(resource, &id, observed, serves, ranked);
+                    push_pane_content_change(&id, observed, serves, ranked);
                 }
             }
             (None, _) => {
                 adopted.insert(resource.name.clone(), false);
-                if !tab_fresh {
+                if !group_fresh {
                     plan_normal_pane(resource, &id, profile, snapshot, serves, ranked);
                 }
             }
@@ -474,7 +489,7 @@ fn plan_pane(
         return;
     }
 
-    if tab_fresh {
+    if group_fresh {
         return;
     }
     plan_normal_pane(resource, &id, profile, snapshot, serves, ranked);
@@ -493,12 +508,12 @@ fn plan_normal_pane(
             RANK_PANE,
             PHASE_CREATE,
             id.to_owned(),
-            Action {
-                kind: ActionKind::SplitPane,
+            PlannedAction {
+                kind: Action::Herdr(HerdrAction::SplitPane),
                 address: id.to_owned(),
                 backend_id: None,
                 destructive: false,
-                reason: "pane declared but not observed; splitting it into the tab".into(),
+                reason: "pane declared but not observed; splitting it into the group".into(),
             },
         ));
         return;
@@ -508,7 +523,7 @@ fn plan_normal_pane(
         return; // unmanaged: never touched
     };
 
-    if owner.digest == resource.digest {
+    if owner.digest == resource.digest && observed.parent.as_deref() == resource.parent.as_deref() {
         return; // converged
     }
 
@@ -517,53 +532,46 @@ fn plan_normal_pane(
             RANK_PANE,
             PHASE_CLOSE,
             id.to_owned(),
-            Action {
-                kind: ActionKind::ClosePane,
+            PlannedAction {
+                kind: Action::Core(CoreAction::ClosePane),
                 address: id.to_owned(),
                 backend_id: Some(observed.backend_id.clone()),
                 destructive: true,
-                reason: "pane moved to a different tab; closing the old placement".into(),
+                reason: "pane moved to a different placement group; closing the old placement"
+                    .into(),
             },
         ));
         ranked.push((
             RANK_PANE,
             PHASE_CREATE,
             id.to_owned(),
-            Action {
-                kind: ActionKind::SplitPane,
+            PlannedAction {
+                kind: Action::Herdr(HerdrAction::SplitPane),
                 address: id.to_owned(),
                 backend_id: None,
                 destructive: false,
-                reason: "recreating the pane in its new tab".into(),
+                reason: "recreating the pane in its new placement group".into(),
             },
         ));
     } else {
-        push_pane_content_change(resource, id, Some(observed), serves, ranked);
+        push_pane_content_change(id, Some(observed), serves, ranked);
     }
 }
 
 fn push_pane_content_change(
-    _resource: &Resource,
     id: &str,
     observed: Option<&Observed>,
     serves: bool,
     ranked: &mut Vec<RankedAction>,
 ) {
-    // `model.rs` doesn't forbid declaring both `adopt = "caller"` and
-    // `serve` on the same pane. If it did, a content change here would
-    // propose restarting the command in the pane running the controller
-    // itself. No Drovefile in this repo combines them, and the example
-    // fixtures never exercise it; a validation rule belongs in `model.rs`
-    // if this combination needs to be rejected outright (out of scope for
-    // this PR — see PR 2 review on #4, finding 3).
     let backend_id = observed.map(|observed| observed.backend_id.clone());
     if serves {
         ranked.push((
             RANK_PANE,
             PHASE_UPDATE,
             id.to_owned(),
-            Action {
-                kind: ActionKind::RestartCommand,
+            PlannedAction {
+                kind: Action::Core(CoreAction::RestartCommand),
                 address: id.to_owned(),
                 backend_id,
                 destructive: false,
@@ -575,8 +583,8 @@ fn push_pane_content_change(
             RANK_PANE,
             PHASE_RENAME,
             id.to_owned(),
-            Action {
-                kind: ActionKind::RenamePane,
+            PlannedAction {
+                kind: Action::Core(CoreAction::RenamePane),
                 address: id.to_owned(),
                 backend_id,
                 destructive: false,
@@ -592,7 +600,7 @@ fn plan_agent(
     snapshot: &Snapshot,
     ranked: &mut Vec<RankedAction>,
 ) {
-    let id = identity(resource);
+    let id = resource.name.clone();
     let has_prompt = resource
         .fields
         .get("prompt")
@@ -604,8 +612,8 @@ fn plan_agent(
                 RANK_AGENT,
                 PHASE_CREATE,
                 id.clone(),
-                Action {
-                    kind: ActionKind::StartAgent,
+                PlannedAction {
+                    kind: Action::Herdr(HerdrAction::StartAgent),
                     address: id.clone(),
                     backend_id: None,
                     destructive: false,
@@ -617,8 +625,8 @@ fn plan_agent(
                     RANK_AGENT,
                     PHASE_UPDATE,
                     id.clone(),
-                    Action {
-                        kind: ActionKind::PromptAgent,
+                    PlannedAction {
+                        kind: Action::Core(CoreAction::PromptAgent),
                         address: id,
                         backend_id: None,
                         destructive: false,
@@ -635,8 +643,8 @@ fn plan_agent(
                     RANK_AGENT,
                     PHASE_UPDATE,
                     id.clone(),
-                    Action {
-                        kind: ActionKind::PromptAgent,
+                    PlannedAction {
+                        kind: Action::Core(CoreAction::PromptAgent),
                         address: id,
                         backend_id: Some(observed.backend_id.clone()),
                         destructive: false,
@@ -680,13 +688,6 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 /// The v2 model has no declared `writes` for a task yet, so `inputs` stands
 /// in for both reads and writes (spec §5's `RunTask` row): two tasks that
 /// touch the same path without an `after` edge between them race.
-// The hazard pass here only checks task-vs-task overlap (spec §5's
-// `RunTask` row). Task-vs-pane hazards (a task's `inputs` overlapping a
-// running pane's `cwd`) are intentionally out of scope for this PR: the
-// brief's paraphrase of this item names only task ordering, and pane
-// `cwd` isn't tracked as a read/write surface anywhere else in this
-// module. Confirmed deferred, not dropped — see PR 2 review on #4,
-// finding 2.
 fn plan_tasks(ir: &Ir, profile: &Profile, snapshot: &Snapshot, ranked: &mut Vec<RankedAction>) {
     let task_resources: Vec<&Resource> = ir
         .resources
@@ -731,8 +732,8 @@ fn plan_tasks(ir: &Ir, profile: &Profile, snapshot: &Snapshot, ranked: &mut Vec<
                     RANK_TASK,
                     PHASE_CONFLICT,
                     format!("{left}~{right}"),
-                    Action {
-                        kind: ActionKind::Conflict,
+                    PlannedAction {
+                        kind: Action::Core(CoreAction::Conflict),
                         address: format!("{left}~{right}"),
                         backend_id: None,
                         destructive: false,
@@ -776,8 +777,6 @@ fn plan_tasks(ir: &Ir, profile: &Profile, snapshot: &Snapshot, ranked: &mut Vec<
             .collect();
         ready.sort_unstable();
         if ready.is_empty() {
-            // The `after` DAG is already enforced by `Profile::validate`; this
-            // is unreachable, but stop rather than loop forever if it ever isn't.
             break;
         }
         for name in ready {
@@ -792,8 +791,8 @@ fn plan_tasks(ir: &Ir, profile: &Profile, snapshot: &Snapshot, ranked: &mut Vec<
                 RANK_TASK,
                 phase,
                 name.to_owned(),
-                Action {
-                    kind: ActionKind::RunTask,
+                PlannedAction {
+                    kind: Action::Core(CoreAction::RunTask),
                     address: name.to_owned(),
                     backend_id: None,
                     destructive: false,
@@ -820,7 +819,7 @@ fn plan_detach(
         }
         let rank = match observed.kind.as_str() {
             "workspace" => RANK_WORKSPACE,
-            "tab" => RANK_TAB,
+            "placement" => RANK_TAB,
             "pane" => RANK_PANE,
             "agent" => RANK_AGENT,
             "task" => RANK_TASK,
@@ -830,8 +829,8 @@ fn plan_detach(
             rank,
             PHASE_DETACH,
             id.clone(),
-            Action {
-                kind: ActionKind::Detach,
+            PlannedAction {
+                kind: Action::Core(CoreAction::Detach),
                 address: id.clone(),
                 backend_id: Some(observed.backend_id.clone()),
                 destructive: false,
@@ -865,7 +864,16 @@ mod tests {
         }))
     }
 
-    fn digest_of<'a>(ir: &'a Ir, kind: &str, name: &str) -> &'a str {
+    fn pane_digest<'a>(ir: &'a Ir, name: &str) -> &'a str {
+        ir.resources
+            .iter()
+            .find(|resource| resource.kind == "pane" && resource.name == name)
+            .unwrap_or_else(|| panic!("no pane resource named `{name}`"))
+            .digest
+            .as_str()
+    }
+
+    fn resource_digest<'a>(ir: &'a Ir, kind: &str, name: &str) -> &'a str {
         ir.resources
             .iter()
             .find(|resource| resource.kind == kind && resource.name == name)
@@ -874,8 +882,39 @@ mod tests {
             .as_str()
     }
 
-    fn kinds(plan: &Plan) -> Vec<ActionKind> {
+    fn group_digest<'a>(ir: &'a Ir, id: &str) -> &'a str {
+        ir.placements
+            .iter()
+            .find(|group| group.id == id)
+            .unwrap_or_else(|| panic!("no placement group `{id}`"))
+            .topology_digest
+            .as_str()
+    }
+
+    fn kinds(plan: &Plan) -> Vec<Action> {
         plan.actions.iter().map(|action| action.kind).collect()
+    }
+
+    /// A snapshot that already owns the workspace and the group, converged,
+    /// so only pane-level differences remain to plan.
+    fn converged_shell(ir: &Ir) -> Snapshot {
+        Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(ir, "workspace", "dev"),
+            )
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                group_digest(ir, "dev/main"),
+            )
     }
 
     #[test]
@@ -885,7 +924,10 @@ mod tests {
         assert_eq!(plan.status, SyncStatus::OutOfSync);
         assert_eq!(
             kinds(&plan),
-            [ActionKind::CreateWorkspace, ActionKind::CreateTab]
+            [
+                Action::Core(CoreAction::CreateWorkspace),
+                Action::Herdr(HerdrAction::CreateTab)
+            ]
         );
     }
 
@@ -893,31 +935,14 @@ mod tests {
     fn converged_resources_produce_no_actions() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
-            .owned(
-                "pane",
-                "review",
-                "w1:p1",
-                Some("dev/main"),
-                "default",
-                digest_of(&ir, "pane", "review"),
-            );
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            pane_digest(&ir, "review"),
+        );
         let plan = build_plan(&profile, &snapshot).expect("plan");
         assert_eq!(plan.status, SyncStatus::InSync);
         assert!(plan.actions.is_empty());
@@ -927,24 +952,7 @@ mod tests {
     fn unmanaged_panes_produce_no_actions() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
-            .unmanaged("pane", "review", "w1:p1", Some("dev/main"));
+        let snapshot = converged_shell(&ir).unmanaged("pane", "review", "w1:p1", Some("dev/main"));
         let plan = build_plan(&profile, &snapshot).expect("plan");
         assert!(
             plan.actions.is_empty(),
@@ -953,28 +961,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_pane_in_existing_tab_splits_it() {
+    fn missing_pane_in_existing_group_splits_it() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            );
+        let snapshot = converged_shell(&ir);
         let plan = build_plan(&profile, &snapshot).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::SplitPane]);
+        assert_eq!(kinds(&plan), [Action::Herdr(HerdrAction::SplitPane)]);
         assert!(!plan.actions[0].destructive);
     }
 
@@ -982,33 +974,16 @@ mod tests {
     fn changed_serve_command_restarts_in_place() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
-            .owned(
-                "pane",
-                "review",
-                "w1:p1",
-                Some("dev/main"),
-                "default",
-                "stale-digest",
-            );
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            "stale-digest",
+        );
         let plan = build_plan(&profile, &snapshot).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::RestartCommand]);
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RestartCommand)]);
         assert!(!plan.actions[0].destructive);
         assert_eq!(plan.actions[0].backend_id.as_deref(), Some("w1:p1"));
     }
@@ -1023,68 +998,41 @@ mod tests {
             }]
         }));
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
-            .owned(
-                "pane",
-                "review",
-                "w1:p1",
-                Some("dev/main"),
-                "default",
-                "stale-digest",
-            );
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            "stale-digest",
+        );
         let plan = build_plan(&profile, &snapshot).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::RenamePane]);
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
     }
 
     #[test]
-    fn pane_moved_to_a_different_tab_replaces_destructively() {
+    fn pane_moved_to_a_different_group_replaces_destructively() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        // Observed under a tab identity ("dev/other") that no longer matches
-        // the pane's declared parent ("dev/main"): a topology change.
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
-            .owned(
-                "pane",
-                "review",
-                "w1:p9",
-                Some("dev/other"),
-                "default",
-                "stale-digest",
-            );
+        // Observed under a group identity ("dev/other") that no longer
+        // matches the pane's declared placement ("dev/main"): a topology
+        // change.
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p9",
+            Some("dev/other"),
+            "default",
+            pane_digest(&ir, "review"),
+        );
         let plan = build_plan(&profile, &snapshot).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::ClosePane, ActionKind::SplitPane]);
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::ClosePane),
+                Action::Herdr(HerdrAction::SplitPane)
+            ]
+        );
         assert!(plan.actions[0].destructive);
         assert!(!plan.actions[1].destructive);
     }
@@ -1093,30 +1041,14 @@ mod tests {
     fn owned_but_undeclared_pane_is_detached_not_closed() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
+        let snapshot = converged_shell(&ir)
             .owned(
                 "pane",
                 "review",
                 "w1:p1",
                 Some("dev/main"),
                 "default",
-                digest_of(&ir, "pane", "review"),
+                pane_digest(&ir, "review"),
             )
             .owned(
                 "pane",
@@ -1127,7 +1059,7 @@ mod tests {
                 "any-digest",
             );
         let plan = build_plan(&profile, &snapshot).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::Detach]);
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::Detach)]);
         assert_eq!(plan.actions[0].address, "gone");
         assert!(!plan.actions[0].destructive);
     }
@@ -1151,18 +1083,15 @@ mod tests {
         assert!(
             plan.actions
                 .iter()
-                .any(|action| action.kind == ActionKind::AdoptPane
+                .any(|action| action.kind == Action::Core(CoreAction::AdoptPane)
                     && action.address == "controller"
                     && action.backend_id.as_deref() == Some("caller-pane-1"))
         );
-        // The tab already exists around the live caller pane (it is not a
+        // The group already exists around the live caller pane (it is not a
         // fresh `CreateTab` layout), so the sibling pane is split into it
         // individually rather than being subsumed into a layout application.
-        assert!(
-            plan.actions
-                .iter()
-                .any(|action| action.address == "log" && action.kind == ActionKind::SplitPane)
-        );
+        assert!(plan.actions.iter().any(|action| action.address == "log"
+            && action.kind == Action::Herdr(HerdrAction::SplitPane)));
     }
 
     #[test]
@@ -1180,12 +1109,12 @@ mod tests {
             !plan
                 .actions
                 .iter()
-                .any(|action| action.kind == ActionKind::AdoptPane)
+                .any(|action| action.kind == Action::Core(CoreAction::AdoptPane))
         );
         assert!(
             plan.actions
                 .iter()
-                .any(|action| action.kind == ActionKind::CreateTab)
+                .any(|action| action.kind == Action::Herdr(HerdrAction::CreateTab))
         );
     }
 
@@ -1199,12 +1128,12 @@ mod tests {
             ]
         }));
         let plan = build_plan(&profile, &Snapshot::default()).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::Conflict]);
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::Conflict)]);
         assert!(
             !plan
                 .actions
                 .iter()
-                .any(|action| action.kind == ActionKind::RunTask)
+                .any(|action| action.kind == Action::Core(CoreAction::RunTask))
         );
     }
 
@@ -1218,7 +1147,13 @@ mod tests {
             ]
         }));
         let plan = build_plan(&profile, &Snapshot::default()).expect("plan");
-        assert_eq!(kinds(&plan), [ActionKind::RunTask, ActionKind::RunTask]);
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::RunTask),
+                Action::Core(CoreAction::RunTask)
+            ]
+        );
         assert_eq!(plan.actions[0].address, "a");
         assert_eq!(plan.actions[1].address, "b");
     }
@@ -1236,7 +1171,7 @@ mod tests {
             "n/a",
             None,
             "default",
-            digest_of(&ir, "task", "scaffold"),
+            resource_digest(&ir, "task", "scaffold"),
         );
         let plan = build_plan(&profile, &snapshot).expect("plan");
         assert!(plan.actions.is_empty());
@@ -1253,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn actions_are_ordered_workspace_before_tab_before_pane_before_agent() {
+    fn actions_are_ordered_workspace_before_group_before_pane_before_agent() {
         let profile = profile_from(json!({
             "name": "default",
             "workspaces": [{
@@ -1272,26 +1207,17 @@ mod tests {
         assert_eq!(
             kinds(&plan),
             [
-                ActionKind::CreateWorkspace,
-                ActionKind::CreateTab,
-                ActionKind::StartAgent,
-                ActionKind::PromptAgent,
-                ActionKind::RunTask,
+                Action::Core(CoreAction::CreateWorkspace),
+                Action::Herdr(HerdrAction::CreateTab),
+                Action::Herdr(HerdrAction::StartAgent),
+                Action::Core(CoreAction::PromptAgent),
+                Action::Core(CoreAction::RunTask),
             ]
         );
     }
 
     #[test]
     fn moved_checkout_does_not_change_any_digest() {
-        // D21: "digests never include the repository path". `Workspace.cwd`
-        // defaults to the relative `.` (see `default_cwd`) and `to_ir`
-        // never reads `std::env::current_dir()` or `Profile`'s own
-        // `repo_root` (that field doesn't exist — `dsl::compile` resolves
-        // `repo_root` only to read `file()` prompts, and never stores it
-        // on `Profile`). So the IR field itself — not just two identical
-        // builds of the same in-memory value — must stay the declared
-        // relative `.`, regardless of where the checkout that produced
-        // this `Profile` lives on disk.
         let profile = one_pane_profile();
         let ir = profile.to_ir();
         let workspace = ir
@@ -1301,12 +1227,6 @@ mod tests {
             .expect("workspace resource");
         assert_eq!(workspace.fields["cwd"], serde_json::json!("."));
 
-        // A second `Profile` built from a fixture that only varies in an
-        // absolute path having nothing to do with any declared field (here:
-        // two structurally identical profiles, standing in for the same
-        // Drovefile loaded from two different checkout directories) must
-        // still converge on the same digest, since nothing in the model
-        // carries that path into `fields`.
         let moved = one_pane_profile();
         let first = build_plan(&profile, &Snapshot::default()).expect("plan");
         let second = build_plan(&moved, &Snapshot::default()).expect("plan");
@@ -1317,31 +1237,14 @@ mod tests {
     fn render_reports_in_sync_with_no_actions() {
         let profile = one_pane_profile();
         let ir = profile.to_ir();
-        let snapshot = Snapshot::default()
-            .owned(
-                "workspace",
-                "dev",
-                "w1",
-                None,
-                "default",
-                digest_of(&ir, "workspace", "dev"),
-            )
-            .owned(
-                "tab",
-                "dev/main",
-                "w1:t1",
-                Some("dev"),
-                "default",
-                digest_of(&ir, "tab", "main"),
-            )
-            .owned(
-                "pane",
-                "review",
-                "w1:p1",
-                Some("dev/main"),
-                "default",
-                digest_of(&ir, "pane", "review"),
-            );
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            pane_digest(&ir, "review"),
+        );
         let plan = build_plan(&profile, &snapshot).expect("plan");
         assert_eq!(plan.render(), "in sync: profile `default`\n");
     }

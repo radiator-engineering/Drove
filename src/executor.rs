@@ -16,10 +16,10 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    backend::Backend,
+    backend::{Backend, PaneSpec},
     ir::{Ir, Resource},
     model::{Profile, Task, canonical_digest},
-    planner::{ActionKind, Plan},
+    planner::{Action, CoreAction, HerdrAction, Plan, PlannedAction},
     state::{LocalState, ManagedResource},
 };
 
@@ -305,7 +305,7 @@ pub fn execute_plan_tasks(
     let ir = profile.to_ir();
     let mut results = Vec::new();
     for action in &plan.actions {
-        if action.kind != ActionKind::RunTask {
+        if action.kind != Action::Core(CoreAction::RunTask) {
             continue;
         }
         let Some(task) = tasks_by_name.get(action.address.as_str()) else {
@@ -385,8 +385,8 @@ pub fn down(
 fn collect_hooks(profile: &Profile, event: HookEvent) -> BTreeMap<&str, &[String]> {
     let mut hooks = BTreeMap::new();
     for workspace in &profile.workspaces {
-        for tab in &workspace.tabs {
-            for pane in &tab.panes {
+        for group in &workspace.tabs {
+            for pane in &group.panes {
                 let hook = match event {
                     HookEvent::Start => &pane.on_start,
                     HookEvent::Stop => &pane.on_stop,
@@ -409,24 +409,16 @@ fn collect_hooks(profile: &Profile, event: HookEvent) -> BTreeMap<&str, &[String
     hooks
 }
 
-/// A resource's identity for the shared namespace (D5): its own name,
-/// except a tab, whose identity is scoped to its workspace. Mirrors
-/// `planner::identity`, which is private to that module.
+/// A resource's identity for the shared namespace (D5): its own declared
+/// name. Placement groups are not core resources (D29), so they never appear
+/// here.
 fn identity(resource: &Resource) -> String {
-    if resource.kind == "tab" {
-        format!(
-            "{}/{}",
-            resource.parent.as_deref().unwrap_or(""),
-            resource.name
-        )
-    } else {
-        resource.name.clone()
-    }
+    resource.name.clone()
 }
 
 /// Dependent -> its dependencies: a resource's structural parent (a pane
-/// depends on its tab, a tab on its workspace, an agent on its pane) plus
-/// whatever it names in a declared `after`.
+/// depends on its placement group, an agent on its pane) plus whatever it
+/// names in a declared `after`.
 fn dependency_edges(ir: &Ir) -> BTreeMap<String, Vec<String>> {
     let mut edges = BTreeMap::new();
     for resource in &ir.resources {
@@ -509,6 +501,293 @@ fn teardown_order(managed: &BTreeMap<String, ManagedResource>, ir: &Ir) -> Vec<S
     let mut order = topo_forward(&ids, &edges);
     order.reverse();
     order
+}
+
+/// What became of one planned action when applied to a backend (D29).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The verb ran against the backend.
+    Applied,
+    /// The action is recorded/handled outside the backend apply loop (a task
+    /// run, a detach, a task conflict report).
+    Skipped,
+    /// A flavor action whose flavor this backend does not implement. `drove
+    /// plan` prints it and `drove status` counts it; it is never dropped.
+    Unsupported {
+        flavor: &'static str,
+        action: Action,
+    },
+}
+
+/// Running backend ids gathered while a plan applies: creating a workspace,
+/// group or pane yields the id later actions address.
+#[derive(Default)]
+struct ApplyState {
+    workspace_ids: BTreeMap<String, String>,
+    group_ids: BTreeMap<String, String>,
+    pane_ids: BTreeMap<String, String>,
+}
+
+/// Applies every action in `plan` against `backend`, resolving each verb's
+/// concrete arguments from `ir`, and returns each action's [`Outcome`] in
+/// order. A flavor action on a backend without that flavor is surfaced as
+/// [`Outcome::Unsupported`] and the loop continues, so core resources in the
+/// same plan are still created (D29).
+pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Result<Vec<(String, Outcome)>> {
+    let mut state = ApplyState::default();
+    let mut outcomes = Vec::with_capacity(plan.actions.len());
+    for action in &plan.actions {
+        let outcome = apply_action(backend, ir, &mut state, action)?;
+        outcomes.push((action.address.clone(), outcome));
+    }
+    Ok(outcomes)
+}
+
+/// Routes one planned action to the backend through a single exhaustive
+/// match (D29). A `Herdr(..)`/`Radiator(..)` action whose accessor returns
+/// `None` yields [`Outcome::Unsupported`] without touching the backend.
+fn apply_action(
+    backend: &dyn Backend,
+    ir: &Ir,
+    state: &mut ApplyState,
+    action: &PlannedAction,
+) -> Result<Outcome> {
+    match action.kind {
+        Action::Core(core) => apply_core(backend, ir, state, core, action),
+        Action::Herdr(herdr) => {
+            let Some(ext) = backend.herdr() else {
+                return Ok(Outcome::Unsupported {
+                    flavor: "herdr",
+                    action: action.kind,
+                });
+            };
+            apply_herdr(ext, ir, state, herdr, action)
+        }
+        // `RadiatorAction` is empty (spec §8, D37); this arm keeps the match
+        // exhaustive so adding a variant forces every backend to answer it.
+        Action::Radiator(radiator) => match radiator {},
+    }
+}
+
+fn apply_core(
+    backend: &dyn Backend,
+    ir: &Ir,
+    state: &mut ApplyState,
+    core: CoreAction,
+    action: &PlannedAction,
+) -> Result<Outcome> {
+    match core {
+        CoreAction::CreateWorkspace => {
+            let fields = resource_fields(ir, "workspace", &action.address)?;
+            let label = string_field(fields, "label").unwrap_or_else(|| action.address.clone());
+            let cwd = string_field(fields, "cwd").unwrap_or_else(|| ".".to_owned());
+            let id = backend.create_workspace(&label, Path::new(&cwd))?;
+            state.workspace_ids.insert(action.address.clone(), id);
+            Ok(Outcome::Applied)
+        }
+        CoreAction::RenameWorkspace => {
+            let id = backend_id(state.workspace_ids.get(&action.address), action)?;
+            let fields = resource_fields(ir, "workspace", &action.address)?;
+            let label = string_field(fields, "label").unwrap_or_else(|| action.address.clone());
+            backend.rename_workspace(&id, &label)?;
+            Ok(Outcome::Applied)
+        }
+        CoreAction::CreatePane => {
+            let (workspace_id, spec) = pane_create_inputs(ir, state, &action.address)?;
+            let pane_id = backend.create_pane(&workspace_id, &spec)?;
+            state.pane_ids.insert(action.address.clone(), pane_id);
+            Ok(Outcome::Applied)
+        }
+        CoreAction::ClosePane => {
+            let id = backend_id(action.backend_id.as_ref(), action)?;
+            backend.close_pane(&id)?;
+            Ok(Outcome::Applied)
+        }
+        CoreAction::RenamePane => {
+            let id = backend_id(action.backend_id.as_ref(), action)?;
+            let fields = resource_fields(ir, "pane", &action.address)?;
+            let label = string_field(fields, "label").unwrap_or_else(|| action.address.clone());
+            backend.rename_pane(&id, &label)?;
+            Ok(Outcome::Applied)
+        }
+        CoreAction::RestartCommand => {
+            let id = backend_id(action.backend_id.as_ref(), action)?;
+            let argv = pane_command(ir, &action.address);
+            backend.restart_command(&id, &argv)?;
+            Ok(Outcome::Applied)
+        }
+        CoreAction::PromptAgent => {
+            let id = backend_id(action.backend_id.as_ref(), action)?;
+            let fields = resource_fields(ir, "agent", &action.address)?;
+            if let Some(prompt) = string_field(fields, "prompt") {
+                backend.prompt_agent(&id, &prompt)?;
+            }
+            Ok(Outcome::Applied)
+        }
+        // Adoption records ownership of the caller pane (D24); it needs no
+        // backend verb. Detach, RunTask and Conflict are handled outside the
+        // backend apply loop (local state, `execute_plan_tasks`, reporting).
+        CoreAction::AdoptPane | CoreAction::Detach | CoreAction::RunTask | CoreAction::Conflict => {
+            Ok(Outcome::Skipped)
+        }
+    }
+}
+
+fn apply_herdr(
+    ext: &dyn crate::backend::HerdrExt,
+    ir: &Ir,
+    state: &mut ApplyState,
+    herdr: HerdrAction,
+    action: &PlannedAction,
+) -> Result<Outcome> {
+    match herdr {
+        HerdrAction::CreateTab => {
+            let group = placement_group(ir, &action.address)?;
+            let workspace_id = backend_id(state.workspace_ids.get(&group.workspace), action)?;
+            let tab_id = ext.create_tab(&workspace_id, &group.label, group.split, &group.ratios)?;
+            state.group_ids.insert(action.address.clone(), tab_id);
+            Ok(Outcome::Applied)
+        }
+        HerdrAction::RenameTab => {
+            let group = placement_group(ir, &action.address)?;
+            let tab_id = backend_id(state.group_ids.get(&action.address), action)?;
+            ext.rename_tab(&tab_id, &group.label)?;
+            Ok(Outcome::Applied)
+        }
+        HerdrAction::SetRatio => {
+            let group = placement_group(ir, &action.address)?;
+            let tab_id = backend_id(state.group_ids.get(&action.address), action)?;
+            ext.set_ratio(&tab_id, &group.ratios)?;
+            Ok(Outcome::Applied)
+        }
+        HerdrAction::SplitPane => {
+            let (_workspace_id, spec) = pane_create_inputs(ir, state, &action.address)?;
+            let group_id = pane_group_id(ir, &action.address)?;
+            let tab_id = backend_id(state.group_ids.get(&group_id), action)?;
+            let group = placement_group(ir, &group_id)?;
+            let pane_id = ext.split_pane(&tab_id, &spec, group.split)?;
+            state.pane_ids.insert(action.address.clone(), pane_id);
+            Ok(Outcome::Applied)
+        }
+        HerdrAction::StartAgent => {
+            let fields = resource_fields(ir, "agent", &action.address)?;
+            let pane = agent_parent(ir, &action.address)?;
+            let pane_id = backend_id(state.pane_ids.get(&pane), action)?;
+            let kind = string_field(fields, "kind").unwrap_or_default();
+            let args = string_array(fields, "args");
+            ext.start_agent(&pane_id, &action.address, &kind, &args)?;
+            Ok(Outcome::Applied)
+        }
+    }
+}
+
+fn resource_fields<'a>(ir: &'a Ir, kind: &str, name: &str) -> Result<&'a serde_json::Value> {
+    ir.resources
+        .iter()
+        .find(|resource| resource.kind == kind && resource.name == name)
+        .map(|resource| &resource.fields)
+        .ok_or_else(|| anyhow::anyhow!("no {kind} resource named `{name}` in the IR"))
+}
+
+fn placement_group<'a>(ir: &'a Ir, id: &str) -> Result<&'a crate::ir::PlacementGroup> {
+    ir.placements
+        .iter()
+        .find(|group| group.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no placement group `{id}` in the IR"))
+}
+
+fn pane_group_id(ir: &Ir, pane: &str) -> Result<String> {
+    ir.resources
+        .iter()
+        .find(|resource| resource.kind == "pane" && resource.name == pane)
+        .and_then(|resource| resource.parent.clone())
+        .ok_or_else(|| anyhow::anyhow!("pane `{pane}` has no placement group"))
+}
+
+fn agent_parent(ir: &Ir, agent: &str) -> Result<String> {
+    ir.resources
+        .iter()
+        .find(|resource| resource.kind == "agent" && resource.name == agent)
+        .and_then(|resource| resource.parent.clone())
+        .ok_or_else(|| anyhow::anyhow!("agent `{agent}` has no pane"))
+}
+
+fn pane_create_inputs(ir: &Ir, state: &ApplyState, pane: &str) -> Result<(String, PaneSpec)> {
+    let group_id = pane_group_id(ir, pane)?;
+    let group = placement_group(ir, &group_id)?;
+    let workspace_id = state
+        .workspace_ids
+        .get(&group.workspace)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("workspace `{}` has no backend id yet", group.workspace))?;
+    let fields = resource_fields(ir, "pane", pane)?;
+    let spec = PaneSpec {
+        label: string_field(fields, "label").or_else(|| Some(pane.to_owned())),
+        cwd: string_field(fields, "cwd").map(std::path::PathBuf::from),
+        command: {
+            let argv = pane_command(ir, pane);
+            (!argv.is_empty()).then_some(argv)
+        },
+        env: string_map(fields, "env"),
+    };
+    Ok((workspace_id, spec))
+}
+
+/// The first `serve` candidate's argv (D8: `any_of` tries them in order; the
+/// backend runs the first).
+fn pane_command(ir: &Ir, pane: &str) -> Vec<String> {
+    let Ok(fields) = resource_fields(ir, "pane", pane) else {
+        return Vec::new();
+    };
+    fields
+        .get("serve")
+        .and_then(|v| v.as_array())
+        .and_then(|candidates| candidates.first())
+        .and_then(|v| v.as_array())
+        .map(|argv| {
+            argv.iter()
+                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn backend_id(id: Option<&String>, action: &PlannedAction) -> Result<String> {
+    id.cloned()
+        .ok_or_else(|| anyhow::anyhow!("no backend id for `{}` yet", action.address))
+}
+
+fn string_field(fields: &serde_json::Value, key: &str) -> Option<String> {
+    fields
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn string_array(fields: &serde_json::Value, key: &str) -> Vec<String> {
+    fields
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_map(fields: &serde_json::Value, key: &str) -> BTreeMap<String, String> {
+    fields
+        .get(key)
+        .and_then(|v| v.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -909,7 +1188,6 @@ mod tests {
             &mut state,
             &[
                 ("dev", "workspace", None),
-                ("dev/main", "tab", Some("dev")),
                 ("gitlog", "pane", Some("dev/main")),
             ],
         );
@@ -926,8 +1204,10 @@ mod tests {
         )
         .expect("down");
 
-        // Reverse dependency order: pane before tab before workspace.
-        assert_eq!(report.detached, vec!["gitlog", "dev/main", "dev"]);
+        // Reverse dependency order: pane before workspace. The placement
+        // group is derived, not a managed resource (D29), so it is not torn
+        // down on its own.
+        assert_eq!(report.detached, vec!["gitlog", "dev"]);
         assert_eq!(report.hooks_run, vec![("gitlog".to_owned(), true)]);
         assert_eq!(runner.calls(), vec![vec!["notify-stop".to_owned()]]);
 
@@ -980,5 +1260,117 @@ mod tests {
         // down's job is to stop tracking it, not to force approval.
         assert_eq!(report.detached, vec!["gitlog"]);
         assert!(report.hooks_run.is_empty());
+    }
+
+    /// A backend with no Herdr flavor: `herdr()` is `None`, so every
+    /// `Herdr(..)` action must come back `Unsupported`. It records the panes
+    /// it is asked to create so the test can prove core actions still run.
+    #[derive(Default)]
+    struct FlavorlessBackend {
+        created_panes: Mutex<Vec<String>>,
+    }
+
+    impl Backend for FlavorlessBackend {
+        fn snapshot(&self) -> Result<crate::backend::herdr::SessionSnapshot> {
+            Ok(Default::default())
+        }
+        fn caller_pane_id(&self) -> Option<String> {
+            None
+        }
+        fn create_workspace(&self, _label: &str, _cwd: &Path) -> Result<String> {
+            Ok("w1".into())
+        }
+        fn rename_workspace(&self, _id: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        fn create_pane(&self, _workspace_id: &str, spec: &PaneSpec) -> Result<String> {
+            let name = spec.label.clone().unwrap_or_default();
+            self.created_panes.lock().expect("mutex").push(name);
+            Ok("p1".into())
+        }
+        fn close_pane(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn rename_pane(&self, _id: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        fn restart_command(&self, _id: &str, _argv: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn prompt_agent(&self, _id: &str, _prompt: &str) -> Result<()> {
+            Ok(())
+        }
+        fn process_info(&self, _id: &str) -> Result<Option<crate::backend::ProcessInfo>> {
+            Ok(None)
+        }
+        fn report_tokens(&self, _address: &str, _tokens: &BTreeMap<String, String>) -> Result<()> {
+            Ok(())
+        }
+        fn output(&self, _id: &str, _timeout: std::time::Duration) -> Result<String> {
+            Ok(String::new())
+        }
+        fn capabilities(&self) -> crate::backend::Capabilities {
+            crate::backend::Capabilities {
+                workspace_env: false,
+                pane_command_at_create: true,
+                metadata_tokens: false,
+                process_info: false,
+                events: false,
+                readiness_output: false,
+            }
+        }
+        // No `herdr()` override: it inherits the default `None`.
+    }
+
+    #[test]
+    fn herdr_action_on_a_flavorless_backend_is_unsupported_but_core_panes_still_run() {
+        use crate::planner::{Action, CoreAction, HerdrAction, PlannedAction, SyncStatus};
+
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "editor", "serve": [["bash"]]}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+
+        let action = |kind, address: &str| PlannedAction {
+            kind,
+            address: address.to_owned(),
+            backend_id: None,
+            destructive: false,
+            reason: String::new(),
+        };
+        let plan = Plan {
+            profile: "default".into(),
+            desired_digest: String::new(),
+            status: SyncStatus::OutOfSync,
+            adopted: BTreeMap::new(),
+            actions: vec![
+                action(Action::Core(CoreAction::CreateWorkspace), "dev"),
+                action(Action::Herdr(HerdrAction::CreateTab), "dev/main"),
+                action(Action::Core(CoreAction::CreatePane), "editor"),
+            ],
+        };
+
+        let backend = FlavorlessBackend::default();
+        let outcomes = apply_plan(&backend, &ir, &plan).expect("apply");
+
+        assert_eq!(outcomes[0].1, Outcome::Applied);
+        assert_eq!(
+            outcomes[1].1,
+            Outcome::Unsupported {
+                flavor: "herdr",
+                action: Action::Herdr(HerdrAction::CreateTab),
+            },
+            "a Herdr action on a backend without the flavor must be Unsupported"
+        );
+        assert_eq!(outcomes[2].1, Outcome::Applied);
+        assert_eq!(
+            *backend.created_panes.lock().expect("mutex"),
+            vec!["editor".to_owned()],
+            "the core pane must still be created despite the unsupported Herdr action"
+        );
     }
 }

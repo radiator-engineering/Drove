@@ -14,7 +14,7 @@ use interprocess::local_socket::traits::Stream as _StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Backend, Capabilities, ProcessInfo};
+use super::{Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, Split};
 use crate::model::SplitDirection;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -418,13 +418,8 @@ impl RawPaneProcessInfo {
 impl Backend for HerdrClient {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            tabs: true,
-            splits_and_ratios: true,
             workspace_env: true,
             pane_command_at_create: true,
-            agent_start: true,
-            agent_prompt: true,
-            adopt_caller: true,
             metadata_tokens: true,
             process_info: true,
             events: true,
@@ -444,48 +439,41 @@ impl Backend for HerdrClient {
         HerdrClient::create_workspace(self, label, cwd)
     }
 
-    fn create_tab(
-        &self,
-        workspace_id: &str,
-        tab_label: &str,
-        root: Value,
-    ) -> Result<ExportedLayout> {
-        HerdrClient::apply_layout(self, workspace_id, None, tab_label, root)
+    fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<()> {
+        HerdrClient::rename_workspace(self, workspace_id, label)
     }
 
-    fn split_pane(
-        &self,
-        pane_id: &str,
-        direction: SplitDirection,
-        ratio: f64,
-        command: Option<&[String]>,
-        cwd: Option<&Path>,
-    ) -> Result<String> {
-        HerdrClient::split_pane(self, pane_id, direction, ratio, command, cwd)
+    /// Opens a pane with no placement by applying a single-pane layout to
+    /// `workspace_id`, which Herdr places in the workspace's first tab
+    /// (spec §3). A Herdr placement is applied afterwards through
+    /// [`HerdrExt`].
+    fn create_pane(&self, workspace_id: &str, spec: &PaneSpec) -> Result<String> {
+        let label = spec.label.as_deref().unwrap_or("pane");
+        let mut leaf = json!({"type": "pane", "label": label});
+        if let Some(command) = &spec.command {
+            leaf["command"] = json!(command);
+        }
+        if let Some(cwd) = &spec.cwd {
+            leaf["cwd"] = json!(cwd);
+        }
+        let layout = HerdrClient::apply_layout(self, workspace_id, None, label, leaf)?;
+        layout
+            .pane_ids_preorder()
+            .into_iter()
+            .next()
+            .context("layout.apply for create_pane returned no pane")
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<()> {
         HerdrClient::close_pane(self, pane_id)
     }
 
-    fn set_ratio(&self, tab_id: &str, ratios: &[f64]) -> Result<()> {
-        HerdrClient::set_ratio(self, tab_id, ratios)
-    }
-
-    fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<()> {
-        HerdrClient::rename_workspace(self, workspace_id, label)
-    }
-
-    fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
-        HerdrClient::rename_tab(self, tab_id, label)
-    }
-
     fn rename_pane(&self, pane_id: &str, label: &str) -> Result<()> {
         HerdrClient::rename_pane(self, pane_id, label)
     }
 
-    fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()> {
-        HerdrClient::start_agent(self, pane_id, name, kind, args)
+    fn restart_command(&self, pane_id: &str, argv: &[String]) -> Result<()> {
+        HerdrClient::run_command(self, pane_id, argv)
     }
 
     fn prompt_agent(&self, pane_id: &str, prompt: &str) -> Result<()> {
@@ -506,6 +494,61 @@ impl Backend for HerdrClient {
 
     fn output(&self, pane_id: &str, timeout: Duration) -> Result<String> {
         HerdrClient::output(self, pane_id, timeout)
+    }
+
+    fn herdr(&self) -> Option<&dyn HerdrExt> {
+        Some(self)
+    }
+}
+
+impl HerdrExt for HerdrClient {
+    /// Creates a tab holding one initial pane (Herdr has no empty tab) and
+    /// returns its tab id; `HerdrExt::split_pane` adds the rest. `split` and
+    /// `ratios` describe the finished layout, so `ratios` is applied here and
+    /// `split` is honored per split when panes are added.
+    fn create_tab(
+        &self,
+        workspace_id: &str,
+        label: &str,
+        _split: Split,
+        ratios: &[f64],
+    ) -> Result<String> {
+        let leaf = json!({"type": "pane", "label": label});
+        let layout = HerdrClient::apply_layout(self, workspace_id, None, label, leaf)?;
+        if !ratios.is_empty() {
+            HerdrClient::set_ratio(self, &layout.tab_id, ratios)?;
+        }
+        Ok(layout.tab_id)
+    }
+
+    /// Splits the tab's current last pane in `split` direction, opening a new
+    /// pane from `spec`. Ratios across the tab are set separately with
+    /// [`HerdrExt::set_ratio`].
+    fn split_pane(&self, tab_id: &str, spec: &PaneSpec, split: Split) -> Result<String> {
+        let target = HerdrClient::export_layout(self, tab_id)?
+            .pane_ids_preorder()
+            .into_iter()
+            .next_back()
+            .with_context(|| format!("tab `{tab_id}` has no pane to split"))?;
+        let command = spec.command.as_deref();
+        let pane_id =
+            HerdrClient::split_pane(self, &target, split, 0.5, command, spec.cwd.as_deref())?;
+        if let Some(label) = &spec.label {
+            HerdrClient::rename_pane(self, &pane_id, label)?;
+        }
+        Ok(pane_id)
+    }
+
+    fn set_ratio(&self, tab_id: &str, ratios: &[f64]) -> Result<()> {
+        HerdrClient::set_ratio(self, tab_id, ratios)
+    }
+
+    fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+        HerdrClient::rename_tab(self, tab_id, label)
+    }
+
+    fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()> {
+        HerdrClient::start_agent(self, pane_id, name, kind, args)
     }
 }
 
