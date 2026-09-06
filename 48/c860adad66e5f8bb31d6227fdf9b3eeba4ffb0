@@ -1,0 +1,41 @@
+src/dsl.rs
+  s_6150149524e485::t_05b96a0b99735e 231-236,241-249
+  s_6150149524e485::t_0a6275877cdb55 520-562
+docs/drovefile.md
+  s_6150149524e485::t_7b9723c6bfd273 73,75
+  s_6150149524e485::t_80f81b73d5b7a6 111
+src/model.rs
+  s_6150149524e485::t_6f3c68c82596da 67
+  s_6150149524e485::t_166c41afd3b089 131,631-633
+  s_6150149524e485::t_6b386323d6c892 100-106
+  s_6150149524e485::t_fcc733bb2052b0 603-608,610-624,626-630,634-635
+  s_6150149524e485::t_c2056c2bff3c26 625
+  s_6150149524e485::t_997a9fcb58197a 142,148
+  s_6150149524e485::t_f7f824b8cc9487 133
+  s_6150149524e485::t_1db5acecb5e84d 163-169
+  s_6150149524e485::t_e98facc1815672 107
+  s_6150149524e485::t_fd1a5e5aac0c4f 609
+src/backend/herdr.rs
+  s_6150149524e485::t_e78ea17f468d97 270,274
+  s_6150149524e485::t_09b236dd728bd4 198-199,203-204,207-208
+  s_6150149524e485::t_8789790ee9aa1c 242,246,250
+  s_6150149524e485::t_60202aae1d39a4 262
+src/cli.rs
+  s_6150149524e485::t_f0e19769c71f93 53,57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "48c860adad66e5f8bb31d6227fdf9b3eeba4ffb0",
+  "prompts": {},
+  "sessions": {
+    "s_6150149524e485": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58a7c6d9-702a-4180-a246-0ce76c641bc9",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
