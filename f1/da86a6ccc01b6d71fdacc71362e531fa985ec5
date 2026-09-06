@@ -1,0 +1,21 @@
+src/herdr.rs
+  s_3292b4f4dd9b9b::t_dfb3040d9e35ba 360
+.github/workflows/ci.yml
+  s_3292b4f4dd9b9b::t_4b2d9f7059910c 43-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f1da86a6ccc01b6d71fdacc71362e531fa985ec5",
+  "prompts": {},
+  "sessions": {
+    "s_3292b4f4dd9b9b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b815617a-d9a4-473c-a754-894468ec33b0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
