@@ -558,6 +558,60 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_task_name() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [
+                {"name": "scaffold", "run": ["true"]},
+                {"name": "scaffold", "run": ["true"]}
+            ]
+        }));
+        let error = profile.validate().expect_err("duplicate task name");
+        assert!(error.to_string().contains("duplicate task name"));
+    }
+
+    #[test]
+    fn rejects_task_name_colliding_with_pane_name() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "scaffold"}]}]
+            }],
+            "tasks": [{"name": "scaffold", "run": ["true"]}]
+        }));
+        let error = profile.validate().expect_err("name collision");
+        assert!(error.to_string().contains("collides with a pane"));
+    }
+
+    #[test]
+    fn rejects_duplicate_profile_name() {
+        let profile = Profile {
+            name: "default".into(),
+            workspaces: vec![],
+            tasks: vec![],
+        };
+        let error =
+            DroveConfig::new(vec![profile.clone(), profile]).expect_err("duplicate profile name");
+        assert!(error.to_string().contains("duplicate profile name"));
+    }
+
+    #[test]
+    fn requires_a_default_profile() {
+        let profile = Profile {
+            name: "other".into(),
+            workspaces: vec![],
+            tasks: vec![],
+        };
+        let error = DroveConfig::new(vec![profile]).expect_err("missing default profile");
+        assert!(
+            error
+                .to_string()
+                .contains("must declare a `default` profile")
+        );
+    }
+
+    #[test]
     fn rejects_oversized_inline_prompt() {
         let profile = profile_from(json!({
             "name": "default",
