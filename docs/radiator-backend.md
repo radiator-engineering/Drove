@@ -53,21 +53,33 @@ drift to the planner, not as a coin flip (spec §9, brief item 3).
 
 ## Detecting the gap-report hub additions at runtime
 
-`.context/handoffs/recon-radiator-gaps-report.md` proposes five hub
+`.context/handoffs/recon-radiator-gaps-report.md` proposed five hub
 additions: `pane.set_metadata`, `PaneInfo.metadata`, `PaneInfo.process`,
-`pane.tail`, `workspace.rename`, `hub.capabilities`. None of them has landed
-in `radiator-cli` as of this PR. Every call against one goes through
-`RadiatorClient::request_optional`, which turns the hub's
-`{"error": {"code": "unknown_method"}}` into `Ok(None)` instead of a failure:
+`pane.tail`, `workspace.rename`, `hub.capabilities`. They've since landed on
+`radiator-cli` `main` (its PR 21), but this backend still degrades against a
+hub that lacks them — an older deployed hub, or a rolling upgrade — rather
+than assuming the version it happened to be tested against. Every call
+against one of these goes through `RadiatorClient::request_optional`, which
+turns the hub's `{"error": {"code": "unknown_method"}}` into `Ok(None)`
+instead of a failure:
 
-- `report_tokens` — falls back to the journal (above).
+- `report_tokens` — falls back to the journal (above) only when the hub
+  rejects `pane.set_metadata`; on a hub with it, tokens go straight through
+  and the journal is never touched.
 - `rename_workspace` — prints a `warning:` line and leaves the hub-assigned
-  name in place, rather than failing `drove up`.
+  name in place only when the hub rejects `workspace.rename`, rather than
+  failing `drove up`.
 - `process_info` — reads a `process` field out of the raw `hub.snapshot`
-  response if present, `None` otherwise; never errors on its absence.
+  response if present (the shape `radiator-cli` actually ships:
+  `{pid, argv, status, exit_code}`), `None` otherwise; never errors on its
+  absence.
 
-This means the backend runs unchanged whether or not the parallel hub PR the
-gaps report proposes has landed — no flag, no version check.
+`Capabilities::metadata_tokens`/`process_info` still declare `false`
+unconditionally (above): they're this backend's static, hub-version-agnostic
+contract, not a live probe, so the planner never assumes a specific hub
+build. `tests/radiator_smoke.rs` (below) exercises the real, non-degraded
+path against the current hub build directly, independent of what
+`capabilities()` reports.
 
 ## Not implemented here
 
@@ -97,9 +109,27 @@ required.
 
 `tests/radiator_smoke.rs` is a real end-to-end check against an actual hub
 daemon: open a workspace, open a pane, read it back from `hub.snapshot`,
-report tokens, close both. It's skipped (not failed) unless
-`RADIATOR_SMOKE_SOCKET` is set. `scripts/smoke-radiator.sh` builds
-`radiator-cli` (from `../radiator-cli` next to this repo, or
-`$RADIATOR_CLI_ROOT`), starts its hub on a temp socket, and runs it — or
-prints why it skipped and exits 0 if `radiator-cli` isn't checked out or
-won't build, so CI without that sibling repo still passes.
+report tokens and confirm the hub itself now reports them back
+(`resolve_ownership`), read `process_info` back for the spawned pane, rename
+the workspace and confirm the hub applied it, then close both. It's skipped
+(not failed) unless `RADIATOR_SMOKE_SOCKET` is set.
+
+`scripts/smoke-radiator.sh` builds `radiator-cli` (from `../radiator-cli`
+next to this repo, or `$RADIATOR_CLI_ROOT`), starts its hub, and runs the
+test above against it — or prints why it skipped and exits 0 if
+`radiator-cli` isn't checked out or won't build, so CI without that sibling
+repo still passes.
+
+**Isolation.** `radiator hub`'s persisted-layout state file is keyed by
+`--hub-name` alone (`radiator_hub::paths::state_path`), independent of
+`--socket` — passing `--socket` without also pinning `--hub-name` still
+persists to the *default* hub's state file (`hub-main.layout.json`), because
+`--hub-name` silently defaults to `"main"`. An earlier version of this script
+did exactly that, and its throwaway `drove-smoke` workspace leaked into a
+live `main` hub's persisted layout. The script now runs the hub with
+`XDG_RUNTIME_DIR` pointed at its own scratch directory and a unique
+`--hub-name`, so both its socket and its state file are fully isolated —
+mirroring `scripts/smoke-herdr.sh`'s unique `--session` for the same
+reason. Verify this holds before trusting a change here: diff
+`~/.local/state/radiator/hub-main.layout.json` (or wherever a real hub on
+the machine persists to) before and after a run.

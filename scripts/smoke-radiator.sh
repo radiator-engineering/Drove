@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# Builds the real `radiator-cli` hub, starts it on a temp socket, and runs
+# Builds the real `radiator-cli` hub, starts it on an isolated hub, and runs
 # tests/radiator_smoke.rs against it. Skips (exit 0) instead of failing when
 # radiator-cli isn't checked out next to this repo, or its build fails — a
 # missing sibling checkout is expected outside the author's machine, not a
 # Drove regression.
+#
+# Isolation: `radiator hub`'s state file is keyed by `--hub-name` alone
+# (`radiator_hub::paths::state_path`), independent of `--socket` — passing
+# `--socket` without also pinning `--hub-name` still persists layout to the
+# *default* hub's state file (`hub-main.layout.json`) and can leak a
+# throwaway workspace into a live hub sharing that name. This script points
+# `XDG_RUNTIME_DIR` at a scratch directory for the hub subprocess and uses a
+# unique `--hub-name`, so both its socket and its state file live under the
+# scratch dir and never touch a real hub, matching how
+# `scripts/smoke-herdr.sh` uses a unique `--session` for the same reason.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,8 +30,15 @@ if ! (cd "$radiator_cli" && cargo build --quiet --bin radiator) 2>"$root/target/
   exit 0
 fi
 
-tmp="$(mktemp -d)"
-socket="$tmp/hub.sock"
+hub_name="ci$$"
+# A Unix socket path has a short OS limit (SUN_LEN, ~104 bytes on macOS).
+# `$TMPDIR` on macOS is already a long per-process path, so `mktemp -d`
+# there plus `radiator/hub-${hub_name}.sock` can blow the limit — root the
+# scratch dir at `/tmp` directly instead.
+tmp="$(mktemp -d /tmp/drove-radiator-XXXXXX)"
+runtime_dir="$tmp/rt"
+mkdir -p "$runtime_dir"
+socket="$runtime_dir/radiator/hub-${hub_name}.sock"
 server_pid=""
 
 cleanup() {
@@ -33,7 +50,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$radiator_cli/target/debug/radiator" --socket "$socket" hub >"$tmp/hub.log" 2>&1 &
+# Unset any ambient socket override so `--hub-name`'s derived path (under our
+# scratch `XDG_RUNTIME_DIR`) is what actually gets bound.
+env -u RADIATOR_HUB_SOCKET XDG_RUNTIME_DIR="$runtime_dir" \
+  "$radiator_cli/target/debug/radiator" --hub-name "$hub_name" hub >"$tmp/hub.log" 2>&1 &
 server_pid="$!"
 
 for _ in {1..100}; do

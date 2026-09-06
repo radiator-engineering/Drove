@@ -53,6 +53,34 @@ fn radiator_hub_smoke() {
         .report_tokens(&pane_id, &tokens)
         .expect("report_tokens degrades cleanly with or without pane.set_metadata");
 
+    // radiator-cli PR 21 (merged to main) added `pane.set_metadata`,
+    // `PaneInfo.process`, and `workspace.rename`. Against a hub that build,
+    // `resolve_ownership`/`process_info`/`rename_workspace` take their
+    // primary path (the hub itself), not the journal/warning fallback this
+    // backend also supports for an older hub.
+    let ownership = client
+        .resolve_ownership(&pane_id)
+        .expect("resolve_ownership");
+    assert_eq!(
+        ownership,
+        drove::backend::radiator::Ownership::Known(tokens),
+        "hub.snapshot should report back the metadata pane.set_metadata just wrote"
+    );
+
+    let process = client
+        .process_info(&pane_id)
+        .expect("process_info")
+        .expect("hub reports PaneInfo.process for a spawned term pane");
+    assert_eq!(process.command, vec!["true".to_owned()]);
+
+    let renamed = client
+        .rename_workspace(&workspace_id, "drove-smoke-renamed")
+        .expect("workspace.rename");
+    assert!(
+        renamed,
+        "hub.snapshot should have workspace.rename, not fall back to the unsupported warning"
+    );
+
     client.close_pane(&pane_id).expect("pane.close");
     client
         .close_workspace(&workspace_id)
