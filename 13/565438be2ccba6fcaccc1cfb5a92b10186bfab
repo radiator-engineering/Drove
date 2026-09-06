@@ -1,0 +1,69 @@
+.context/DECISIONS.md
+  s_5213c0d852466f::t_a7484c5f331d27 86
+  s_5213c0d852466f::t_29160a538b9db1 87
+  s_5213c0d852466f::t_5d9c74fe67c094 90
+  s_5213c0d852466f::t_ee999bfadcf9e4 88
+  s_5213c0d852466f::t_b484be0c08aea7 89
+  s_4d0bfc94e513e8::t_2aac411d270a78 91
+AGENTS.md
+  s_5213c0d852466f::t_6ea2c3d821d9b4 39-42
+.context/PR-WORKFLOW.md
+  s_5213c0d852466f::t_6ea2c3d821d9b4 1-34
+scripts/smoke-herdr.sh
+  s_930a7d7fbae4d7::t_802f70df2b04c6 50-55
+src/lib.rs
+  s_930a7d7fbae4d7::t_68fbb1a60239f9 10
+tests/herdr_smoke_live.rs
+  s_930a7d7fbae4d7::t_582c3ad032205f 1-16,21-57,59-115,117
+  s_930a7d7fbae4d7::t_c7db389ed22fc1 17-20,58,116
+src/backend/mod.rs
+  s_930a7d7fbae4d7::t_481850433493cd 91-94
+  s_930a7d7fbae4d7::t_9eb3d1c9f2742f 32-34
+src/backend/herdr.rs
+  s_930a7d7fbae4d7::t_1f7485d3b93cc0 393,487,769-994,996-999
+  s_930a7d7fbae4d7::t_0c9795beabb170 85-91
+  s_930a7d7fbae4d7::t_dafa5c7aede00f 400,404,407,409,414
+  s_930a7d7fbae4d7::t_f29436b3161cd7 612-615
+  s_930a7d7fbae4d7::t_c2dda431cbdb61 302,995
+  s_930a7d7fbae4d7::t_97443fad40d96e 565-570
+  s_930a7d7fbae4d7::t_f0168430d5509c 546-547
+  s_930a7d7fbae4d7::t_2d18b68432e772 184-195,210-301,303-392
+  s_930a7d7fbae4d7::t_a8d3ac89d5766f 519-522
+  s_930a7d7fbae4d7::t_2b0d0769aa0e08 436-440,442,445-446,449-450,461-462,469-470,473-474,484-486
+src/readiness.rs
+  s_930a7d7fbae4d7::t_7f1dcf42573d51 1-110,113-128,134-149,152-160
+  s_930a7d7fbae4d7::t_b03f75cac930e3 129-133
+  s_930a7d7fbae4d7::t_c2dda431cbdb61 111-112,150-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "13565438be2ccba6fcaccc1cfb5a92b10186bfab",
+  "prompts": {},
+  "sessions": {
+    "s_4d0bfc94e513e8": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "23969d32-ade2-4275-a464-00ce9516c777",
+        "model": "composer-2.5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_5213c0d852466f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "97ba7d22-31ef-4bde-ad62-eca25a35ad1a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_930a7d7fbae4d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5dc7ab27-cb51-4e9a-a77c-bc5ce14c09f1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
