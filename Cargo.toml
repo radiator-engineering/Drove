@@ -3,9 +3,13 @@ name = "drove"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Versioned, declarative Herdr workspaces"
+description = "Versioned, declarative agent workspaces"
 license = "Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/radiator-engineering/Drove"
+homepage = "https://github.com/radiator-engineering/Drove"
+keywords = ["cli", "workspace", "declarative", "herdr", "devtools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -33,3 +37,8 @@ unwrap_used = "deny"
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
