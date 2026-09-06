@@ -1,0 +1,32 @@
+docs/spec.md
+  s_4ad92f6366fc54::t_54367146807951 61-66
+  s_4ad92f6366fc54::t_cccb13eff82610 1,8,12
+  s_4ad92f6366fc54::t_3b9144759763a3 25
+README.md
+  s_4ad92f6366fc54::t_5463929a892efc 91
+  s_4ad92f6366fc54::t_9483ebfd23a730 78
+  s_4ad92f6366fc54::t_4f62563ab87a65 54-55,61-62,65
+  s_4ad92f6366fc54::t_5befd82ee8a703 113
+docs/upgrading-v3.md
+  s_4ad92f6366fc54::t_2a0181da2d8ad4 1-30
+docs/drovefile.md
+  s_4ad92f6366fc54::t_35e00edadb5818 1,5-24,38,42,47,50-56,59-61,73,77,81-83,89-99,138-150,160,163-165,167,169
+docs/radiator-backend.md
+  s_4ad92f6366fc54::t_1584655b6d7fe6 3,6,8-12,14-19,23,25-43,53-84,88-91,100-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "52f56fc0af69a4cc63df39ada74acd9c989f8b9b",
+  "prompts": {},
+  "sessions": {
+    "s_4ad92f6366fc54": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7bf0152c-401e-414a-a268-26812b2c453a",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
