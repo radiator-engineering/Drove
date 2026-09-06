@@ -102,6 +102,37 @@ fn status_rejects_an_unknown_backend_flag() {
 }
 
 #[test]
+fn lint_warns_about_a_stale_was_and_a_task_without_check() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review", was = "shell"),
+        ])]),
+    ],
+    tasks = [task(name = "build", run = ["true"])],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "lint"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("was = \"shell\"").and(predicate::str::contains("no `check`")),
+        );
+}
+
+#[test]
 fn invalid_drovefile_fails_before_contacting_herdr() {
     let directory = tempfile::tempdir().expect("tempdir");
     let drovefile = directory.path().join("Drovefile");

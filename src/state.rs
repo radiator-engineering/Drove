@@ -68,6 +68,18 @@ impl LocalState {
         self.profiles.entry(name.to_owned()).or_default()
     }
 
+    /// Records a `was =` rename (D34): moves a managed resource's entry from
+    /// its old identity to its new one, keeping the same backend id, parent
+    /// and digest. After this, the next `drove up`/`plan`/`status` sees the
+    /// resource under `new_identity` and the `was` declaration goes inert —
+    /// there is no longer an old identity live for it to match.
+    pub fn rename_resource(&mut self, profile: &str, old_identity: &str, new_identity: &str) {
+        let managed = self.profile_mut(profile);
+        if let Some(resource) = managed.resources.remove(old_identity) {
+            managed.resources.insert(new_identity.to_owned(), resource);
+        }
+    }
+
     pub fn is_approved(&self, digest: &str) -> bool {
         self.approvals.contains(digest)
     }
@@ -220,5 +232,63 @@ mod tests {
         let encoded = serde_json::to_vec(&state).expect("encode");
         let loaded: LocalState = serde_json::from_slice(&encoded).expect("decode");
         assert!(loaded.is_approved("abc"));
+    }
+
+    #[test]
+    fn rename_resource_migrates_identity_and_round_trips() {
+        let mut state = LocalState {
+            schema_version: 1,
+            repo_root: PathBuf::from("/repo"),
+            profiles: BTreeMap::new(),
+            approvals: BTreeSet::new(),
+            journal: Vec::new(),
+            path: PathBuf::new(),
+        };
+        state.profile_mut("default").resources.insert(
+            "old".to_owned(),
+            ManagedResource {
+                kind: "pane".into(),
+                backend_id: "w1:p1".into(),
+                parent: Some("dev/main".into()),
+                digest: "digest-1".into(),
+                adopted: None,
+                last_outcome: None,
+            },
+        );
+
+        state.rename_resource("default", "old", "new");
+
+        assert!(
+            !state
+                .profile("default")
+                .expect("default profile")
+                .resources
+                .contains_key("old")
+        );
+        let migrated = state
+            .profile("default")
+            .expect("default profile")
+            .resources
+            .get("new")
+            .expect("resource under new identity");
+        assert_eq!(migrated.backend_id, "w1:p1");
+        assert_eq!(migrated.digest, "digest-1");
+
+        let encoded = serde_json::to_vec(&state).expect("encode");
+        let loaded: LocalState = serde_json::from_slice(&encoded).expect("decode");
+        assert!(
+            loaded
+                .profile("default")
+                .expect("default profile")
+                .resources
+                .contains_key("new")
+        );
+        assert!(
+            !loaded
+                .profile("default")
+                .expect("default profile")
+                .resources
+                .contains_key("old")
+        );
     }
 }

@@ -90,6 +90,9 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Warn about a stale `was =` declaration or a task with no `check`
+    /// (D26, D34). Always exits 0.
+    Lint,
     /// Run `on_stop` hooks, then detach every resource this profile owns.
     Down {
         /// Also close owned panes on the backend; without it, detach only.
@@ -139,6 +142,10 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
 
     if let Some(Command::Run { task, yes }) = &cli.command {
         return run_command(profile, &repo_root, task.as_deref(), *yes, cli.json);
+    }
+
+    if matches!(cli.command, Some(Command::Lint)) {
+        return lint_command(profile, &repo_root, cli.json);
     }
 
     let (backend_id, target) = resolve_backend(&cli, &compiled.config);
@@ -192,7 +199,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
         allow_replace: false,
         yes: false,
     }) {
-        Command::Render | Command::Run { .. } | Command::Down { .. } => {
+        Command::Render | Command::Run { .. } | Command::Down { .. } | Command::Lint => {
             unreachable!("handled above")
         }
         Command::Status | Command::Plan => {
@@ -266,6 +273,67 @@ fn run_command(
             report_task_outcomes(&results, json)
         }
     }
+}
+
+/// `drove lint` (D26, D34): a stale `was =` that matches nothing live, and a
+/// task with no `check`. Minimal on purpose — always exits 0, warnings only.
+fn lint_command(profile: &Profile, repo_root: &Path, json: bool) -> Result<ExitCode> {
+    let state = LocalState::load(repo_root)?;
+    let snapshot = state
+        .profile(&profile.name)
+        .map(|managed| managed.to_snapshot(&profile.name, None))
+        .unwrap_or_default();
+
+    let is_live = |name: &str| {
+        snapshot
+            .resources
+            .get(name)
+            .and_then(|observed| observed.owner.as_ref())
+            .is_some_and(|owner| owner.profile == profile.name)
+    };
+
+    let mut warnings = Vec::new();
+    for workspace in &profile.workspaces {
+        if let Some(was) = &workspace.was
+            && !is_live(was)
+        {
+            warnings.push(format!(
+                "workspace `{}` declares was = \"{was}\" which matches nothing live",
+                workspace.name
+            ));
+        }
+        for tab in &workspace.tabs {
+            for pane in &tab.panes {
+                if let Some(was) = &pane.was
+                    && !is_live(was)
+                {
+                    warnings.push(format!(
+                        "pane `{}` declares was = \"{was}\" which matches nothing live",
+                        pane.name
+                    ));
+                }
+            }
+        }
+    }
+    for task in &profile.tasks {
+        if task.check.is_none() {
+            warnings.push(format!(
+                "task `{}` has no `check`; every run is treated as unconverged",
+                task.name
+            ));
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string(&warnings)?);
+    } else if warnings.is_empty() {
+        println!("no lint warnings in profile `{}`", profile.name);
+    } else {
+        for warning in &warnings {
+            println!("warning: {warning}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn down_command(
