@@ -25,9 +25,22 @@ LOG=.context/events.jsonl; [ -e "$LOG" ] || exit 0
 
 # changed paths outside .context/ (renames: keep the new name). Everything else,
 # AGENTS.md and .claude/ included, must be named in a result to get committed.
-changed="$(git status --porcelain --untracked-files=all 2>/dev/null \
-  | grep -vE '^.. \.context/' \
-  | sed -E 's/^.. //; s/^.* -> //')"
+# -z keeps raw path names intact (text porcelain C-quotes paths with
+# whitespace, breaking both the stat lookup below and the paths= list this
+# hook suggests). -z records are NUL-terminated; a rename/copy (status R/C)
+# emits the destination record followed by a second, unprefixed record
+# holding the source path, which must be consumed and dropped, not treated
+# as another changed file.
+changed="$(
+  git status --porcelain -z --untracked-files=all 2>/dev/null | {
+    while IFS= read -r -d '' entry; do
+      st="${entry:0:2}" f="${entry:3}"
+      case "$st" in R*|C*) IFS= read -r -d '' _ || true ;; esac  # discard source path
+      case "$f" in .context/*) continue ;; esac
+      printf '%s\n' "$f"
+    done
+  }
+)"
 [ -n "$changed" ] || exit 0
 
 # newest change vs the controller's last result (controller lines carry no by=, or by=controller)
@@ -39,7 +52,12 @@ mtime_ns() {
   s="$(stat -f '%Fm' "$1" 2>/dev/null || stat -c '%.9Y' "$1" 2>/dev/null)" || { echo 0; return; }
   printf '%s\n' "${s/./}"
 }
-now="$(date +%s%N 2>/dev/null || echo 0)"; newest=0
+# `date +%s%N` is GNU; older BSD/macOS date has no %N and emits the literal
+# "N" suffix (non-numeric), so validate before trusting it and fall back to
+# whole seconds (padded to ns) when it isn't purely digits.
+now="$(date +%s%N 2>/dev/null || true)"
+case "$now" in ''|*[!0-9]*) now="$(date +%s 2>/dev/null || echo 0)000000000" ;; esac
+newest=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   if [ -e "$f" ]; then m="$(mtime_ns "$f")"; else m="$now"; fi

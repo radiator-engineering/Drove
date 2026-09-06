@@ -61,14 +61,22 @@ acked_through() {
 }
 
 # files currently dirty under the doc roots (sorted, one per line).
-# -z + strip the two-char status prefix (and any "old -> new" rename arrow)
-# keeps paths with spaces intact; `awk '{print $NF}'` on porcelain text output
-# would instead return a fragment of a quoted, space-containing path.
+# -z keeps paths with spaces intact (git text-porcelain C-quotes them, and
+# `awk '{print $NF}'` would then return a fragment of the quoted path). -z
+# records are NUL-terminated, not newline-terminated, and for a rename/copy
+# (status R/C) the destination record is followed by a SECOND, unprefixed
+# record holding the source path — piping through `tr '\0' '\n'` would strip
+# the same 3-char status prefix from that source record too, corrupting it.
+# Read records directly and consume the source record explicitly instead.
 dirty_docs() {
-  git status --porcelain -z 2>/dev/null | tr '\0' '\n' | sed 's/^...//; s/^.* -> //' | while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    while IFS= read -r p; do [ -n "$p" ] || continue; case "$f" in "$p"|"$p"/*) echo "$f"; break ;; esac; done <<<"$(tr ',' '\n' <<<"$DOC_PATHS")"
-  done | sort -u
+  git status --porcelain -z 2>/dev/null | {
+    while IFS= read -r -d '' entry; do
+      st="${entry:0:2}" f="${entry:3}"
+      case "$st" in R*|C*) IFS= read -r -d '' _ || true ;; esac  # discard source path
+      [ -n "$f" ] || continue
+      while IFS= read -r p; do [ -n "$p" ] || continue; case "$f" in "$p"|"$p"/*) echo "$f"; break ;; esac; done <<<"$(tr ',' '\n' <<<"$DOC_PATHS")"
+    done
+  } | sort -u
 }
 
 # The documentation-writer skill is interactive by design (it asks four
