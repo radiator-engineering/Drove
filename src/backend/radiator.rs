@@ -108,19 +108,27 @@ impl RadiatorClient {
     /// `hub.capabilities`, queried once and cached (D35). An older hub with
     /// no `hub.capabilities` at all answers `unknown_method`, folded into
     /// the same all-`false` default as a hub that explicitly reports no
-    /// optional features — either way this backend falls back to the local
-    /// token journal and skips `process_info`.
+    /// optional features (or one whose reply doesn't parse) — either way
+    /// that is a stable fact about this hub build, worth caching. A
+    /// transport failure is not: it is reported as an all-`false` default
+    /// for this call only, without being written to the cache, so a
+    /// transient blip doesn't permanently strand this client on the
+    /// journal-only path once the hub is reachable again. The lock is held
+    /// across the whole check-request-fill sequence so concurrent callers
+    /// on a cache miss share one `hub.capabilities` round trip rather than
+    /// each firing their own.
     fn hub_capabilities(&self) -> HubCapabilities {
-        if let Some(cached) = *self.capabilities.lock().expect("capabilities cache lock") {
+        let mut cache = self.capabilities.lock().expect("capabilities cache lock");
+        if let Some(cached) = *cache {
             return cached;
         }
-        let queried = self
-            .request_optional("hub.capabilities", json!({}))
-            .ok()
-            .flatten()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default();
-        *self.capabilities.lock().expect("capabilities cache lock") = Some(queried);
+        let queried = match self.request_optional("hub.capabilities", json!({})) {
+            Ok(reply) => reply
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
+            Err(_) => return HubCapabilities::default(),
+        };
+        *cache = Some(queried);
         queried
     }
 
@@ -332,8 +340,13 @@ impl RadiatorClient {
     /// non-capable hub whose journal has nothing either.
     pub fn resolve_ownership(&self, id: &str) -> Result<Ownership> {
         if self.hub_capabilities().metadata {
+            // Read the hub's answer before clearing the journal: if
+            // `hub.snapshot` fails, `?` returns early and the (possibly
+            // still-needed) journal entry is left in place rather than
+            // deleted ahead of a read that never completed.
+            let hub_tokens = self.hub_reported_metadata(id)?;
             self.journal_clear(id)?;
-            return Ok(match self.hub_reported_metadata(id)? {
+            return Ok(match hub_tokens {
                 Some(hub) => Ownership::Known(hub),
                 None => Ownership::Unknown,
             });
@@ -1179,6 +1192,28 @@ mod tests {
         let first = Backend::capabilities(&client);
         let second = Backend::capabilities(&client);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn hub_capabilities_does_not_cache_a_transport_failure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory
+            .path()
+            .join("hub-capabilities-transport-failure.sock");
+        let client = RadiatorClient::new(path.clone());
+
+        // Nothing is listening yet, so the request fails to connect at all
+        // — not with `unknown_method`. That failure must not be cached as
+        // "no optional features", or the client would be stuck on the
+        // journal-only path forever even once the hub comes up.
+        let before = Backend::capabilities(&client);
+        assert!(!before.metadata_tokens);
+        assert!(!before.process_info);
+
+        fake_hub(path, capabilities_response(true, true));
+        let after = Backend::capabilities(&client);
+        assert!(after.metadata_tokens);
+        assert!(after.process_info);
     }
 
     #[test]
