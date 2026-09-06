@@ -40,12 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is dropped: the crate compiles there, but two planner tests
-        # (detects_layout_drift_without_counting_runtime_ids,
-        # running_agent_in_mapped_pane_is_in_sync) fail because the planner
-        # normalizes pane cwd paths with Unix separators. That is a source bug
-        # to fix before claiming Windows support, not a CI concern.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

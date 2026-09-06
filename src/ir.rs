@@ -147,7 +147,7 @@ fn to_ir_inner(profile: &Profile) -> Result<Ir> {
                 // unchanged.
                 let content_fields = json!({
                     "label": pane.label,
-                    "cwd": pane.cwd,
+                    "cwd": pane.cwd.as_deref().map(crate::paths::normalize_for_digest),
                     "env": pane.env,
                     "serve": pane.serve,
                     "ready": pane.ready,
@@ -197,7 +197,7 @@ fn to_ir_inner(profile: &Profile) -> Result<Ir> {
 
         let workspace_fields = json!({
             "label": workspace.label,
-            "cwd": workspace.cwd,
+            "cwd": crate::paths::normalize_for_digest(&workspace.cwd),
             "env": workspace.env,
         });
         // The workspace digest still folds in each group's shape and its

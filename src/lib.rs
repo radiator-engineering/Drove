@@ -7,6 +7,7 @@ pub mod dsl;
 pub mod executor;
 pub mod ir;
 pub mod model;
+pub mod paths;
 pub mod planner;
 pub mod readiness;
 pub mod state;
