@@ -18,7 +18,26 @@ fn client() -> Option<HerdrClient> {
         return None;
     }
     let client = HerdrClient::discover(None, None);
-    client.ping().ok().map(|_| client)
+    // An explicit target that fails to ping is a real failure, not "no
+    // Herdr running" — surface it instead of silently skipping the test.
+    client
+        .ping()
+        .expect("ping the explicitly configured Herdr target");
+    Some(client)
+}
+
+/// Closes a workspace when dropped, including on panic/unwind, so a smoke
+/// test failure partway through never leaves a stray workspace behind in
+/// the isolated session.
+struct WorkspaceGuard<'a> {
+    client: &'a HerdrClient,
+    workspace_id: String,
+}
+
+impl Drop for WorkspaceGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.close_workspace(&self.workspace_id);
+    }
 }
 
 #[test]
@@ -35,6 +54,10 @@ fn drove_converges_a_tab_incrementally_against_a_live_herdr() {
     let workspace_id = client
         .create_workspace("drove-smoke", Path::new("."))
         .expect("create workspace");
+    let _workspace_guard = WorkspaceGuard {
+        client: &client,
+        workspace_id: workspace_id.clone(),
+    };
 
     let root = json!({
         "type": "pane",
@@ -118,7 +141,9 @@ fn drove_converges_a_tab_incrementally_against_a_live_herdr() {
     assert_eq!(client.caller_pane_id(), None);
 
     // output(): recent text of the pane that ran `true`.
-    let output = client.output(&first_pane).expect("pane output");
+    let output = client
+        .output(&first_pane, std::time::Duration::from_secs(2))
+        .expect("pane output");
     let _ = output; // content is unpredictable; the call succeeding is the check.
 
     client.close_pane(&second_pane).expect("close split pane");

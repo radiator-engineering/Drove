@@ -5,7 +5,7 @@
 pub mod herdr;
 pub mod radiator;
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -91,5 +91,7 @@ pub trait Backend {
 
     /// Recent pane text, host-side input to an `output()` readiness probe
     /// (D23). Only meaningful when `capabilities().readiness_output`.
-    fn output(&self, pane_id: &str) -> Result<String>;
+    /// `timeout` bounds the backend round trip so a withheld response
+    /// cannot block a readiness check indefinitely.
+    fn output(&self, pane_id: &str, timeout: Duration) -> Result<String>;
 }

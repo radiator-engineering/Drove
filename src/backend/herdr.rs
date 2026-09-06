@@ -5,10 +5,12 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::Stream;
+use interprocess::local_socket::traits::Stream as _StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -36,11 +38,27 @@ impl HerdrClient {
     }
 
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, None)
+    }
+
+    /// Sends a request, bounding how long the response read may block. Used
+    /// by `output()` so an `output()` readiness probe (D23) cannot hang
+    /// forever on a Herdr response that never arrives.
+    pub fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let id = format!("drove:{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed));
         let request = json!({"id": id, "method": method, "params": params});
-        let mut stream = BufReader::new(connect(&self.socket_path).with_context(|| {
+        let stream = connect(&self.socket_path).with_context(|| {
             format!("cannot connect to Herdr at {}", self.socket_path.display())
-        })?);
+        })?;
+        stream
+            .set_recv_timeout(timeout)
+            .context("cannot set Herdr response timeout")?;
+        let mut stream = BufReader::new(stream);
         serde_json::to_writer(stream.get_mut(), &request).context("cannot encode Herdr request")?;
         stream
             .get_mut()
@@ -280,6 +298,14 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Closes a whole workspace (`workspace.close`), for callers (test
+    /// cleanup, tear-down) that own a workspace outright rather than an
+    /// individual pane.
+    pub fn close_workspace(&self, workspace_id: &str) -> Result<()> {
+        self.request("workspace.close", json!({"workspace_id": workspace_id}))?;
+        Ok(())
+    }
+
     /// Sets every split ratio in a tab from a flat, left-to-right ratio
     /// list (spec D6: a tab is a pane list with a shared `split` direction
     /// and one ratio per gap, not a binary tree). Herdr addresses one split
@@ -320,9 +346,10 @@ impl HerdrClient {
     }
 
     /// Recent pane output (`pane.read`, `source: "recent"`), the host-side
-    /// input to an `output()` readiness probe (D23).
-    pub fn output(&self, pane_id: &str) -> Result<String> {
-        let result = self.request(
+    /// input to an `output()` readiness probe (D23). `timeout` bounds the
+    /// response read so a withheld response cannot hang the probe forever.
+    pub fn output(&self, pane_id: &str, timeout: Duration) -> Result<String> {
+        let result = self.request_with_timeout(
             "pane.read",
             json!({
                 "pane_id": pane_id,
@@ -330,6 +357,7 @@ impl HerdrClient {
                 "format": "text",
                 "strip_ansi": true,
             }),
+            Some(timeout),
         )?;
         result
             .get("read")
@@ -350,13 +378,7 @@ fn is_pane_id(address: &str) -> bool {
 
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
-        .map(|arg| {
-            if arg.is_empty() || arg.contains([' ', '\t', '\'', '"', '\n']) {
-                format!("'{}'", arg.replace('\'', r"'\''"))
-            } else {
-                arg.clone()
-            }
-        })
+        .map(|arg| format!("'{}'", arg.replace('\'', r"'\''")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -482,8 +504,8 @@ impl Backend for HerdrClient {
         HerdrClient::report_metadata(self, address, tokens)
     }
 
-    fn output(&self, pane_id: &str) -> Result<String> {
-        HerdrClient::output(self, pane_id)
+    fn output(&self, pane_id: &str, timeout: Duration) -> Result<String> {
+        HerdrClient::output(self, pane_id, timeout)
     }
 }
 
@@ -715,6 +737,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_join_quotes_every_argument() {
+        let joined = shell_join(&[
+            "echo".into(),
+            "$(rm -rf /)".into(),
+            "a;b".into(),
+            "`whoami`".into(),
+            "*.rs".into(),
+            "a>b".into(),
+            "it's".into(),
+        ]);
+        assert_eq!(
+            joined,
+            r"'echo' '$(rm -rf /)' 'a;b' '`whoami`' '*.rs' 'a>b' 'it'\''s'"
+        );
+    }
+
+    #[test]
     fn exchanges_one_ndjson_request_with_fake_server() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("herdr.sock");
@@ -809,7 +848,7 @@ mod tests {
         assert_eq!(requests[0]["params"]["direction"], "down");
         assert_eq!(requests[1]["method"], "pane.send_text");
         assert_eq!(requests[1]["params"]["pane_id"], "w1:p3");
-        assert_eq!(requests[1]["params"]["text"], "echo 'hi there'");
+        assert_eq!(requests[1]["params"]["text"], "'echo' 'hi there'");
         assert_eq!(requests[2]["method"], "pane.send_keys");
         assert_eq!(requests[2]["params"]["keys"], json!(["Enter"]));
     }
@@ -992,8 +1031,32 @@ mod tests {
             stream.get_mut().write_all(b"\n").expect("newline");
         });
 
-        let text = HerdrClient::new(path).output("w1:p1").expect("pane output");
+        let text = HerdrClient::new(path)
+            .output("w1:p1", Duration::from_secs(1))
+            .expect("pane output");
         assert_eq!(text, "scaffold: watching for changes");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn output_times_out_on_a_withheld_response() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-output-timeout.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            // Accept the request but never respond, holding the connection
+            // open past the client's timeout.
+            stream.read_line(&mut line).expect("read");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let error = HerdrClient::new(path)
+            .output("w1:p1", Duration::from_millis(100))
+            .expect_err("withheld response times out");
+        assert!(error.to_string().contains("Herdr response"));
         server.join().expect("server thread");
     }
 
@@ -1021,6 +1084,32 @@ mod tests {
         let request = server.join().expect("server thread");
         assert_eq!(request["method"], "pane.close");
         assert_eq!(request["params"]["pane_id"], "w1:p2");
+    }
+
+    #[test]
+    fn close_workspace_sends_the_target_workspace_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-close-workspace.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({"id": request["id"], "result": {"type": "ok"}});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            request
+        });
+
+        HerdrClient::new(path)
+            .close_workspace("w1")
+            .expect("close workspace");
+
+        let request = server.join().expect("server thread");
+        assert_eq!(request["method"], "workspace.close");
+        assert_eq!(request["params"]["workspace_id"], "w1");
     }
 
     #[test]

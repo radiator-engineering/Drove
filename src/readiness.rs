@@ -8,7 +8,7 @@
 
 use std::{
     net::{TcpStream, ToSocketAddrs},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -47,17 +47,28 @@ pub fn probe_port(port: u16, timeout: Duration) -> bool {
 
 /// True if `argv` runs to completion within `timeout` and exits zero.
 /// Any other outcome (nonzero exit, spawn failure, timeout) is "not ready";
-/// a timeout kills the child rather than leaving it to run unbounded.
+/// a timeout kills the whole process group rather than leaving descendants
+/// (e.g. children spawned by a shell script probe) to run unbounded.
 pub fn probe_cmd(argv: &[String], timeout: Duration) -> Result<bool> {
     let [program, args @ ..] = argv else {
         bail!("cmd() readiness probe declares an empty argv");
     };
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Make the child its own process group leader so a timeout can kill
+        // its whole group, not just the direct child.
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return Ok(false);
+    };
 
     let deadline = Instant::now() + timeout;
     loop {
@@ -65,12 +76,31 @@ pub fn probe_cmd(argv: &[String], timeout: Duration) -> Result<bool> {
             return Ok(status.success());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_process_group(&mut child);
             let _ = child.wait();
             return Ok(false);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &mut Child) {
+    // The child is its own process group leader (see `process_group(0)`
+    // above), so a negative pid signals the whole group. Shelling out to
+    // `kill` avoids reaching for libc/unsafe for a single signal.
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{}", child.id()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut Child) {
+    let _ = child.kill();
 }
 
 #[cfg(test)]
@@ -127,10 +157,10 @@ mod tests {
 
     #[test]
     fn port_probe_fails_on_a_closed_port() {
-        // An IANA-unassigned port (<https://www.iana.org/assignments/service-names-port-numbers>)
-        // rather than bind-then-drop, which races another process for the
-        // freed port.
-        assert!(!probe_port(47, Duration::from_millis(200)));
+        // Port 0 cannot have a listener bound to it, so connecting always
+        // fails deterministically (unlike a fixed port, which a local
+        // service could in principle be listening on).
+        assert!(!probe_port(0, Duration::from_millis(200)));
     }
 
     #[test]
@@ -150,6 +180,37 @@ mod tests {
         let ready =
             probe_cmd(&["sleep".into(), "5".into()], Duration::from_millis(100)).expect("probe");
         assert!(!ready);
+    }
+
+    #[test]
+    fn cmd_probe_reports_not_ready_when_the_program_does_not_exist() {
+        let ready = probe_cmd(
+            &["drove-readiness-probe-does-not-exist".into()],
+            Duration::from_secs(1),
+        )
+        .expect("spawn failure is not an error");
+        assert!(!ready);
+    }
+
+    #[test]
+    fn cmd_probe_kills_a_descendant_spawned_by_a_shell_probe() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let marker = directory.path().join("still-alive");
+        let script = format!(
+            "(sleep 5; touch {}) & wait",
+            marker.to_str().expect("utf8 path")
+        );
+        let ready = probe_cmd(
+            &["sh".into(), "-c".into(), script],
+            Duration::from_millis(200),
+        )
+        .expect("probe");
+        assert!(!ready);
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(
+            !marker.exists(),
+            "descendant survived the timeout and created the marker file"
+        );
     }
 
     #[test]
