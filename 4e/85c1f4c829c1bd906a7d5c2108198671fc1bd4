@@ -1,0 +1,19 @@
+docs/superpowers/research/2026-09-06-neuroarxiv-drove-v2.md
+  s_5213c0d852466f::t_547b6c4a749fa3 1-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "4e85c1f4c829c1bd906a7d5c2108198671fc1bd4",
+  "prompts": {},
+  "sessions": {
+    "s_5213c0d852466f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "97ba7d22-31ef-4bde-ad62-eca25a35ad1a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
