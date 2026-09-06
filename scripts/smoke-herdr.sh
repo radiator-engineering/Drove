@@ -47,3 +47,9 @@ run_allowing_drift() {
 run_allowing_drift up
 run_allowing_drift up
 run_allowing_drift status
+
+# PR 3: split, set-ratio, token round-trip, process-info and adopt against
+# the same live session (tests/herdr_smoke_live.rs skips itself if
+# HERDR_SOCKET_PATH is unreachable).
+export HERDR_SOCKET_PATH="$socket"
+(cd "$root" && cargo test --test herdr_smoke_live -- --nocapture)

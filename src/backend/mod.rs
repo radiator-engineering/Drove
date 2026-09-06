@@ -5,7 +5,7 @@
 pub mod herdr;
 pub mod radiator;
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,9 @@ pub struct Capabilities {
     pub metadata_tokens: bool,
     pub process_info: bool,
     pub events: bool,
+    /// Whether `Backend::output` can read pane text for an `output()`
+    /// readiness probe (D23). Radiator sets this false.
+    pub readiness_output: bool,
 }
 
 /// Backend-observed information about a running pane's process, used for
@@ -85,4 +88,10 @@ pub trait Backend {
     fn process_info(&self, pane_id: &str) -> Result<Option<ProcessInfo>>;
 
     fn report_tokens(&self, address: &str, tokens: &BTreeMap<String, String>) -> Result<()>;
+
+    /// Recent pane text, host-side input to an `output()` readiness probe
+    /// (D23). Only meaningful when `capabilities().readiness_output`.
+    /// `timeout` bounds the backend round trip so a withheld response
+    /// cannot block a readiness check indefinitely.
+    fn output(&self, pane_id: &str, timeout: Duration) -> Result<String>;
 }
