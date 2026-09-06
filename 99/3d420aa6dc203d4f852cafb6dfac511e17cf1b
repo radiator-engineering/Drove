@@ -1,0 +1,23 @@
+docs/radiator-backend.md
+  s_de71d7d03253aa::t_b38caf57dd0aaa 48-56
+src/backend/radiator.rs
+  s_de71d7d03253aa::t_e84804ac233156 346-363
+  s_de71d7d03253aa::t_304bea0c39061e 245-250,256-257,262-270,273-276,278-280
+  s_de71d7d03253aa::t_35e0e47cecaadd 1021-1026,1028,1031,1034-1035,1042-1045,1059,1070-1078
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "993d420aa6dc203d4f852cafb6dfac511e17cf1b",
+  "prompts": {},
+  "sessions": {
+    "s_de71d7d03253aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a8360c60-47d5-46a6-b703-03c3b40d8dbe",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
