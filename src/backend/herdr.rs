@@ -195,14 +195,17 @@ impl Backend for HerdrClient {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             tabs: true,
-            splits_and_ratios: true,
+            // PR 3 implements split_pane/set_ratio/rename_pane.
+            splits_and_ratios: false,
             workspace_env: true,
             pane_command_at_create: true,
             agent_start: true,
-            agent_prompt: true,
+            // PR 3 implements prompt_agent.
+            agent_prompt: false,
             adopt_caller: true,
             metadata_tokens: true,
-            process_info: true,
+            // PR 3 implements process_info.
+            process_info: false,
             events: true,
         }
     }
@@ -236,15 +239,15 @@ impl Backend for HerdrClient {
         _command: Option<&[String]>,
         _cwd: Option<&Path>,
     ) -> Result<String> {
-        unimplemented!("// PR 3: incremental pane.split")
+        bail!("pane.split is not implemented yet (PR 3)")
     }
 
     fn close_pane(&self, _pane_id: &str) -> Result<()> {
-        unimplemented!("// PR 3: pane.close")
+        bail!("pane.close is not implemented yet (PR 3)")
     }
 
     fn set_ratio(&self, _tab_id: &str, _ratios: &[f64]) -> Result<()> {
-        unimplemented!("// PR 3: layout.set_split_ratio")
+        bail!("layout.set_split_ratio is not implemented yet (PR 3)")
     }
 
     fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<()> {
@@ -256,7 +259,7 @@ impl Backend for HerdrClient {
     }
 
     fn rename_pane(&self, _pane_id: &str, _label: &str) -> Result<()> {
-        unimplemented!("// PR 3: pane.rename")
+        bail!("pane.rename is not implemented yet (PR 3)")
     }
 
     fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()> {
@@ -264,11 +267,11 @@ impl Backend for HerdrClient {
     }
 
     fn prompt_agent(&self, _pane_id: &str, _prompt: &str) -> Result<()> {
-        unimplemented!("// PR 3: agent.prompt")
+        bail!("agent.prompt is not implemented yet (PR 3)")
     }
 
     fn process_info(&self, _pane_id: &str) -> Result<Option<ProcessInfo>> {
-        unimplemented!("// PR 3: process info via pane inspection")
+        bail!("process info via pane inspection is not implemented yet (PR 3)")
     }
 
     fn report_tokens(

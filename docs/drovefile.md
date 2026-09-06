@@ -70,9 +70,9 @@ pane(
 
 `serve` is the long-running process; a pane without `serve` is a plain terminal. `serve = any_of([argv1], [argv2])` tries each candidate argv in order and records the first whose executable is on `PATH`. Exactly one pane per profile may declare `adopt = "caller"`; Drove never creates, moves, or replaces that pane — it is the invoking terminal.
 
-Readiness gates `after`: `output("watching")` matches pane output, `port(8080)` probes a TCP port, `cmd(["curl", "-f", "..."])` runs a command. Readiness is re-checked on every reconcile, not just at start.
+Readiness gates `after`: `output("watching")` matches pane output, `port(8080)` probes a TCP port, `cmd(["curl", "-f", "..."])` runs a command. The reconciler is planned to re-check readiness on every reconcile, not just at start; this PR only compiles readiness into the IR.
 
-`on_start` and `on_stop` are argv hooks Drove runs once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and backend ids in the environment.
+`on_start` and `on_stop` are argv hooks Drove is planned to run once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and backend ids in the environment. Task and hook execution are not implemented yet — the planner in this PR always reports the profile as in sync.
 
 ## Agents
 
@@ -108,7 +108,7 @@ task(
 )
 ```
 
-If `check` succeeds, Drove skips `run`. `auto = True` (the default) runs the task during reconciliation once its `after` set is ready; `auto = False` requires an explicit `drove run <name>`. Task dependencies (`after`) form a directed acyclic graph together with pane `after` references, since both live in the same namespace.
+If `check` succeeds, Drove is planned to skip `run`. `auto = True` (the default) is planned to run the task during reconciliation once its `after` set is ready; `auto = False` requires an explicit `drove run <name>`. Task dependencies (`after`) form a directed acyclic graph together with pane `after` references, since both live in the same namespace. This PR validates that graph but does not execute tasks; the planner always reports the profile as in sync.
 
 ## Commands
 

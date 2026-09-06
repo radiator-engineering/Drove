@@ -64,6 +64,7 @@ impl Profile {
     pub fn validate(&self) -> Result<()> {
         let mut workspace_names = BTreeSet::new();
         let mut pane_names = BTreeSet::new();
+        let mut agent_names = BTreeSet::new();
         let mut adopt_count = 0usize;
 
         for workspace in &self.workspaces {
@@ -96,6 +97,14 @@ impl Profile {
                     }
                     if let Some(agent) = &pane.agent {
                         agent.validate()?;
+                        if let Some(agent_name) = &agent.name
+                            && (pane_names.contains(agent_name.as_str())
+                                || !agent_names.insert(agent_name.as_str()))
+                        {
+                            bail!(
+                                "agent `{agent_name}` collides with another resource of the same name in the shared `after` namespace"
+                            );
+                        }
                     }
                     if let Some(adopt) = &pane.adopt {
                         if adopt != "caller" {
@@ -119,9 +128,9 @@ impl Profile {
             if !task_names.insert(task.name.as_str()) {
                 bail!("duplicate task name `{}` in profile", task.name);
             }
-            if pane_names.contains(task.name.as_str()) {
+            if pane_names.contains(task.name.as_str()) || agent_names.contains(task.name.as_str()) {
                 bail!(
-                    "task `{}` collides with a pane of the same name in the shared `after` namespace",
+                    "task `{}` collides with a pane or agent of the same name in the shared `after` namespace",
                     task.name
                 );
             }
@@ -130,12 +139,13 @@ impl Profile {
             }
         }
 
-        self.validate_after(&pane_names, &task_names)
+        self.validate_after(&pane_names, &agent_names, &task_names)
     }
 
     fn validate_after(
         &self,
         pane_names: &BTreeSet<&str>,
+        agent_names: &BTreeSet<&str>,
         task_names: &BTreeSet<&str>,
     ) -> Result<()> {
         let mut edges: BTreeMap<&str, &[String]> = BTreeMap::new();
@@ -150,7 +160,13 @@ impl Profile {
             edges.insert(task.name.as_str(), task.after.as_slice());
         }
 
-        let known = || pane_names.iter().copied().chain(task_names.iter().copied());
+        let known = || {
+            pane_names
+                .iter()
+                .copied()
+                .chain(agent_names.iter().copied())
+                .chain(task_names.iter().copied())
+        };
         for (id, targets) in &edges {
             for target in *targets {
                 if !known().any(|name| name == target) {
@@ -582,6 +598,39 @@ mod tests {
         }));
         let error = profile.validate().expect_err("name collision");
         assert!(error.to_string().contains("collides with a pane"));
+    }
+
+    #[test]
+    fn rejects_agent_name_colliding_with_pane_name() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "ratios": [0.5], "panes": [
+                    {"name": "review"},
+                    {"name": "worker", "agent": {"name": "review", "kind": "claude"}}
+                ]}]
+            }]
+        }));
+        let error = profile.validate().expect_err("agent/pane name collision");
+        assert!(error.to_string().contains("collides with another resource"));
+    }
+
+    #[test]
+    fn agent_name_is_a_valid_after_target() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "ratios": [0.5], "panes": [
+                    {"name": "worker", "agent": {"name": "review", "kind": "claude"}},
+                    {"name": "follower", "after": ["review"]}
+                ]}]
+            }]
+        }));
+        profile
+            .validate()
+            .expect("agent name is a known after target");
     }
 
     #[test]

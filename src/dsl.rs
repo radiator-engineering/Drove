@@ -228,16 +228,25 @@ fn resolve_profiles(raw_profiles: Vec<JsonValue>, repo_root: &Path) -> Result<Ve
             let (base_workspaces, base_tasks) = resolved
                 .get(extends)
                 .with_context(|| format!("profile `{name}` extends unknown profile `{extends}`"))?;
-            if workspaces.is_empty() {
-                workspaces = base_workspaces.clone();
-            }
-            if tasks.is_empty() {
-                tasks = base_tasks.clone();
-            }
+            let mut inherited_workspaces = base_workspaces.clone();
+            inherited_workspaces.append(&mut workspaces);
+            workspaces = inherited_workspaces;
+            let mut inherited_tasks = base_tasks.clone();
+            inherited_tasks.append(&mut tasks);
+            tasks = inherited_tasks;
         }
 
         if let Some(without) = raw.get("without").and_then(JsonValue::as_array) {
             let excluded: Vec<&str> = without.iter().filter_map(JsonValue::as_str).collect();
+            for name_to_drop in &excluded {
+                if !workspaces.iter().any(|workspace| {
+                    workspace.get("name").and_then(JsonValue::as_str) == Some(*name_to_drop)
+                }) {
+                    bail!(
+                        "profile `{name}` declares without = [\"{name_to_drop}\"] for an unknown workspace"
+                    );
+                }
+            }
             if !excluded.is_empty() {
                 workspaces.retain(|workspace| {
                     let workspace_name = workspace.get("name").and_then(JsonValue::as_str);
@@ -506,6 +515,49 @@ profile(name = "core", extends = "default", without = ["files"])
         let core = compiled.config.profile("core").expect("core profile");
         assert_eq!(core.workspaces.len(), 1);
         assert_eq!(core.workspaces[0].name, "control");
+    }
+
+    #[test]
+    fn profile_extends_composes_child_workspaces_with_inherited_ones() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+control_ws = workspace(name = "control", tabs = [tab(name = "main", panes = [pane(name = "shell")])])
+extra_ws = workspace(name = "extra", tabs = [tab(name = "extra", panes = [pane(name = "editor")])])
+
+profile(name = "default", workspaces = [control_ws])
+profile(name = "core", extends = "default", workspaces = [extra_ws])
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        let core = compiled.config.profile("core").expect("core profile");
+        let names: Vec<&str> = core
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.name.as_str())
+            .collect();
+        assert_eq!(names, ["control", "extra"]);
+    }
+
+    #[test]
+    fn without_an_unknown_workspace_fails() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+default_ws = workspace(name = "control", tabs = [tab(name = "main", panes = [pane(name = "shell")])])
+
+profile(name = "default", workspaces = [default_ws])
+profile(name = "core", extends = "default", without = ["typo"])
+"#,
+        )
+        .expect("write fixture");
+
+        let error = compile(&directory.path().join("Drovefile")).expect_err("unknown without");
+        assert!(error.to_string().contains("unknown workspace"));
     }
 
     #[test]

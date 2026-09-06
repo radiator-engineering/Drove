@@ -50,11 +50,11 @@ enum Command {
     Plan,
     /// Reconcile the selected profile, then exit.
     Up {
-        /// Permit replacement of managed tabs and their live PTYs.
+        /// Not yet implemented: the planner in this PR never proposes a replace.
         #[arg(long)]
         allow_replace: bool,
 
-        /// Approve changed task bytes without an interactive prompt.
+        /// Not yet implemented: the planner in this PR never proposes a task run.
         #[arg(long, short = 'y')]
         yes: bool,
     },
