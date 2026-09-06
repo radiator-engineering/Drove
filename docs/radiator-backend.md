@@ -45,11 +45,15 @@ it (`error.code == "unknown_method"`), tokens go into a local journal file
 instead, keyed by hub pane id, under
 `$DROVE_STATE_HOME/radiator-journal/<sha256(socket path)>.json` (falling back
 through `$XDG_STATE_HOME`/`~/.local/state/drove` like `src/state.rs`'s own
-state file). `resolve_ownership` compares whatever the hub itself reports
-(via a proposed `PaneInfo.metadata` field, once it exists) against the
-journal and returns `Ownership::Unknown` the moment they disagree, rather
-than picking one arbitrarily — an unresolved disagreement should read as
-drift to the planner, not as a coin flip (spec §9, brief item 3).
+state file). `resolve_ownership` treats the hub as authoritative the moment
+it reports anything at all (via the proposed `PaneInfo.metadata` field): a
+hub answer wins outright, and any journal entry for that pane is cleared
+rather than compared against it, since a journal entry can only predate a
+hub gaining `pane.set_metadata` — it is never a live second writer once the
+hub can report metadata itself. `report_tokens` clears the same way on a
+successful hub write. `Ownership::Unknown` is reserved for a pane the hub
+says nothing about and the journal has never seen either — genuine "we
+don't know," not a stale-versus-live mismatch (spec §9, brief item 3).
 
 ## Detecting the gap-report hub additions at runtime
 

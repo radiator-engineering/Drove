@@ -242,30 +242,42 @@ impl RadiatorClient {
     }
 
     /// `pane.set_metadata` is a proposed hub addition (gaps report item 1).
-    /// On a hub that has it, tokens are written through to the hub. On one
-    /// that doesn't, they land in the local journal keyed by `id` instead.
+    /// On a hub that has it, tokens are written through to the hub, and any
+    /// journal entry left over from before the hub supported metadata (an
+    /// older hub, or one caught mid rolling-upgrade) is cleared — the hub is
+    /// now authoritative for `id`, so a stale journal entry must not linger
+    /// to be read back as a conflict. On a hub that still lacks it, tokens
+    /// land in the local journal instead.
     pub fn report_tokens(&self, id: &str, tokens: &BTreeMap<String, String>) -> Result<()> {
         let outcome =
             self.request_optional("pane.set_metadata", json!({"id": id, "set": tokens}))?;
         if outcome.is_none() {
             self.journal_merge(id, tokens)?;
+        } else {
+            self.journal_clear(id)?;
         }
         Ok(())
     }
 
-    /// Resolve what this backend believes `id`'s ownership tokens are,
-    /// consulting the hub's reported metadata (if the hub supports it) and
-    /// the local journal, and returning `Unknown` when they disagree (spec
-    /// §9, brief item 3).
+    /// Resolve what this backend believes `id`'s ownership tokens are. The
+    /// hub is authoritative whenever it reports anything at all — the
+    /// journal only fills in for a hub that can't store metadata yet, and
+    /// once a hub gains `pane.set_metadata` its answer must supersede
+    /// whatever the journal was tracking beforehand, not merely agree with
+    /// it (a stale journal entry from before the hub could report metadata
+    /// is not the same as a live disagreement, spec §9, brief item 3).
+    /// `Unknown` is reserved for a hub that reports nothing and a journal
+    /// that has nothing either.
     pub fn resolve_ownership(&self, id: &str) -> Result<Ownership> {
         let hub_tokens = self.hub_reported_metadata(id)?;
+        if let Some(hub) = hub_tokens {
+            self.journal_clear(id)?;
+            return Ok(Ownership::Known(hub));
+        }
         let journal_tokens = self.load_journal()?.panes.get(id).cloned();
-        Ok(match (hub_tokens, journal_tokens) {
-            (Some(hub), Some(journal)) if hub == journal => Ownership::Known(hub),
-            (Some(_), Some(_)) => Ownership::Unknown,
-            (Some(hub), None) => Ownership::Known(hub),
-            (None, Some(journal)) => Ownership::Known(journal),
-            (None, None) => Ownership::Unknown,
+        Ok(match journal_tokens {
+            Some(journal) => Ownership::Known(journal),
+            None => Ownership::Unknown,
         })
     }
 
@@ -324,6 +336,24 @@ impl RadiatorClient {
             .entry(id.to_owned())
             .or_default()
             .extend(tokens.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let path = self.journal_path();
+        let parent = path.parent().context("journal path has no parent")?;
+        fs::create_dir_all(parent).context("cannot create Radiator journal directory")?;
+        fs::write(&path, serde_json::to_vec_pretty(&journal)?)
+            .context("cannot write Radiator token journal")?;
+        Ok(())
+    }
+
+    /// Drop `id`'s journal entry, if any. Called once the hub itself becomes
+    /// authoritative for `id` (a successful `pane.set_metadata` write, or
+    /// `resolve_ownership` seeing the hub report anything at all), so a
+    /// journal entry written before the hub could store metadata never
+    /// outlives its purpose and gets read back as a false conflict.
+    fn journal_clear(&self, id: &str) -> Result<()> {
+        let mut journal = self.load_journal()?;
+        if journal.panes.remove(id).is_none() {
+            return Ok(());
+        }
         let path = self.journal_path();
         let parent = path.parent().context("journal path has no parent")?;
         fs::create_dir_all(parent).context("cannot create Radiator journal directory")?;
@@ -988,20 +1018,31 @@ mod tests {
         assert_eq!(ownership, Ownership::Known(tokens));
     }
 
+    /// Regression for the reviewer's rolling-upgrade finding on PR 5: tokens
+    /// get journaled while the hub lacks `pane.set_metadata`, the hub then
+    /// gains it (a hub upgrade) and reports its own (possibly different)
+    /// current tokens for the same pane. The hub must win outright — not
+    /// read as a conflict against the now-superseded journal entry — and
+    /// the stale journal entry must be cleared so it can't resurface later.
     #[test]
-    fn resolve_ownership_is_unknown_when_hub_and_journal_disagree() {
+    fn resolve_ownership_prefers_hub_over_a_stale_journal_entry_after_rolling_upgrade() {
         let state_home = tempfile::tempdir().expect("tempdir");
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("hub-disagree.sock");
+        let path = directory.path().join("hub-upgrade.sock");
         let client = RadiatorClient::with_journal_root(path.clone(), state_home.path().to_owned());
 
+        // Written back when this hub (or an earlier build of it) had no
+        // `pane.set_metadata`.
         let mut journal_tokens = BTreeMap::new();
         journal_tokens.insert("drove_digest".to_owned(), "old".to_owned());
         client
             .journal_merge("w0:p1", &journal_tokens)
             .expect("seed journal");
 
-        fake_hub(path, |request| {
+        let mut hub_tokens = BTreeMap::new();
+        hub_tokens.insert("drove_digest".to_owned(), "new".to_owned());
+        let hub_tokens_for_response = hub_tokens.clone();
+        fake_hub(path, move |request| {
             assert_eq!(request["method"], "hub.snapshot");
             json!({
                 "id": request["id"],
@@ -1015,7 +1056,7 @@ mod tests {
                             "kind": "term",
                             "title": "p",
                             "runner": "idle",
-                            "metadata": {"drove_digest": "new"},
+                            "metadata": hub_tokens_for_response,
                         }],
                     }],
                     "seq": 1,
@@ -1026,7 +1067,15 @@ mod tests {
         let ownership = client
             .resolve_ownership("w0:p1")
             .expect("resolve ownership");
-        assert_eq!(ownership, Ownership::Unknown);
+        assert_eq!(ownership, Ownership::Known(hub_tokens));
+        assert!(
+            !client
+                .load_journal()
+                .expect("load journal")
+                .panes
+                .contains_key("w0:p1"),
+            "stale journal entry must be cleared once the hub reports for this pane"
+        );
     }
 
     #[test]
