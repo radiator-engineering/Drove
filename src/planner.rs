@@ -1287,6 +1287,48 @@ mod tests {
     }
 
     #[test]
+    fn was_matching_a_workspace_already_live_under_the_new_name_is_a_conflict() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "was": "legacy",
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        let snapshot = Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(&ir, "workspace", "dev"),
+            )
+            .owned("workspace", "legacy", "w2", None, "default", "any-digest");
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.kind == Action::Core(CoreAction::Conflict)
+                    && action.address == "dev")
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|action| action.kind == Action::Core(CoreAction::RenameWorkspace))
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|action| action.kind == Action::Core(CoreAction::Detach))
+        );
+    }
+
+    #[test]
     fn adopts_caller_pane_when_present() {
         let profile = profile_from(json!({
             "name": "default",
