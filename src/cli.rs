@@ -78,7 +78,8 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Print the compiled intermediate representation (schema version 2).
+    /// Print the compiled intermediate representation (schema version 3); a
+    /// v2 Drovefile also prints its deprecation warnings and v3 form (D31).
     Render,
     /// Run one task and its `after` prerequisites; with no task, list every
     /// declared task and its last recorded outcome.
@@ -120,6 +121,13 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
             println!("{}", serde_json::to_string(&ir)?);
         } else {
             println!("{}", ir.to_json_pretty()?);
+        }
+        // A v2 Drovefile compiles through the shims (D31); show its warnings
+        // and the equivalent v3 form so the author can migrate. Both go to
+        // stderr so `--json` stdout stays a clean IR document.
+        print_warnings(&compiled.warnings);
+        if !compiled.warnings.is_empty() {
+            eprint!("\nv3 form:\n\n{}", v3form::render(&compiled.config));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -189,6 +197,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
         }
         Command::Status | Command::Plan => {
             print_plan(&plan, cli.json)?;
+            print_warnings(&compiled.warnings);
             Ok(if plan.status == SyncStatus::InSync {
                 ExitCode::SUCCESS
             } else {
@@ -392,9 +401,315 @@ fn print_plan(plan: &Plan, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Prints each compile-time deprecation warning to stderr (D31), so a warning
+/// never corrupts a `--json` stdout document.
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// Renders a compiled config back into an equivalent v3 Drovefile (D31): the
+/// `drove render` "v3 form" block for a v2 Drovefile. It prints the resolved
+/// profiles, so `extends`/`without` are already applied and every workspace
+/// uses `panes = [herdr.tab(...)]` with `caller_pane` for adoption. Helper
+/// functions and `load(...)` from the original source are not reconstructed.
+mod v3form {
+    use std::fmt::Write;
+
+    use crate::model::{
+        Agent, DroveConfig, Pane, Profile, Readiness, SplitDirection, Tab, Task, Workspace,
+    };
+
+    pub fn render(config: &DroveConfig) -> String {
+        let mut out = String::new();
+        let mut declared = false;
+        if let Some(backend) = &config.backend {
+            let _ = writeln!(out, "backend({})", quote(backend));
+            declared = true;
+        }
+        if let Some(session) = &config.target.herdr_session {
+            let _ = writeln!(out, "herdr.session({})", quote(session));
+            declared = true;
+        }
+        if let Some(hub) = &config.target.radiator_hub {
+            let _ = writeln!(out, "radiator.hub({})", quote(hub));
+            declared = true;
+        }
+        if declared {
+            out.push('\n');
+        }
+        for profile in config.profiles.values() {
+            out.push_str(&render_profile(profile));
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_profile(profile: &Profile) -> String {
+        let mut args = vec![format!("name = {}", quote(&profile.name))];
+        if !profile.workspaces.is_empty() {
+            let items: Vec<String> = profile.workspaces.iter().map(render_workspace).collect();
+            args.push(format!("workspaces = {}", list_block(&items, 1)));
+        }
+        if !profile.tasks.is_empty() {
+            let items: Vec<String> = profile.tasks.iter().map(render_task).collect();
+            args.push(format!("tasks = {}", list_block(&items, 1)));
+        }
+        call("profile", &args, 0)
+    }
+
+    fn render_workspace(workspace: &Workspace) -> String {
+        let mut args = vec![quote(&workspace.name)];
+        if let Some(label) = &workspace.label {
+            args.push(format!("label = {}", quote(label)));
+        }
+        if workspace.cwd != std::path::Path::new(".") {
+            args.push(format!(
+                "cwd = {}",
+                quote(&workspace.cwd.display().to_string())
+            ));
+        }
+        if !workspace.env.is_empty() {
+            args.push(format!("env = {}", render_env(&workspace.env)));
+        }
+        let panes: Vec<String> = workspace.tabs.iter().map(render_tab).collect();
+        args.push(format!("panes = {}", list_block(&panes, 2)));
+        call("workspace", &args, 1)
+    }
+
+    fn render_tab(tab: &Tab) -> String {
+        let mut args = vec![quote(&tab.name)];
+        if let Some(label) = &tab.label {
+            args.push(format!("label = {}", quote(label)));
+        }
+        if tab.split != SplitDirection::Right {
+            args.push(format!("split = {}", split_constant(tab.split)));
+        }
+        if !tab.ratios.is_empty() {
+            let ratios: Vec<String> = tab.ratios.iter().map(|r| r.to_string()).collect();
+            args.push(format!("ratios = [{}]", ratios.join(", ")));
+        }
+        let panes: Vec<String> = tab.panes.iter().map(render_pane).collect();
+        args.push(format!("panes = {}", list_block(&panes, 3)));
+        call("herdr.tab", &args, 2)
+    }
+
+    fn render_pane(pane: &Pane) -> String {
+        let mut args = vec![quote(&pane.name)];
+        if let Some(label) = &pane.label {
+            args.push(format!("label = {}", quote(label)));
+        }
+        if let Some(cwd) = &pane.cwd {
+            args.push(format!("cwd = {}", quote(&cwd.display().to_string())));
+        }
+        if !pane.env.is_empty() {
+            args.push(format!("env = {}", render_env(&pane.env)));
+        }
+        if !pane.serve.is_empty() {
+            args.push(format!("serve = {}", render_serve(&pane.serve)));
+        }
+        if let Some(ready) = &pane.ready {
+            args.push(format!("ready = {}", render_ready(ready)));
+        }
+        if !pane.after.is_empty() {
+            args.push(format!("after = {}", render_argv(&pane.after)));
+        }
+        if let Some(agent) = &pane.agent {
+            args.push(format!("agent = {}", render_agent(agent)));
+        }
+        if let Some(on_start) = &pane.on_start {
+            args.push(format!("on_start = {}", render_argv(on_start)));
+        }
+        if let Some(on_stop) = &pane.on_stop {
+            args.push(format!("on_stop = {}", render_argv(on_stop)));
+        }
+        // `adopt = "caller"` becomes the `caller_pane` constructor (D31).
+        let constructor = if pane.adopt.as_deref() == Some("caller") {
+            "caller_pane"
+        } else {
+            "pane"
+        };
+        call(constructor, &args, 3)
+    }
+
+    fn render_task(task: &Task) -> String {
+        let mut args = vec![quote(&task.name)];
+        if !task.run.is_empty() {
+            args.push(format!("run = {}", render_argv(&task.run)));
+        }
+        if let Some(check) = &task.check {
+            args.push(format!("check = {}", render_argv(check)));
+        }
+        if !task.inputs.is_empty() {
+            let inputs: Vec<String> = task
+                .inputs
+                .iter()
+                .map(|p| quote(&p.display().to_string()))
+                .collect();
+            args.push(format!("inputs = [{}]", inputs.join(", ")));
+        }
+        if !task.after.is_empty() {
+            args.push(format!("after = {}", render_argv(&task.after)));
+        }
+        if !task.auto {
+            args.push("auto = False".to_owned());
+        }
+        if let Some(on_start) = &task.on_start {
+            args.push(format!("on_start = {}", render_argv(on_start)));
+        }
+        if let Some(on_stop) = &task.on_stop {
+            args.push(format!("on_stop = {}", render_argv(on_stop)));
+        }
+        call("task", &args, 1)
+    }
+
+    fn render_ready(ready: &Readiness) -> String {
+        match ready {
+            Readiness::Output { value } => format!("output({})", quote(value)),
+            Readiness::Port { value } => format!("port({value})"),
+            Readiness::Cmd { value } => format!("cmd({})", render_argv(value)),
+        }
+    }
+
+    fn render_agent(agent: &Agent) -> String {
+        let mut args = vec![quote(&agent.kind)];
+        if !agent.args.is_empty() {
+            args.push(format!("args = {}", render_argv(&agent.args)));
+        }
+        if let Some(prompt) = &agent.prompt {
+            args.push(format!("prompt = {}", quote(prompt)));
+        }
+        if let Some(name) = &agent.name {
+            args.push(format!("name = {}", quote(name)));
+        }
+        format!("agent({})", args.join(", "))
+    }
+
+    fn render_serve(serve: &[Vec<String>]) -> String {
+        match serve {
+            [single] => render_argv(single),
+            many => {
+                let candidates: Vec<String> = many.iter().map(|c| render_argv(c)).collect();
+                format!("any_of({})", candidates.join(", "))
+            }
+        }
+    }
+
+    fn render_argv(argv: &[String]) -> String {
+        let items: Vec<String> = argv.iter().map(|s| quote(s)).collect();
+        format!("[{}]", items.join(", "))
+    }
+
+    fn render_env(env: &std::collections::BTreeMap<String, String>) -> String {
+        let entries: Vec<String> = env
+            .iter()
+            .map(|(k, v)| format!("{}: {}", quote(k), quote(v)))
+            .collect();
+        format!("{{{}}}", entries.join(", "))
+    }
+
+    fn split_constant(split: SplitDirection) -> &'static str {
+        match split {
+            SplitDirection::Right => "herdr.RIGHT",
+            SplitDirection::Down => "herdr.DOWN",
+        }
+    }
+
+    /// Renders `name(arg, arg, ...)` with one argument per line, each indented
+    /// `level` steps in from the call itself.
+    fn call(name: &str, args: &[String], level: usize) -> String {
+        let inner = indent(level + 1);
+        let joined = args
+            .iter()
+            .map(|arg| format!("{inner}{arg}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("{name}(\n{joined},\n{})", indent(level))
+    }
+
+    /// Renders `[item, item, ...]` with one item per line at `level`.
+    fn list_block(items: &[String], level: usize) -> String {
+        if items.is_empty() {
+            return "[]".to_owned();
+        }
+        let inner = indent(level);
+        let joined = items
+            .iter()
+            .map(|item| format!("{inner}{item}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{joined},\n{}]", indent(level - 1))
+    }
+
+    fn indent(level: usize) -> String {
+        "    ".repeat(level)
+    }
+
+    fn quote(text: &str) -> String {
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pane_digests(config: &crate::model::DroveConfig, profile: &str) -> Vec<(String, String)> {
+        let ir = config.profile(profile).expect("profile").to_ir();
+        let mut panes: Vec<(String, String)> = ir
+            .resources
+            .iter()
+            .filter(|resource| resource.kind == "pane")
+            .map(|resource| (resource.name.clone(), resource.digest.clone()))
+            .collect();
+        panes.sort();
+        panes
+    }
+
+    #[test]
+    fn v3_form_round_trips_a_v2_drovefile_without_warnings() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+control = workspace("control", tabs = [
+    tab("coordinator", split = "down", ratios = [0.5], panes = [
+        pane("controller", adopt = "caller"),
+        pane("eventlog", serve = ["eventlog-view.sh", "-f"], ready = output("ready")),
+    ]),
+])
+profile("default", workspaces = [control])
+"#,
+        )
+        .expect("write v2 fixture");
+
+        let v2 = compile(&directory.path().join("Drovefile")).expect("compile v2");
+        assert!(!v2.warnings.is_empty(), "the fixture is a v2 form");
+        let v3_source = v3form::render(&v2.config);
+        // The rewrite uses only the v3 surface.
+        assert!(v3_source.contains("herdr.tab("));
+        assert!(v3_source.contains("caller_pane("));
+        assert!(v3_source.contains("split = herdr.DOWN"));
+        assert!(v3_source.contains("panes = ["));
+        assert!(!v3_source.contains("tabs = ["));
+        assert!(!v3_source.contains("adopt ="));
+
+        // The rewrite recompiles cleanly and yields identical pane content
+        // digests, so migrating proposes no restarts (D30).
+        std::fs::write(directory.path().join("Drovefile"), &v3_source).expect("write v3 form");
+        let v3 = compile(&directory.path().join("Drovefile")).expect("compile v3 form");
+        assert!(
+            v3.warnings.is_empty(),
+            "v3 form still warns: {:?}",
+            v3.warnings
+        );
+        assert_eq!(
+            pane_digests(&v2.config, "default"),
+            pane_digests(&v3.config, "default"),
+        );
+    }
 
     #[test]
     fn clap_defaults_to_up_workflow() {

@@ -1,6 +1,6 @@
 def reactor(name, agent, model, script, after = []):
     slug = name + "-reactor"
-    return herdr.tab("{}: {} reactor".format(model, name), panes = [
+    return tab("{}: {} reactor".format(model, name), panes = [
         pane(slug,
              serve = ["bash", ".context/bin/run-reactor.sh", script],
              ready = output("watching"),

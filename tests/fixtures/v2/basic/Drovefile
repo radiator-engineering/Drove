@@ -3,11 +3,11 @@ profile(
     workspaces = [
         workspace(
             name = "development",
-            panes = [
-                herdr.tab(
+            tabs = [
+                tab(
                     name = "main",
                     label = "editor + tests",
-                    split = herdr.RIGHT,
+                    split = "right",
                     ratios = [0.67],
                     panes = [
                         pane(name = "editor"),
