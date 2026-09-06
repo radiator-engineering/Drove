@@ -465,10 +465,7 @@ fn connect(path: &Path) -> std::io::Result<Stream> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufRead as _, BufReader, Write as _},
-        thread,
-    };
+    use std::thread;
 
     use interprocess::local_socket::{Listener, ListenerOptions, traits::Listener as _};
 
