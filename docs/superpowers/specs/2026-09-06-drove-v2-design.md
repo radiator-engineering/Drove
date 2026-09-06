@@ -214,3 +214,16 @@ by a separate review agent. Foundation first, then three in parallel.
 1. Radiator hub `pane.open` has no readiness or process-info surface today. Should PR 5 wait for hub changes, or ship with `ready` unsupported on that backend?
 2. Should `drove up` refuse to run outside a backend pane (no caller to adopt) when the profile declares an `adopt` pane, or create the controller pane instead and warn?
 3. Prompt text for agents: inline string, or `prompt_file=` only, so prompts are reviewable files? Current choice: both, inline capped at 2 KB.
+
+## 9. Amendments from the prior-art pass (2026-09-06)
+
+Source: `docs/superpowers/research/2026-09-06-neuroarxiv-drove-v2.md`.
+
+- **D21 Content-addressed resources.** Every IR resource carries `digest`, the SHA-256 of its canonical JSON with backend ids excluded and prompts, env, argv, cwd, readiness and children included. Ownership tokens become `drove_name`, `drove_profile`, `drove_digest`. Drift is a token comparison first; process inspection is a fallback for exited commands. This supersedes the process-info-first wording of D17. Digests never include the repository path.
+- **D22 Restart in place.** A changed digest on a `pane(serve=)` restarts the command in the existing pane. Only topology changes (split shape, tab membership) replace a pane, and those stay destructive and confirmed.
+- **D23 Readiness probes are host-side** except `output()`. Backends declare `readiness_output`; Radiator sets it false and the planner marks such probes `unsupported`.
+- **D24 No caller.** Outside a managed pane the `adopt="caller"` pane is created normally and the journal records `adopted = false`.
+- **D25 Prompts** are inline strings or `file("repo/relative/path")`, resolved at compile time into the IR.
+- **D26 Lint.** A later `drove lint` checks tasks without `check`, `after` cycles, and unreachable profiles. PR 6 adds a Drovefile corpus that runs against a real Herdr session.
+
+PR 1 gains: `digest()` on every IR resource with a test that key order and backend ids do not change it and any declared field does.

@@ -75,3 +75,11 @@ variadic and swallows a trailing positional prompt.
 `.context/events.jsonl` is `chflags uappnd` / `chattr +a` protected when
 `setup.sh --protect` was used, so a non-Claude agent cannot rewrite or delete
 it; `>>` appends still succeed.
+
+## 2026-09-06 Drove v2 pass
+- agent-topology = parallel-worktrees: each PR worker gets its own git worktree under ~/Development/Drove-worktrees and its own herdr workspace.
+- worker-commits = own-branch: a PR worker commits on its own branch in its own worktree and opens a PR; the commit reactor still owns commits on main.
+- design = docs/superpowers/specs/2026-09-06-drove-v2-design.md (D1–D20).
+- content-addressed-resources = D21: every IR resource has a digest; ownership tokens drove_name/drove_profile/drove_digest; drift is token comparison first.
+- restart-in-place = D22: changed digest restarts the command in the same pane; only topology changes replace.
+- readiness-host-side = D23; adopt-no-caller = D24; prompt-file = D25; lint-later = D26.
