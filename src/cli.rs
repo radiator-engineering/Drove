@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     backend::herdr::HerdrClient,
     dsl::{compile, find_drovefile},
-    planner::{Action, Plan, SyncStatus, build_plan},
+    planner::{Plan, Snapshot, SyncStatus, build_plan},
 };
 
 #[derive(Debug, Parser)]
@@ -106,7 +106,11 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::from(3));
     }
 
-    let plan = build_plan(profile)?;
+    // Backends cannot read ownership tokens back yet (PR 3), and executing
+    // reconciliation is out of scope here, so `drove up`/`plan`/`status`
+    // plan against an empty snapshot: everything reports as declared but
+    // absent until a later PR wires in local state and live discovery.
+    let plan = build_plan(profile, &Snapshot::default())?;
     match cli.command.unwrap_or(Command::Up {
         allow_replace: false,
         yes: false,
@@ -135,33 +139,8 @@ fn print_plan(plan: &Plan, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(plan)?);
         return Ok(());
     }
-    match plan.status {
-        SyncStatus::InSync => println!("in sync: profile `{}`", plan.profile),
-        SyncStatus::OutOfSync => {
-            println!(
-                "out of sync: profile `{}` ({} action{})",
-                plan.profile,
-                plan.actions.len(),
-                if plan.actions.len() == 1 { "" } else { "s" }
-            );
-            for action in &plan.actions {
-                print_action(action);
-            }
-        }
-    }
+    print!("{}", plan.render());
     Ok(())
-}
-
-fn print_action(action: &Action) {
-    let warning = if action.destructive {
-        " [replacement approval required]"
-    } else {
-        ""
-    };
-    println!(
-        "  {:?} {}{} — {}",
-        action.kind, action.address, warning, action.reason
-    );
 }
 
 #[cfg(test)]
