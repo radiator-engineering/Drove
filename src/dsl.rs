@@ -15,14 +15,14 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value as JsonValue;
 use starlark::{
     any::ProvidesStaticType,
-    environment::{FrozenModule, Globals, GlobalsBuilder, Module},
+    environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module},
     eval::{Evaluator, FileLoader},
     starlark_module,
     syntax::{AstModule, Dialect},
-    values::{FrozenHeapName, Value},
+    values::{FrozenHeapName, Value, none::NoneType},
 };
 
-use crate::model::{DroveConfig, Profile, canonical_digest};
+use crate::model::{BackendTargets, DroveConfig, Profile, canonical_digest};
 
 const PRELUDE: &str = r#"
 def _compact(values):
@@ -113,6 +113,23 @@ def profile(name, workspaces = [], tasks = [], extends = None, without = []):
         "extends": extends,
         "without": without,
     }))
+
+def backend(id):
+    return _set_backend(id)
+
+def _herdr_session(name):
+    return _set_herdr_session(name)
+
+herdr = struct(
+    session = _herdr_session,
+)
+
+def _radiator_hub(name):
+    return _set_radiator_hub(name)
+
+radiator = struct(
+    hub = _radiator_hub,
+)
 "#;
 
 #[derive(Debug)]
@@ -123,7 +140,15 @@ pub struct CompiledDrovefile {
 }
 
 #[derive(Debug, ProvidesStaticType, Default)]
-struct ProfileStore(RefCell<Vec<JsonValue>>);
+struct ProfileStore {
+    profiles: RefCell<Vec<JsonValue>>,
+    /// `backend(...)` (D32): which backend this project reconciles onto.
+    backend: RefCell<Option<String>>,
+    /// `herdr.session(...)` (D32).
+    herdr_session: RefCell<Option<String>>,
+    /// `radiator.hub(...)` (D32).
+    radiator_hub: RefCell<Option<String>>,
+}
 
 #[starlark_module]
 fn drove_globals(builder: &mut GlobalsBuilder) {
@@ -135,8 +160,41 @@ fn drove_globals(builder: &mut GlobalsBuilder) {
             .extra
             .and_then(|extra| extra.downcast_ref::<ProfileStore>())
             .context("Drove evaluator profile store is missing")?;
-        store.0.borrow_mut().push(value.to_json_value()?);
+        store.profiles.borrow_mut().push(value.to_json_value()?);
         Ok(value)
+    }
+
+    fn _set_backend<'v>(id: String, eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<NoneType> {
+        let store = eval
+            .extra
+            .and_then(|extra| extra.downcast_ref::<ProfileStore>())
+            .context("Drove evaluator profile store is missing")?;
+        *store.backend.borrow_mut() = Some(id);
+        Ok(NoneType)
+    }
+
+    fn _set_herdr_session<'v>(
+        name: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let store = eval
+            .extra
+            .and_then(|extra| extra.downcast_ref::<ProfileStore>())
+            .context("Drove evaluator profile store is missing")?;
+        *store.herdr_session.borrow_mut() = Some(name);
+        Ok(NoneType)
+    }
+
+    fn _set_radiator_hub<'v>(
+        name: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let store = eval
+            .extra
+            .and_then(|extra| extra.downcast_ref::<ProfileStore>())
+            .context("Drove evaluator profile store is missing")?;
+        *store.radiator_hub.borrow_mut() = Some(name);
+        Ok(NoneType)
     }
 }
 
@@ -170,7 +228,9 @@ pub fn compile(path: &Path) -> Result<CompiledDrovefile> {
         .context("Drovefile name must be UTF-8")?
         .to_owned();
 
-    let globals = GlobalsBuilder::standard().with(drove_globals).build();
+    let globals = GlobalsBuilder::extended_by(&[LibraryExtension::StructType])
+        .with(drove_globals)
+        .build();
     let store = ProfileStore::default();
     let mut loader = RepositoryLoader::default();
     let mut sources = BTreeMap::from([("<drove-prelude>".to_owned(), PRELUDE.to_owned())]);
@@ -185,14 +245,19 @@ pub fn compile(path: &Path) -> Result<CompiledDrovefile> {
         &mut stack,
     )?;
 
-    let raw_profiles = store.0.into_inner();
+    let backend = store.backend.into_inner();
+    let target = BackendTargets {
+        herdr_session: store.herdr_session.into_inner(),
+        radiator_hub: store.radiator_hub.into_inner(),
+    };
+    let raw_profiles = store.profiles.into_inner();
     if raw_profiles.is_empty() {
         bail!("Drovefile did not declare any profiles");
     }
     let profiles = resolve_profiles(raw_profiles, &repo_root)?;
 
     Ok(CompiledDrovefile {
-        config: DroveConfig::new(profiles)?,
+        config: DroveConfig::new(profiles, backend, target)?,
         repo_root,
         source_digest: canonical_digest(&sources)?,
     })
@@ -459,6 +524,29 @@ profile(
         assert!(
             error.to_string().contains("cannot load")
                 || error.to_string().contains("escapes repository")
+        );
+    }
+
+    #[test]
+    fn backend_and_radiator_hub_round_trip_into_the_compiled_config() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+backend("radiator")
+radiator.hub("main")
+herdr.session("drove")
+profile(name = "default")
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        assert_eq!(compiled.config.backend.as_deref(), Some("radiator"));
+        assert_eq!(compiled.config.target.radiator_hub.as_deref(), Some("main"));
+        assert_eq!(
+            compiled.config.target.herdr_session.as_deref(),
+            Some("drove")
         );
     }
 

@@ -19,10 +19,33 @@ pub const SCHEMA_VERSION: u32 = 2;
 pub struct DroveConfig {
     pub schema_version: u32,
     pub profiles: BTreeMap<String, Profile>,
+    /// Which backend this project reconciles onto (D32): `backend(...)` in
+    /// the Drovefile. `None` when undeclared; the CLI falls back to its own
+    /// resolution order (spec §5).
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// The named instance each flavor targets when its Drovefile declares
+    /// one (`herdr.session(...)`, `radiator.hub(...)`), D32.
+    #[serde(default)]
+    pub target: BackendTargets,
+}
+
+/// Per-flavor target instance declarations (D32). Only the active backend's
+/// declaration is used; a Drovefile may declare both.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BackendTargets {
+    #[serde(default)]
+    pub herdr_session: Option<String>,
+    #[serde(default)]
+    pub radiator_hub: Option<String>,
 }
 
 impl DroveConfig {
-    pub fn new(profiles: Vec<Profile>) -> Result<Self> {
+    pub fn new(
+        profiles: Vec<Profile>,
+        backend: Option<String>,
+        target: BackendTargets,
+    ) -> Result<Self> {
         let mut by_name = BTreeMap::new();
         for profile in profiles {
             validate_name("profile", &profile.name)?;
@@ -36,6 +59,8 @@ impl DroveConfig {
         let config = Self {
             schema_version: SCHEMA_VERSION,
             profiles: by_name,
+            backend,
+            target,
         };
         for profile in config.profiles.values() {
             profile.validate()?;
@@ -424,7 +449,8 @@ mod tests {
             "name": "Default",
             "workspaces": []
         }));
-        let error = DroveConfig::new(vec![profile]).expect_err("invalid name");
+        let error = DroveConfig::new(vec![profile], None, BackendTargets::default())
+            .expect_err("invalid name");
         assert!(error.to_string().contains("must match"));
     }
 
@@ -640,8 +666,12 @@ mod tests {
             workspaces: vec![],
             tasks: vec![],
         };
-        let error =
-            DroveConfig::new(vec![profile.clone(), profile]).expect_err("duplicate profile name");
+        let error = DroveConfig::new(
+            vec![profile.clone(), profile],
+            None,
+            BackendTargets::default(),
+        )
+        .expect_err("duplicate profile name");
         assert!(error.to_string().contains("duplicate profile name"));
     }
 
@@ -652,7 +682,8 @@ mod tests {
             workspaces: vec![],
             tasks: vec![],
         };
-        let error = DroveConfig::new(vec![profile]).expect_err("missing default profile");
+        let error = DroveConfig::new(vec![profile], None, BackendTargets::default())
+            .expect_err("missing default profile");
         assert!(
             error
                 .to_string()
