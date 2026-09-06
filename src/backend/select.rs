@@ -138,18 +138,17 @@ mod tests {
 
     #[test]
     fn open_reaches_radiator_when_selected() {
-        // `Backend::herdr()` (an accessor added by PR 11's seam) does not
-        // exist yet; assert on `capabilities()` instead per the brief.
-        // TODO(pr11): once `Backend::herdr()` lands, additionally assert
-        // `backend.herdr().is_none()` here.
+        // The Radiator backend has no Herdr flavor: its `herdr()` accessor
+        // (the core/flavor seam, D28) returns `None`.
         let backend = open(RADIATOR_BACKEND, &Target::default()).expect("open radiator");
-        assert!(!backend.capabilities().tabs);
+        assert!(backend.herdr().is_none());
     }
 
     #[test]
     fn open_reaches_herdr_when_selected() {
+        // The Herdr backend offers the Herdr flavor: `herdr()` returns `Some`.
         let backend = open(HERDR_BACKEND, &Target::default()).expect("open herdr");
-        assert!(backend.capabilities().tabs);
+        assert!(backend.herdr().is_some());
     }
 
     #[test]

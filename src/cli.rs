@@ -16,7 +16,7 @@ use crate::{
         run_named_task,
     },
     model::Profile,
-    planner::{ActionKind, Plan, SyncStatus, build_plan},
+    planner::{Action, CoreAction, Plan, SyncStatus, build_plan},
     state::LocalState,
 };
 
@@ -200,7 +200,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
             if plan
                 .actions
                 .iter()
-                .any(|action| action.kind == ActionKind::Conflict)
+                .any(|action| action.kind == Action::Core(CoreAction::Conflict))
             {
                 // Reconciling workspaces/tabs/panes/agents against the
                 // backend is out of scope here (PR 3/5); only the plan's
