@@ -1,0 +1,24 @@
+name: Publish crate
+
+# Publishes drove to crates.io when a release tag is pushed, alongside the
+# dist Release workflow that builds binaries, installers and the Homebrew
+# formula. Requires the CARGO_REGISTRY_TOKEN repository secret.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

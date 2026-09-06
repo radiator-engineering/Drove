@@ -8,16 +8,43 @@ Drove is intentionally on demand. It reads the live state and changes it only wh
 
 ## Install
 
-Requirements:
+`drove` ships prebuilt binaries for macOS (Intel and Apple silicon), Linux
+(x86_64 and arm64) and Windows (x86_64) with every release. You also need a
+supported backend; Herdr 0.8.2 or newer is the one available today.
 
-- Rust 1.88 or newer
-- A supported backend. Herdr 0.8.2 or newer is the one available today.
+Homebrew (macOS and Linux):
 
-From this checkout:
+```sh
+brew install radiator-engineering/tap/drove
+```
+
+Shell installer (macOS and Linux):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/radiator-engineering/Drove/releases/latest/download/drove-installer.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -c "irm https://github.com/radiator-engineering/Drove/releases/latest/download/drove-installer.ps1 | iex"
+```
+
+With Cargo (needs Rust 1.88 or newer):
+
+```sh
+cargo install drove     # compile from crates.io
+cargo binstall drove    # download a prebuilt binary, no compile
+```
+
+Or from a checkout of this repository:
 
 ```sh
 cargo install --path .
 ```
+
+Every [GitHub release](https://github.com/radiator-engineering/Drove/releases)
+also carries the raw binaries and their SHA256 checksums.
 
 ## Quick start
 
