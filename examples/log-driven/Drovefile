@@ -1,0 +1,39 @@
+load("drove/reactors.star", "reactor")
+
+scaffold = task(
+    "scaffold",
+    check = ["bash", ".context/bin/scaffold.sh", "--check"],
+    run = ["bash", ".context/bin/scaffold.sh"],
+    inputs = [".context/bin/scaffold.sh"],
+)
+protect_log = task(
+    "protect-log",
+    check = ["protect-log.sh", "--status"],
+    run = ["protect-log.sh"],
+    auto = False,
+)
+
+control = workspace("control", tabs = [
+    tab("coordinator", split = "down", ratios = [0.5], panes = [
+        pane("controller", adopt = "caller"),
+        pane("eventlog", serve = ["eventlog-view.sh", "-f"]),
+    ]),
+    tab("monitor: system + agents", panes = [
+        pane("agentmon", serve = any_of(["agentmon", "--since", "launch"], ["htop"])),
+    ]),
+])
+
+maintenance = workspace("maintenance", tabs = [
+    tab("lazygit", panes = [pane("gitlog", serve = any_of(["lazygit"], ["bash"]))]),
+    reactor("commit", agent = "cursor-committer", model = "composer-2.5-fast",
+            script = "cursor-commit-reactor.sh"),
+    reactor("doc-sync", agent = "doc-worker", model = "sonnet",
+            script = "doc-sync-reactor.sh", after = ["commit-reactor"]),
+])
+
+files = workspace("files", tabs = [
+    tab("files", panes = [pane("spiceedit", serve = any_of(["spiceedit"], ["bash"]))]),
+])
+
+profile("default", workspaces = [control, maintenance, files], tasks = [scaffold, protect_log])
+profile("core", extends = "default", without = ["files"])

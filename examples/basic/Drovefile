@@ -1,27 +1,20 @@
-profiles = [
-    profile(
-        name = "default",
-        workspaces = [
-            workspace(
-                id = "development",
-                label = "development",
-                cwd = ".",
-                tabs = [
-                    tab(
-                        id = "main",
-                        label = "editor + tests",
-                        layout = split(
-                            direction = "right",
-                            ratio = 0.67,
-                            first = pane(id = "editor", label = "editor"),
-                            second = pane(
-                                id = "tests",
-                                label = "tests",
-                            ),
-                        ),
-                    ),
-                ],
-            ),
-        ],
-    ),
-]
+profile(
+    name = "default",
+    workspaces = [
+        workspace(
+            name = "development",
+            tabs = [
+                tab(
+                    name = "main",
+                    label = "editor + tests",
+                    split = "right",
+                    ratios = [0.67],
+                    panes = [
+                        pane(name = "editor"),
+                        pane(name = "tests"),
+                    ],
+                ),
+            ],
+        ),
+    ],
+)
