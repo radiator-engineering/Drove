@@ -208,10 +208,12 @@ mod tests {
         // descendant would otherwise run for.
         let directory = tempfile::tempdir().expect("tempdir");
         let pid_file = directory.path().join("descendant-pid");
-        let script = format!(
-            "sleep 30 & echo $! > {}; wait",
-            pid_file.to_str().expect("utf8 path")
-        );
+        // MSYS `sh` treats `\` as an escape character, so a raw Windows
+        // temp path (`C:\Users\...`) fed into the script unquoted mangles
+        // the redirect target. Forward slashes and single quotes are both
+        // safe for MSYS `sh` on a Windows path (`C:/Users/...`).
+        let pid_file_for_script = pid_file.to_str().expect("utf8 path").replace('\\', "/");
+        let script = format!("sleep 30 & echo $! > '{pid_file_for_script}'; wait");
         let ready = probe_cmd(
             &["sh".into(), "-c".into(), script],
             Duration::from_millis(300),
