@@ -50,7 +50,10 @@ pub struct EnvInputs {
 
 /// Resolves the backend id and its target instance per D32's four-level
 /// order (CLI > environment > Drovefile > built-in), purely from
-/// already-gathered inputs.
+/// already-gathered inputs. `--session` (the Herdr alias of `--target`)
+/// names a Herdr session, so it is ignored once Radiator is selected —
+/// `--target`, `RADIATOR_HUB`, `radiator.hub(...)` and the `main` built-in
+/// still apply in that case.
 pub fn resolve(
     cli: CliInputs<'_>,
     env: &EnvInputs,
@@ -69,13 +72,12 @@ pub fn resolve(
             }
         });
 
-    let cli_target = cli.target.or(cli.session);
     let name = match backend.as_str() {
-        RADIATOR_BACKEND => non_empty(cli_target)
+        RADIATOR_BACKEND => non_empty(cli.target)
             .or_else(|| non_empty(env.radiator_hub.as_deref()))
             .or_else(|| non_empty(file_target.radiator_hub.as_deref()))
             .map(str::to_owned),
-        _ => non_empty(cli_target)
+        _ => non_empty(cli.target.or(cli.session))
             .or_else(|| non_empty(env.herdr_session.as_deref()))
             .or_else(|| non_empty(file_target.herdr_session.as_deref()))
             .map(str::to_owned),
@@ -276,6 +278,38 @@ mod tests {
             &BackendTargets::default(),
         );
         assert_eq!(target.name, None);
+    }
+
+    #[test]
+    fn session_flag_is_ignored_for_the_radiator_backend() {
+        // `--session` is a Herdr alias of `--target` (spec §5); it must not
+        // leak into the Radiator hub name. `RADIATOR_HUB`/`radiator.hub()`/
+        // the `main` built-in still apply, and `--target` still works.
+        let file = targets(None, Some("file-hub"));
+        let cli = CliInputs {
+            backend: Some("radiator"),
+            session: Some("some-herdr-session"),
+            ..Default::default()
+        };
+        let (backend, target) = resolve(cli, &EnvInputs::default(), None, &file);
+        assert_eq!(backend, "radiator");
+        assert_eq!(target.name.as_deref(), Some("file-hub"));
+
+        let env = EnvInputs {
+            radiator_hub: Some("env-hub".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(cli, &env, None, &BackendTargets::default());
+        assert_eq!(target.name.as_deref(), Some("env-hub"));
+
+        let cli_with_target = CliInputs {
+            backend: Some("radiator"),
+            session: Some("some-herdr-session"),
+            target: Some("cli-hub"),
+            ..Default::default()
+        };
+        let (_, target) = resolve(cli_with_target, &env, None, &BackendTargets::default());
+        assert_eq!(target.name.as_deref(), Some("cli-hub"));
     }
 
     #[test]
