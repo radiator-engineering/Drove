@@ -1,0 +1,27 @@
+docs/drovefile.md
+  s_bcf75685da3a06::t_0b2d3eb078efcf 128
+src/cli.rs
+  s_bcf75685da3a06::t_6026b454f333ab 201
+  s_bcf75685da3a06::t_96684b35944bac 132
+  s_bcf75685da3a06::t_baf07833c07099 253,264-280,285,288,295-307,315-321
+  s_bcf75685da3a06::t_ad5c628ec7a4fc 241
+  s_bcf75685da3a06::t_52b6aaf44dafeb 322-323
+src/executor.rs
+  s_bcf75685da3a06::t_6a2e032b7668f0 88-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "cdfd3e25bb9963d8c42e4348513631ef04de9608",
+  "prompts": {},
+  "sessions": {
+    "s_bcf75685da3a06": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fa07664-e042-437e-b5a1-6c8bc7a36a82",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
