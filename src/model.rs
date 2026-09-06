@@ -1,16 +1,19 @@
-//! Canonical desired-state model produced by a `Drovefile`.
+//! Canonical desired-state model (schema version 2) produced by a `Drovefile`.
+//!
+//! Five resource kinds — workspace, tab, pane, agent, task — share one
+//! profile-scoped namespace for `after`, `on_*` and adoption references.
+//! See `docs/superpowers/specs/2026-09-06-drove-v2-design.md` §3-4.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path, PathBuf},
+    path::PathBuf,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DroveConfig {
@@ -22,7 +25,7 @@ impl DroveConfig {
     pub fn new(profiles: Vec<Profile>) -> Result<Self> {
         let mut by_name = BTreeMap::new();
         for profile in profiles {
-            validate_id("profile", &profile.name)?;
+            validate_name("profile", &profile.name)?;
             if by_name.insert(profile.name.clone(), profile).is_some() {
                 bail!("duplicate profile name");
             }
@@ -47,308 +50,318 @@ impl DroveConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub name: String,
     #[serde(default)]
-    pub workspaces: Vec<WorkspaceSpec>,
+    pub workspaces: Vec<Workspace>,
     #[serde(default)]
-    pub agents: Vec<AgentSpec>,
-    #[serde(default)]
-    pub bootstrap: Vec<BootstrapTask>,
+    pub tasks: Vec<Task>,
 }
 
 impl Profile {
     pub fn validate(&self) -> Result<()> {
-        let mut workspace_ids = BTreeSet::new();
-        let mut pane_ids = BTreeSet::new();
+        let mut workspace_names = BTreeSet::new();
+        let mut pane_names = BTreeSet::new();
+        let mut adopt_count = 0usize;
 
         for workspace in &self.workspaces {
-            validate_id("workspace", &workspace.id)?;
-            validate_relative_path("workspace cwd", &workspace.cwd)?;
-            if !workspace_ids.insert(workspace.id.as_str()) {
-                bail!("duplicate workspace id `{}`", workspace.id);
+            validate_name("workspace", &workspace.name)?;
+            if !workspace_names.insert(workspace.name.as_str()) {
+                bail!("duplicate workspace name `{}`", workspace.name);
             }
 
-            let mut tab_ids = BTreeSet::new();
+            let mut tab_names = BTreeSet::new();
             for tab in &workspace.tabs {
-                validate_id("tab", &tab.id)?;
-                if !tab_ids.insert(tab.id.as_str()) {
+                // Tabs are a Herdr placement hint, not part of the shared
+                // `after`/adoption namespace (spec §3-4), so their name is
+                // a free-form label rather than the strict identifier used
+                // for workspace/pane/agent/task names.
+                if tab.name.is_empty() || tab.name.len() > 64 {
+                    bail!("tab name `{}` must be 1-64 characters", tab.name);
+                }
+                if !tab_names.insert(tab.name.as_str()) {
                     bail!(
-                        "duplicate tab id `{}` in workspace `{}`",
-                        tab.id,
-                        workspace.id
+                        "duplicate tab name `{}` in workspace `{}`",
+                        tab.name,
+                        workspace.name
                     );
                 }
-                tab.layout.validate(&mut pane_ids)?;
+                tab.validate()?;
+                for pane in &tab.panes {
+                    validate_name("pane", &pane.name)?;
+                    if !pane_names.insert(pane.name.as_str()) {
+                        bail!("duplicate pane name `{}` in profile", pane.name);
+                    }
+                    if let Some(agent) = &pane.agent {
+                        agent.validate()?;
+                    }
+                    if let Some(adopt) = &pane.adopt {
+                        if adopt != "caller" {
+                            bail!(
+                                "pane `{}` declares adopt = `{adopt}`; only `caller` is supported",
+                                pane.name
+                            );
+                        }
+                        adopt_count += 1;
+                    }
+                }
             }
         }
+        if adopt_count > 1 {
+            bail!("only one pane per profile may declare `adopt = \"caller\"`");
+        }
 
-        let mut agent_ids = BTreeSet::new();
-        for agent in &self.agents {
-            validate_id("agent", &agent.id)?;
-            if !agent_ids.insert(agent.id.as_str()) {
-                bail!("duplicate agent id `{}`", agent.id);
+        let mut task_names = BTreeSet::new();
+        for task in &self.tasks {
+            validate_name("task", &task.name)?;
+            if !task_names.insert(task.name.as_str()) {
+                bail!("duplicate task name `{}` in profile", task.name);
             }
-            if !pane_ids.contains(agent.pane.as_str()) {
+            if pane_names.contains(task.name.as_str()) {
                 bail!(
-                    "agent `{}` references unknown pane `{}`",
-                    agent.id,
-                    agent.pane
+                    "task `{}` collides with a pane of the same name in the shared `after` namespace",
+                    task.name
                 );
             }
+            if task.run.is_empty() {
+                bail!("task `{}` requires a non-empty `run` argv", task.name);
+            }
         }
 
-        validate_bootstrap(&self.bootstrap)
+        self.validate_after(&pane_names, &task_names)
+    }
+
+    fn validate_after(
+        &self,
+        pane_names: &BTreeSet<&str>,
+        task_names: &BTreeSet<&str>,
+    ) -> Result<()> {
+        let mut edges: BTreeMap<&str, &[String]> = BTreeMap::new();
+        for workspace in &self.workspaces {
+            for tab in &workspace.tabs {
+                for pane in &tab.panes {
+                    edges.insert(pane.name.as_str(), pane.after.as_slice());
+                }
+            }
+        }
+        for task in &self.tasks {
+            edges.insert(task.name.as_str(), task.after.as_slice());
+        }
+
+        let known = || pane_names.iter().copied().chain(task_names.iter().copied());
+        for (id, targets) in &edges {
+            for target in *targets {
+                if !known().any(|name| name == target) {
+                    bail!("`{id}` declares `after = [\"{target}\"]` for an unknown resource");
+                }
+            }
+        }
+
+        fn visit<'a>(
+            id: &'a str,
+            edges: &BTreeMap<&'a str, &'a [String]>,
+            visiting: &mut BTreeSet<&'a str>,
+            visited: &mut BTreeSet<&'a str>,
+        ) -> Result<()> {
+            if visited.contains(id) {
+                return Ok(());
+            }
+            if !visiting.insert(id) {
+                bail!("`after` dependency cycle includes `{id}`");
+            }
+            if let Some(targets) = edges.get(id) {
+                for target in *targets {
+                    visit(target, edges, visiting, visited)?;
+                }
+            }
+            visiting.remove(id);
+            visited.insert(id);
+            Ok(())
+        }
+
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        for id in edges.keys().copied() {
+            visit(id, &edges, &mut visiting, &mut visited)?;
+        }
+        Ok(())
     }
 
     pub fn digest(&self) -> Result<String> {
         canonical_digest(self)
     }
+
+    pub fn to_ir(&self) -> crate::ir::Ir {
+        crate::ir::to_ir(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspaceSpec {
-    pub id: String,
-    pub label: String,
+pub struct Workspace {
+    pub name: String,
+    #[serde(default)]
+    pub label: Option<String>,
     #[serde(default = "default_cwd")]
     pub cwd: PathBuf,
     #[serde(default)]
-    pub tabs: Vec<TabSpec>,
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tabs: Vec<Tab>,
+}
+
+impl Workspace {
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct TabSpec {
-    pub id: String,
-    pub label: String,
-    pub layout: LayoutNode,
+pub struct Tab {
+    pub name: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub split: SplitDirection,
+    #[serde(default)]
+    pub ratios: Vec<f64>,
+    #[serde(default)]
+    pub panes: Vec<Pane>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LayoutNode {
-    Pane {
-        id: String,
-        #[serde(default)]
-        label: Option<String>,
-        #[serde(default)]
-        cwd: Option<PathBuf>,
-        #[serde(default)]
-        command: Vec<String>,
-        #[serde(default)]
-        env: BTreeMap<String, String>,
-    },
-    Split {
-        direction: SplitDirection,
-        ratio: f64,
-        first: Box<LayoutNode>,
-        second: Box<LayoutNode>,
-    },
-}
+impl Tab {
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
 
-impl LayoutNode {
-    fn validate<'a>(&'a self, pane_ids: &mut BTreeSet<&'a str>) -> Result<()> {
-        match self {
-            Self::Pane {
-                id, cwd, command, ..
-            } => {
-                validate_id("pane", id)?;
-                if !pane_ids.insert(id) {
-                    bail!("duplicate pane id `{id}` in profile");
-                }
-                if let Some(cwd) = cwd {
-                    validate_relative_path("pane cwd", cwd)?;
-                }
-                if command.first().is_some_and(String::is_empty) {
-                    bail!("pane `{id}` command executable cannot be empty");
-                }
-            }
-            Self::Split {
-                ratio,
-                first,
-                second,
-                ..
-            } => {
-                if !(0.05..=0.95).contains(ratio) {
-                    bail!("split ratio must be between 0.05 and 0.95");
-                }
-                first.validate(pane_ids)?;
-                second.validate(pane_ids)?;
+    fn validate(&self) -> Result<()> {
+        let expected = self.panes.len().saturating_sub(1);
+        if self.ratios.len() != expected {
+            bail!(
+                "tab `{}` declares {} ratio(s) for {} pane(s); expected {expected}",
+                self.name,
+                self.ratios.len(),
+                self.panes.len()
+            );
+        }
+        for ratio in &self.ratios {
+            if !(0.05..=0.95).contains(ratio) {
+                bail!(
+                    "tab `{}` ratio {ratio} must be between 0.05 and 0.95",
+                    self.name
+                );
             }
         }
         Ok(())
     }
-
-    pub fn to_herdr_json(&self, repo_root: &Path, workspace_cwd: &Path) -> Value {
-        match self {
-            Self::Pane {
-                label,
-                cwd,
-                command,
-                env,
-                ..
-            } => {
-                let cwd = normalize_path(
-                    &repo_root
-                        .join(workspace_cwd)
-                        .join(cwd.as_deref().unwrap_or_else(|| Path::new("."))),
-                );
-                let mut pane = json!({
-                    "type": "pane",
-                    "cwd": cwd,
-                });
-                if let Some(label) = label {
-                    pane["label"] = json!(label);
-                }
-                if !command.is_empty() {
-                    pane["command"] = json!(command);
-                }
-                if !env.is_empty() {
-                    pane["env"] = json!(env);
-                }
-                pane
-            }
-            Self::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => json!({
-                "type": "split",
-                "direction": direction,
-                "ratio": ratio,
-                "first": first.to_herdr_json(repo_root, workspace_cwd),
-                "second": second.to_herdr_json(repo_root, workspace_cwd),
-            }),
-        }
-    }
-
-    pub fn pane_ids(&self, result: &mut Vec<String>) {
-        match self {
-            Self::Pane { id, .. } => result.push(id.clone()),
-            Self::Split { first, second, .. } => {
-                first.pane_ids(result);
-                second.pane_ids(result);
-            }
-        }
-    }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
+    #[default]
     Right,
     Down,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct AgentSpec {
-    pub id: String,
-    pub pane: String,
-    pub kind: String,
+pub struct Pane {
+    pub name: String,
     #[serde(default)]
-    pub name: Option<String>,
+    pub label: Option<String>,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// `any_of` candidates, tried in order; a plain `serve = [...]` argv is
+    /// normalized to a single-candidate list at compile time.
+    #[serde(default)]
+    pub serve: Vec<Vec<String>>,
+    #[serde(default)]
+    pub ready: Option<Readiness>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub adopt: Option<String>,
+    #[serde(default)]
+    pub agent: Option<Agent>,
+    #[serde(default)]
+    pub on_start: Option<Vec<String>>,
+    #[serde(default)]
+    pub on_stop: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl Pane {
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Readiness {
+    Output { value: String },
+    Port { value: u16 },
+    Cmd { value: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct BootstrapTask {
-    pub id: String,
-    pub check: Vec<String>,
+pub struct Agent {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Resolved at compile time: either the literal inline string, or the
+    /// contents of a `file("repo/relative/path")` reference (D25).
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+const PROMPT_MAX_BYTES: usize = 2 * 1024;
+
+impl Agent {
+    fn validate(&self) -> Result<()> {
+        if self.kind.is_empty() {
+            bail!("agent declares an empty `kind`");
+        }
+        if let Some(name) = &self.name {
+            validate_name("agent", name)?;
+        }
+        if let Some(prompt) = &self.prompt
+            && prompt.len() > PROMPT_MAX_BYTES
+        {
+            bail!(
+                "agent `{}` prompt exceeds {PROMPT_MAX_BYTES} bytes",
+                self.kind
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Task {
+    pub name: String,
     pub run: Vec<String>,
+    #[serde(default)]
+    pub check: Option<Vec<String>>,
     #[serde(default)]
     pub inputs: Vec<PathBuf>,
     #[serde(default)]
-    pub depends_on: Vec<String>,
-}
-
-impl BootstrapTask {
-    pub fn digest(&self, repo_root: &Path, source_digest: &str) -> Result<String> {
-        let mut hasher = Sha256::new();
-        hasher.update(SCHEMA_VERSION.to_le_bytes());
-        hasher.update(repo_root.to_string_lossy().as_bytes());
-        hasher.update(source_digest.as_bytes());
-        hasher.update(serde_json::to_vec(self)?);
-        for input in &self.inputs {
-            validate_relative_path("bootstrap input", input)?;
-            let path = repo_root.join(input);
-            let canonical = path
-                .canonicalize()
-                .with_context(|| format!("failed to resolve bootstrap input {}", path.display()))?;
-            if !canonical.starts_with(repo_root) {
-                bail!(
-                    "bootstrap input `{}` escapes the repository",
-                    input.display()
-                );
-            }
-            hasher.update(input.to_string_lossy().as_bytes());
-            hasher.update(std::fs::read(&canonical).with_context(|| {
-                format!("failed to read bootstrap input {}", canonical.display())
-            })?);
-        }
-        Ok(hex::encode(hasher.finalize()))
-    }
-}
-
-fn validate_bootstrap(tasks: &[BootstrapTask]) -> Result<()> {
-    let by_id: BTreeMap<&str, &BootstrapTask> =
-        tasks.iter().map(|task| (task.id.as_str(), task)).collect();
-    if by_id.len() != tasks.len() {
-        bail!("duplicate bootstrap task id");
-    }
-    for task in tasks {
-        validate_id("bootstrap task", &task.id)?;
-        if task.check.is_empty() || task.run.is_empty() {
-            bail!(
-                "bootstrap task `{}` requires non-empty check and run argv",
-                task.id
-            );
-        }
-        for dependency in &task.depends_on {
-            if !by_id.contains_key(dependency.as_str()) {
-                bail!(
-                    "bootstrap task `{}` depends on unknown task `{dependency}`",
-                    task.id
-                );
-            }
-        }
-        for input in &task.inputs {
-            validate_relative_path("bootstrap input", input)?;
-        }
-    }
-
-    fn visit<'a>(
-        id: &'a str,
-        tasks: &BTreeMap<&'a str, &'a BootstrapTask>,
-        visiting: &mut BTreeSet<&'a str>,
-        visited: &mut BTreeSet<&'a str>,
-    ) -> Result<()> {
-        if visited.contains(id) {
-            return Ok(());
-        }
-        if !visiting.insert(id) {
-            bail!("bootstrap dependency cycle includes `{id}`");
-        }
-        for dependency in &tasks[id].depends_on {
-            visit(dependency, tasks, visiting, visited)?;
-        }
-        visiting.remove(id);
-        visited.insert(id);
-        Ok(())
-    }
-
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for id in by_id.keys().copied() {
-        visit(id, &by_id, &mut visiting, &mut visited)?;
-    }
-    Ok(())
+    pub after: Vec<String>,
+    #[serde(default = "default_true")]
+    pub auto: bool,
+    #[serde(default)]
+    pub on_start: Option<Vec<String>>,
+    #[serde(default)]
+    pub on_stop: Option<Vec<String>>,
 }
 
 pub fn canonical_digest<T: Serialize>(value: &T) -> Result<String> {
@@ -356,28 +369,15 @@ pub fn canonical_digest<T: Serialize>(value: &T) -> Result<String> {
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-fn validate_id(kind: &str, id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 64
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        bail!("{kind} id `{id}` must match [A-Za-z0-9_-]{{1,64}}");
-    }
-    Ok(())
-}
-
-fn validate_relative_path(kind: &str, path: &Path) -> Result<()> {
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        bail!(
-            "{kind} `{}` must stay inside the repository",
-            path.display()
-        );
+fn validate_name(kind: &str, name: &str) -> Result<()> {
+    let mut bytes = name.bytes();
+    let starts_ok = bytes.next().is_some_and(|byte| byte.is_ascii_lowercase());
+    let rest_ok = name.len() <= 32
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    if !starts_ok || !rest_ok {
+        bail!("{kind} name `{name}` must match [a-z][a-z0-9_-]{{0,31}}");
     }
     Ok(())
 }
@@ -386,32 +386,194 @@ fn default_cwd() -> PathBuf {
     PathBuf::from(".")
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    path.components()
-        .filter(|component| !matches!(component, Component::CurDir))
-        .collect()
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    fn profile_from(value: serde_json::Value) -> Profile {
+        serde_json::from_value(value).expect("profile fixture")
+    }
+
+    #[test]
+    fn rejects_invalid_names() {
+        // Name syntax is checked by `DroveConfig::new`, which validates the
+        // profile name itself before delegating into `Profile::validate`.
+        let profile = profile_from(json!({
+            "name": "Default",
+            "workspaces": []
+        }));
+        let error = DroveConfig::new(vec![profile]).expect_err("invalid name");
+        assert!(error.to_string().contains("must match"));
+    }
 
     #[test]
     fn rejects_duplicate_panes_across_profile() {
-        let profile: Profile = serde_json::from_value(json!({
+        let profile = profile_from(json!({
             "name": "default",
             "workspaces": [{
-                "id": "dev",
-                "label": "dev",
+                "name": "dev",
                 "tabs": [
-                    {"id": "one", "label": "one", "layout": {"type": "pane", "id": "same"}},
-                    {"id": "two", "label": "two", "layout": {"type": "pane", "id": "same"}}
+                    {"name": "one", "panes": [{"name": "same"}]},
+                    {"name": "two", "panes": [{"name": "same"}]}
                 ]
             }]
-        }))
-        .expect("profile fixture");
+        }));
         let error = profile.validate().expect_err("duplicate should fail");
-        assert!(error.to_string().contains("duplicate pane id"));
+        assert!(error.to_string().contains("duplicate pane name"));
+    }
+
+    #[test]
+    fn rejects_duplicate_workspace_names() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [
+                {"name": "dev", "tabs": []},
+                {"name": "dev", "tabs": []}
+            ]
+        }));
+        let error = profile.validate().expect_err("duplicate workspace");
+        assert!(error.to_string().contains("duplicate workspace name"));
+    }
+
+    #[test]
+    fn rejects_second_adopt_in_profile() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "ratios": [0.5],
+                    "panes": [{"name": "one", "adopt": "caller"}, {"name": "two"}]
+                }, {
+                    "name": "second",
+                    "panes": [{"name": "three", "adopt": "caller"}]
+                }]
+            }]
+        }));
+        let error = profile.validate().expect_err("second adopt should fail");
+        assert!(error.to_string().contains("only one pane per profile"));
+    }
+
+    #[test]
+    fn rejects_unsupported_adopt_value() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "one", "adopt": "someone-else"}]}]
+            }]
+        }));
+        let error = profile.validate().expect_err("bad adopt value");
+        assert!(error.to_string().contains("only `caller` is supported"));
+    }
+
+    #[test]
+    fn rejects_wrong_ratio_count() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "ratios": [0.5, 0.5],
+                    "panes": [{"name": "one"}, {"name": "two"}]
+                }]
+            }]
+        }));
+        let error = profile.validate().expect_err("wrong ratio count");
+        assert!(error.to_string().contains("expected 1"));
+    }
+
+    #[test]
+    fn rejects_ratio_out_of_range() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "ratios": [0.99],
+                    "panes": [{"name": "one"}, {"name": "two"}]
+                }]
+            }]
+        }));
+        let error = profile.validate().expect_err("out of range ratio");
+        assert!(error.to_string().contains("between 0.05 and 0.95"));
+    }
+
+    #[test]
+    fn rejects_after_targeting_unknown_resource() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "one", "after": ["missing"]}]}]
+            }]
+        }));
+        let error = profile.validate().expect_err("unknown after target");
+        assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn rejects_after_cycle() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [
+                {"name": "a", "run": ["true"], "after": ["b"]},
+                {"name": "b", "run": ["true"], "after": ["a"]}
+            ]
+        }));
+        let error = profile.validate().expect_err("cycle");
+        assert!(error.to_string().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn accepts_valid_after_dag_across_panes_and_tasks() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "one", "after": ["scaffold"]}]}]
+            }],
+            "tasks": [{"name": "scaffold", "run": ["true"]}]
+        }));
+        profile.validate().expect("valid DAG");
+    }
+
+    #[test]
+    fn rejects_task_missing_run() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [{"name": "empty", "run": []}]
+        }));
+        let error = profile.validate().expect_err("empty run");
+        assert!(error.to_string().contains("non-empty `run`"));
+    }
+
+    #[test]
+    fn rejects_oversized_inline_prompt() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "panes": [{
+                        "name": "review",
+                        "agent": {"kind": "claude", "prompt": "x".repeat(3000)}
+                    }]
+                }]
+            }]
+        }));
+        let error = profile.validate().expect_err("oversized prompt");
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]
@@ -422,23 +584,5 @@ mod tests {
             canonical_digest(&one).expect("digest"),
             canonical_digest(&two).expect("digest")
         );
-    }
-
-    #[test]
-    fn bootstrap_digest_tracks_input_bytes() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = directory.path().canonicalize().expect("canonical root");
-        std::fs::write(root.join("setup.sh"), "one").expect("write input");
-        let task = BootstrapTask {
-            id: "setup".into(),
-            check: vec!["tool".into(), "check".into()],
-            run: vec!["tool".into(), "apply".into()],
-            inputs: vec![PathBuf::from("setup.sh")],
-            depends_on: vec![],
-        };
-        let first = task.digest(&root, "source").expect("digest");
-        std::fs::write(root.join("setup.sh"), "two").expect("change input");
-        let second = task.digest(&root, "source").expect("digest");
-        assert_ne!(first, second);
     }
 }
