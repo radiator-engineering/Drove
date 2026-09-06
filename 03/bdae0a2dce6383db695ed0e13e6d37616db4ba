@@ -1,0 +1,42 @@
+scripts/smoke-herdr.sh
+  s_930a7d7fbae4d7::t_802f70df2b04c6 36-41
+src/lib.rs
+  s_930a7d7fbae4d7::t_68fbb1a60239f9 10
+tests/herdr_smoke_live.rs
+  s_930a7d7fbae4d7::t_582c3ad032205f 1-16,21-57,59-115,117
+  s_930a7d7fbae4d7::t_c7db389ed22fc1 17-20,58,116
+src/backend/mod.rs
+  s_930a7d7fbae4d7::t_481850433493cd 90-93
+  s_930a7d7fbae4d7::t_9eb3d1c9f2742f 31-33
+src/backend/herdr.rs
+  s_930a7d7fbae4d7::t_1f7485d3b93cc0 393,487,769-994,996-999
+  s_930a7d7fbae4d7::t_0c9795beabb170 85-91
+  s_930a7d7fbae4d7::t_dafa5c7aede00f 400,404,407,409,414
+  s_930a7d7fbae4d7::t_f29436b3161cd7 612-615
+  s_930a7d7fbae4d7::t_c2dda431cbdb61 302,995
+  s_930a7d7fbae4d7::t_97443fad40d96e 565-570
+  s_930a7d7fbae4d7::t_f0168430d5509c 546-547
+  s_930a7d7fbae4d7::t_2d18b68432e772 184-195,210-301,303-392
+  s_930a7d7fbae4d7::t_a8d3ac89d5766f 519-522
+  s_930a7d7fbae4d7::t_2b0d0769aa0e08 436-440,442,445-446,449-450,461-462,469-470,473-474,484-486
+src/readiness.rs
+  s_930a7d7fbae4d7::t_7f1dcf42573d51 1-110,113-128,134-149,152-160
+  s_930a7d7fbae4d7::t_b03f75cac930e3 129-133
+  s_930a7d7fbae4d7::t_c2dda431cbdb61 111-112,150-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "03bdae0a2dce6383db695ed0e13e6d37616db4ba",
+  "prompts": {},
+  "sessions": {
+    "s_930a7d7fbae4d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5dc7ab27-cb51-4e9a-a77c-bc5ce14c09f1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
