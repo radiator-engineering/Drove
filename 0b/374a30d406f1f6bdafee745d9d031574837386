@@ -1,0 +1,22 @@
+.context/bin/controller-stop-hook.sh
+  s_f3085e9decf778::t_28e65638f8f2dd 28-43
+  s_f3085e9decf778::t_86c726fc5e4da7 55-60
+.context/bin/doc-sync-reactor.sh
+  s_f3085e9decf778::t_b1758d80cded35 64-70,72-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0b374a30d406f1f6bdafee745d9d031574837386",
+  "prompts": {},
+  "sessions": {
+    "s_f3085e9decf778": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "084616e2-2764-4ca6-8f18-e0d3cf2c70f2",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
