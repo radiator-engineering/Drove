@@ -129,6 +129,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
             &repo_root,
             *purge,
             *yes,
+            cli.json,
         );
     }
 
@@ -197,7 +198,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
                 runner: &HostCommandRunner,
             };
             let results = execute_plan_tasks(profile, &plan, &ctx, &mut state, yes)?;
-            report_task_outcomes(&results)
+            report_task_outcomes(&results, cli.json)
         }
     }
 }
@@ -237,7 +238,7 @@ fn run_command(
                 runner: &HostCommandRunner,
             };
             let results = run_named_task(profile, name, &ctx, &mut state, yes)?;
-            report_task_outcomes(&results)
+            report_task_outcomes(&results, json)
         }
     }
 }
@@ -249,6 +250,7 @@ fn down_command(
     repo_root: &Path,
     purge: bool,
     yes: bool,
+    json: bool,
 ) -> Result<ExitCode> {
     let mut state = LocalState::load(repo_root)?;
     let client = HerdrClient::discover(socket, session);
@@ -259,24 +261,48 @@ fn down_command(
     };
     let backend: Option<&dyn Backend> = if purge { Some(&client) } else { None };
     let report = down(profile, &ctx, &mut state, yes, purge, backend)?;
-    for id in &report.detached {
-        println!("detached {id}");
-    }
-    if report.detached.is_empty() {
-        println!("nothing owned by profile `{}`", profile.name);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "detached": report.detached,
+                "hooks_run": report.hooks_run.iter().map(|(name, success)| {
+                    serde_json::json!({"resource": name, "success": success})
+                }).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        for id in &report.detached {
+            println!("detached {id}");
+        }
+        if report.detached.is_empty() {
+            println!("nothing owned by profile `{}`", profile.name);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn report_task_outcomes(results: &[(String, TaskOutcome)]) -> Result<ExitCode> {
+fn report_task_outcomes(results: &[(String, TaskOutcome)], json: bool) -> Result<ExitCode> {
     let mut blocked = false;
     let mut failed = false;
-    for (name, outcome) in results {
-        println!("{}", describe_outcome(name, *outcome));
+    for (_, outcome) in results {
         match outcome {
             TaskOutcome::Blocked => blocked = true,
             TaskOutcome::Ran(false) => failed = true,
             _ => {}
+        }
+    }
+    if json {
+        let rows: Vec<_> = results
+            .iter()
+            .map(|(name, outcome)| {
+                serde_json::json!({"task": name, "outcome": outcome_label(*outcome)})
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        for (name, outcome) in results {
+            println!("{}", describe_outcome(name, *outcome));
         }
     }
     Ok(if blocked || failed {
@@ -284,6 +310,15 @@ fn report_task_outcomes(results: &[(String, TaskOutcome)]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn outcome_label(outcome: TaskOutcome) -> &'static str {
+    match outcome {
+        TaskOutcome::Skipped => "skipped",
+        TaskOutcome::Ran(true) => "ran",
+        TaskOutcome::Ran(false) => "failed",
+        TaskOutcome::Blocked => "blocked",
+    }
 }
 
 fn describe_outcome(name: &str, outcome: TaskOutcome) -> String {

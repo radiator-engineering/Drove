@@ -85,11 +85,18 @@ pub fn run_task(
     state: &mut LocalState,
     approve: bool,
 ) -> Result<TaskOutcome> {
-    if let Some(check) = &task.check
-        && ctx.runner.run(check, ctx.repo_root, &BTreeMap::new())?
-    {
-        record_task_resource(state, ctx, &task.name, resource_digest, "skipped", true)?;
-        return Ok(TaskOutcome::Skipped);
+    if let Some(check) = &task.check {
+        // A check that cannot even start (missing executable, permission
+        // denied) answers "not satisfied" rather than aborting `run_task`
+        // outright: the task should still get a chance to run.
+        let satisfied = ctx
+            .runner
+            .run(check, ctx.repo_root, &BTreeMap::new())
+            .unwrap_or(false);
+        if satisfied {
+            record_task_resource(state, ctx, &task.name, resource_digest, "skipped", true)?;
+            return Ok(TaskOutcome::Skipped);
+        }
     }
 
     let approval_digest = canonical_digest(&task.run)?;
