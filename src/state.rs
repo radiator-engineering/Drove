@@ -81,12 +81,13 @@ impl LocalState {
             action: action.to_owned(),
             digest: digest.to_owned(),
             completed: false,
+            success: None,
         });
         self.trim_journal();
         self.save()
     }
 
-    pub fn finish_action(&mut self, digest: &str) -> Result<()> {
+    pub fn finish_action(&mut self, digest: &str, success: bool) -> Result<()> {
         if let Some(entry) = self
             .journal
             .iter_mut()
@@ -94,6 +95,7 @@ impl LocalState {
             .find(|entry| entry.digest == digest && !entry.completed)
         {
             entry.completed = true;
+            entry.success = Some(success);
         }
         self.save()
     }
@@ -155,6 +157,11 @@ pub struct ManagedResource {
     /// Set only for a pane declaring `adopt = "caller"` (D24).
     #[serde(default)]
     pub adopted: Option<bool>,
+    /// The outcome of the most recent task run (`"ok"`, `"failed"`,
+    /// `"skipped"`), reported by `drove run` with no task name. Unused for
+    /// non-task resources.
+    #[serde(default)]
+    pub last_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +169,8 @@ pub struct JournalEntry {
     pub action: String,
     pub digest: String,
     pub completed: bool,
+    #[serde(default)]
+    pub success: Option<bool>,
 }
 
 fn state_path(repo_root: &Path) -> PathBuf {
