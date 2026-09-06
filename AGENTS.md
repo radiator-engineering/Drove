@@ -36,3 +36,7 @@ A Stop hook enforces the controller's first command in the controller's pane onl
 - Event vocabulary: `.context/EVENTLOG.md`. Decisions so far: `.context/DECISIONS.md`.
 - Worker briefs: `.context/handoffs/`. Reactor settings: `.context/workspace.env`.
 <!-- log-driven-workspace:end -->
+
+## Pull requests
+
+Every PR is driven to completion by its worker and reviewer, not by the controller. The contract, including the definition of done and the polling loop for review comments, is `.context/PR-WORKFLOW.md`. Workers and reviewers read it before opening or reviewing a PR.
