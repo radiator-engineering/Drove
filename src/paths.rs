@@ -6,18 +6,32 @@
 //! `drove`. [`normalize_for_digest`] renders a path the same way on every
 //! OS: it treats both `/` and `\` as separators (Windows-authored paths
 //! checked out on Unix would otherwise parse as one opaque component,
-//! since Unix does not treat `\` as a separator), then re-renders each
-//! component joined with `/`.
+//! since Unix does not treat `\` as a separator), then re-joins the
+//! segments with a single explicit `/`.
+//!
+//! This renders segments directly from the separator-normalized string
+//! rather than through `Path::components()`: `Component::RootDir`'s own
+//! `OsStr` is the separator character itself, so mapping every component
+//! through `as_os_str()` and joining with `/` doubles it for an absolute
+//! path (`/repo/sub` became `//repo/sub`, `C:\repo\sub` became
+//! `C://repo/sub`) — host-dependent digest content, exactly what this
+//! module exists to prevent.
 
 use std::path::Path;
 
 pub fn normalize_for_digest(path: &Path) -> String {
     let forward = path.to_string_lossy().replace('\\', "/");
-    Path::new(&forward)
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+    let is_absolute = forward.starts_with('/');
+    let rendered = forward
+        .split('/')
+        .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+    if is_absolute {
+        format!("/{rendered}")
+    } else {
+        rendered
+    }
 }
 
 #[cfg(test)]
@@ -41,6 +55,18 @@ mod tests {
     #[test]
     fn current_dir_renders_unchanged() {
         assert_eq!(normalize_for_digest(Path::new(".")), ".");
+    }
+
+    /// Exact-output regression for the double-separator bug: an absolute
+    /// path must render with exactly one leading `/`, not two, and the
+    /// literal expected string is the same on every OS this runs on.
+    #[test]
+    fn absolute_paths_render_with_a_single_leading_slash() {
+        assert_eq!(normalize_for_digest(Path::new("/repo/sub")), "/repo/sub");
+        assert_eq!(
+            normalize_for_digest(Path::new("C:\\repo\\sub")),
+            "C:/repo/sub"
+        );
     }
 
     /// D30: content digests must stay stable across this change.
