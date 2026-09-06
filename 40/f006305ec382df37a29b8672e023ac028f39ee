@@ -1,0 +1,55 @@
+tests/fixtures/v2/basic/Drovefile
+  s_68dcc0e64aefe6::t_660de8c1d98324 1-20
+examples/basic/Drovefile
+  s_68dcc0e64aefe6::t_5cf1c4e473c2ba 6-7,10
+src/dsl.rs
+  s_68dcc0e64aefe6::t_c93bdb8d029418 27-30,42-53,77,85,92-121,125,127-147,150-158,164,174,185-186,197-199
+  s_68dcc0e64aefe6::t_932b91b15fff3e 215-218
+  s_68dcc0e64aefe6::t_d065e60430ab03 591-612,618-625,631-648,671-681,689-697,699-709,715-716,718-721,727-729,735-765,770-786,791-794,802-821,829-837,840-849,855-856
+  s_68dcc0e64aefe6::t_c03bea8a617ed5 649-659,665-670
+  s_68dcc0e64aefe6::t_9d4b835571a4e9 698,838-839
+  s_68dcc0e64aefe6::t_27e85c75f59e90 613-617,626-630,682-688,710-714,717,722-726,730-734,766-769,787-790,795-801,822-828,850-854
+  s_68dcc0e64aefe6::t_ce451dd621fafb 9
+  s_68dcc0e64aefe6::t_556c0f3148d24e 660-664
+  s_68dcc0e64aefe6::t_4766d8c82770fb 230-231
+  s_68dcc0e64aefe6::t_966dc210b86ddc 343,354,358-366
+  s_68dcc0e64aefe6::t_605a1a27bbe019 280-288
+  s_68dcc0e64aefe6::t_d6f0d1319ff1bb 367-368
+examples/log-driven/drove/reactors.star
+  s_68dcc0e64aefe6::t_407e5c950cb4ac 3
+tests/examples.rs
+  s_68dcc0e64aefe6::t_89b97c1cb4c7fe 1,14-32
+  s_68dcc0e64aefe6::t_759abe330bbe5b 33,170-213
+  s_68dcc0e64aefe6::t_9c6b840f631962 34
+src/cli.rs
+  s_68dcc0e64aefe6::t_d481295aafd12c 125-131
+  s_68dcc0e64aefe6::t_27e85c75f59e90 468-471,703-707
+  s_68dcc0e64aefe6::t_7172555f7a4330 404-467,472-627,629-654
+  s_68dcc0e64aefe6::t_1e8aa1e59480ed 81-82
+  s_68dcc0e64aefe6::t_7e616671d3b788 628
+  s_68dcc0e64aefe6::t_ea05cc8f347620 659-702,708-713
+  s_68dcc0e64aefe6::t_948b24e6b5e28f 200
+tests/fixtures/v2/log-driven/Drovefile
+  s_68dcc0e64aefe6::t_660de8c1d98324 1-39
+tests/fixtures/v2/log-driven/drove/reactors.star
+  s_68dcc0e64aefe6::t_660de8c1d98324 1-11
+examples/log-driven/Drovefile
+  s_68dcc0e64aefe6::t_9e9eda21470298 38
+  s_68dcc0e64aefe6::t_fb5311001baeed 16-18,21,26-27,34-35,39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "40f006305ec382df37a29b8672e023ac028f39ee",
+  "prompts": {},
+  "sessions": {
+    "s_68dcc0e64aefe6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82b71a08-0e27-4aae-9679-4f752b52761f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
