@@ -1,0 +1,19 @@
+src/backend/herdr.rs
+  s_6150149524e485::t_ad50915ae84c7e 468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0829d256321201000452124249d7fa37835298dd",
+  "prompts": {},
+  "sessions": {
+    "s_6150149524e485": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58a7c6d9-702a-4180-a246-0ce76c641bc9",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
