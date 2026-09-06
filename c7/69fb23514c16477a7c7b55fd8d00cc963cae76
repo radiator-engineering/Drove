@@ -1,0 +1,19 @@
+Cargo.toml
+  s_5213c0d852466f::t_c3d07400bdf662 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c769fb23514c16477a7c7b55fd8d00cc963cae76",
+  "prompts": {},
+  "sessions": {
+    "s_5213c0d852466f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "97ba7d22-31ef-4bde-ad62-eca25a35ad1a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
