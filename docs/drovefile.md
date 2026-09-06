@@ -56,7 +56,9 @@ control = workspace("control", panes = [
 ])
 ```
 
-`workspace(name, panes = [...])` is the core signature; `label`, `cwd`, `env`, and `was` (below) are also core. The `panes` list accepts bare `pane(...)` values and **groups**. A group is a flavor value that carries its own panes plus a placement; the compiler flattens each group into the core pane list and writes the placement onto every pane it contains. A bare pane in the list — one not wrapped in a group — carries no placement.
+`workspace(name, panes = [...])` is the core signature; `label`, `cwd`, `env`, and `was` (below) are also core. The `panes` list accepts bare `pane(...)` values and **groups**. A group is a flavor value that carries its own panes plus a placement; the compiler flattens each group into the core pane list and writes the placement onto every pane it contains. A bare pane in the list — one not wrapped in a group — is meant to carry no placement.
+
+**Known limitation (D38).** The compiler currently wraps a bare pane in an implicit single-pane Herdr group instead, so it always carries `Placement::Herdr { tab: <pane name> }` — even under `backend("radiator")`. `drove render` shows the Herdr placement, and reconciliation on Radiator reports the resulting action as `unsupported`. No example or test uses a bare pane today, so declare panes only inside `herdr.tab(...)` groups until this is fixed.
 
 `herdr.tab(name, panes, split = herdr.RIGHT, ratios = [])` is the first group. `herdr.RIGHT` and `herdr.DOWN` are the split constants. A tab lists its panes and a split direction; there is no binary split tree on the surface. A backend without tabs and splits flattens the layout and reports `unsupported` rather than dropping it silently.
 

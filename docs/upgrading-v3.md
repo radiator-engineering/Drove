@@ -22,9 +22,9 @@ A pane's content digest — `serve`, `cwd`, `env`, `agent`, `ready`, `on_start`,
 ## How to migrate
 
 1. Run `drove render` against your current Drovefile. If it uses any v2 form, the warnings list each one and the output ends with a `v3 form:` block: your file, rewritten.
-2. Copy that block over your Drovefile, or apply the rewrites from the table above by hand.
+2. Copy that block over your Drovefile, or apply the rewrites from the table above by hand. **The printed `v3 form:` block currently drops any `was = "..."` declaration** (`v3form::render_workspace`/`render_pane` in `src/cli.rs` don't emit it): if your Drovefile uses `was` on a pane or workspace, re-add that field by hand after copying the block over, or apply the rewrites from the table by hand instead of copying the block wholesale.
 3. Run `drove render` again. A clean v3 file compiles with no warnings.
-4. Run `drove plan`. It should propose no changes beyond what you'd expect from the upgrade being purely syntactic.
+4. Run `drove plan`. It should propose no changes beyond what you'd expect from the upgrade being purely syntactic — a plan with `Detach` where you expected `RenamePane`/`RenameWorkspace` means a `was` field was lost in step 2.
 5. Run `drove lint` to catch a stale `was = "..."` or a task with no `check` while you're already touching the file.
 
 See `docs/drovefile.md` for the full v3 reference and `docs/spec.md` for why the core/flavor split exists.

@@ -18,7 +18,7 @@ Terminal layouts are currently assembled through imperative scripts that create 
 - A repository can contain a human-readable, committable `Drovefile`.
 - A user can establish the repository's default workspace by running one command from that repository.
 - A repository can define a default profile and additional named profiles.
-- Running the command compares the selected profile with the current Herdr state before making changes.
+- Running the command compares the selected profile with the current state of the selected backend before making changes.
 - Running the command reconciles the selected profile and then exits.
 - Running the command repeatedly against an already-matching workspace makes no changes.
 - Drove reports whether a profile is `in sync`, `out of sync`, or `not running` without requiring reconciliation.
@@ -60,7 +60,7 @@ Terminal layouts are currently assembled through imperative scripts that create 
 
 ### Core and Flavors
 
-- **Decision:** Drove has a core every backend fully honors — workspace, pane, task, profile — plus per-backend flavors for terminology only that backend understands. Herdr's flavor holds `tab`, split placement, and ratios; a Drovefile using only the core reconciles on any backend with no `unsupported` outcomes.
+- **Decision:** Drove has a core resource model — workspace, pane, task, profile — plus per-backend flavors for terminology only that backend understands. Herdr's flavor holds `tab`, split placement, and ratios. Not every core field is honored equally on every backend: a small set of graded capabilities (workspace `cwd`/`env` among them) can be partially supported, and a backend that can't honor one must report the affected action as `unsupported` rather than silently drop the field. Today Radiator drops workspace `cwd` and `env` without reporting `unsupported` (tracked as a follow-up); pane-level `cwd`/`env` are unaffected.
 - **Alternatives considered:** Making Herdr's tabs and splits part of the core resource model; one union trait covering every backend's verbs.
 - **Rationale:** Tabs and splits are Herdr's own display concept, not something every backend has. Treating them as core forced other backends to fake or silently drop them. Placement, not the resource itself, is the flavor concern.
 
