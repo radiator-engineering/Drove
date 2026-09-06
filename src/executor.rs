@@ -88,7 +88,7 @@ pub fn run_task(
     if let Some(check) = &task.check
         && ctx.runner.run(check, ctx.repo_root, &BTreeMap::new())?
     {
-        record_task_resource(state, ctx, &task.name, resource_digest, "skipped")?;
+        record_task_resource(state, ctx, &task.name, resource_digest, "skipped", true)?;
         return Ok(TaskOutcome::Skipped);
     }
 
@@ -105,6 +105,11 @@ pub fn run_task(
     state.finish_action(&approval_digest, success)?;
 
     if let Some(hook) = &task.on_start {
+        // The hook's own outcome is intentionally not folded into this
+        // task's `TaskOutcome`: it already gets its own approval gate and
+        // journal entry (same as `down`'s hooks), but a wrapped task ran
+        // (or didn't) independently of whether its post-run notification
+        // succeeded.
         run_hook(
             hook,
             &task.name,
@@ -116,12 +121,16 @@ pub fn run_task(
         )?;
     }
 
+    // D18: only a successful `run` converges the task. Recording the
+    // declared digest on failure would make the very next `build_plan` see
+    // this task as in sync, so a failing `run` would never be retried.
     record_task_resource(
         state,
         ctx,
         &task.name,
         resource_digest,
         if success { "ok" } else { "failed" },
+        success,
     )?;
     Ok(TaskOutcome::Ran(success))
 }
@@ -165,21 +174,36 @@ pub fn run_hook(
     Ok(TaskOutcome::Ran(success))
 }
 
+/// Records the task's last outcome unconditionally, but only records
+/// `digest` as its *observed* digest when `converged` is true. On a failed
+/// `run`, `converged` is false, so the previously recorded digest (or none,
+/// if this is the task's first run) is kept: the task stays out of sync and
+/// `build_plan` proposes it again on the next `drove up`/`plan`/`status`.
 fn record_task_resource(
     state: &mut LocalState,
     ctx: &ExecutionContext<'_>,
     name: &str,
     digest: &str,
     outcome: &str,
+    converged: bool,
 ) -> Result<()> {
     let profile = state.profile_mut(ctx.profile);
+    let observed_digest = if converged {
+        digest.to_owned()
+    } else {
+        profile
+            .resources
+            .get(name)
+            .map(|resource| resource.digest.clone())
+            .unwrap_or_default()
+    };
     profile.resources.insert(
         name.to_owned(),
         ManagedResource {
             kind: "task".into(),
             backend_id: String::new(),
             parent: None,
-            digest: digest.to_owned(),
+            digest: observed_digest,
             adopted: None,
             last_outcome: Some(outcome.to_owned()),
         },
@@ -325,6 +349,12 @@ pub fn down(
             } else {
                 Some(resource.backend_id.as_str())
             };
+            // A blocked (unapproved) or failed `on_stop` does not stop the
+            // teardown below: `down`'s job is to stop tracking a resource,
+            // not to hold it hostage to hook approval. A hook that must run
+            // before teardown (e.g. one that kills a background process)
+            // needs its digest pre-approved, the same way a task's `run`
+            // does.
             let outcome = run_hook(hook, &id, backend_id, HookEvent::Stop, ctx, state, approve)?;
             if let TaskOutcome::Ran(success) = outcome {
                 report.hooks_run.push((id.clone(), success));
@@ -632,6 +662,44 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![vec!["check".to_owned()], vec!["run".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn a_failed_run_is_not_recorded_as_converged() {
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [{"name": "scaffold", "run": ["run"]}]
+        }));
+        let digest = digest_of(&profile.to_ir(), "task", "scaffold")
+            .expect("scaffold resource")
+            .to_owned();
+        let runner = FakeRunner::default().fail(&["run"]);
+        let root = PathBuf::from("/repo");
+        let outcome = run_task(
+            &profile.tasks[0],
+            &digest,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+        )
+        .expect("run_task");
+        assert_eq!(outcome, TaskOutcome::Ran(false));
+
+        // D18: a failed `run` must not look converged to the next
+        // `build_plan` — recording `scaffold`'s real IR digest as observed
+        // here would be a false convergence.
+        let snapshot = state
+            .profile("default")
+            .expect("profile recorded")
+            .to_snapshot("default", None);
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.address == "scaffold"),
+            "a failed task must still be proposed to run again: {plan:?}"
         );
     }
 
