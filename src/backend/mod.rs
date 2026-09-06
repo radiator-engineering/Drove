@@ -29,6 +29,9 @@ pub struct Capabilities {
     pub metadata_tokens: bool,
     pub process_info: bool,
     pub events: bool,
+    /// Whether `Backend::output` can read pane text for an `output()`
+    /// readiness probe (D23). Radiator sets this false.
+    pub readiness_output: bool,
 }
 
 /// Backend-observed information about a running pane's process, used for
@@ -85,4 +88,8 @@ pub trait Backend {
     fn process_info(&self, pane_id: &str) -> Result<Option<ProcessInfo>>;
 
     fn report_tokens(&self, address: &str, tokens: &BTreeMap<String, String>) -> Result<()>;
+
+    /// Recent pane text, host-side input to an `output()` readiness probe
+    /// (D23). Only meaningful when `capabilities().readiness_output`.
+    fn output(&self, pane_id: &str) -> Result<String>;
 }
