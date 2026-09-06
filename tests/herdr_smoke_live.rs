@@ -1,7 +1,10 @@
-//! Live-Herdr smoke test for PR 3's incremental convergence surface. Skips
-//! itself when no Herdr socket is reachable so `cargo test` stays green
-//! without a running server; `scripts/smoke-herdr.sh` sets
-//! `HERDR_SOCKET_PATH` at an ephemeral session before running it.
+//! Live-Herdr smoke test for PR 3's incremental convergence surface. This
+//! test creates and closes real workspaces, so it must never touch an
+//! ambient Herdr session someone happens to have open: it only runs when
+//! `HERDR_SOCKET_PATH` or `HERDR_SESSION` is set explicitly, and otherwise
+//! skips itself so a plain `cargo test` stays both green and side-effect
+//! free. `scripts/smoke-herdr.sh` sets `HERDR_SOCKET_PATH` to an ephemeral,
+//! isolated `--session` it starts and tears down itself.
 
 use std::{collections::BTreeMap, env, path::Path};
 
@@ -9,6 +12,11 @@ use drove::backend::{Backend, herdr::HerdrClient};
 use serde_json::json;
 
 fn client() -> Option<HerdrClient> {
+    let has_explicit_target =
+        env::var_os("HERDR_SOCKET_PATH").is_some() || env::var_os("HERDR_SESSION").is_some();
+    if !has_explicit_target {
+        return None;
+    }
     let client = HerdrClient::discover(None, None);
     client.ping().ok().map(|_| client)
 }
