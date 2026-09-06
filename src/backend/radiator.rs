@@ -1,30 +1,37 @@
 //! Typed client for the Radiator hub's NDJSON socket protocol, and the
 //! `Backend` impl that degrades where the hub falls short of what the model
-//! wants (spec §3, D3, D23; `.context/handoffs/recon-radiator-report.md` and
-//! `recon-radiator-gaps-report.md`).
+//! wants (spec §3, D3, D23, D35; `.context/handoffs/recon-radiator-report.md`
+//! and `recon-radiator-gaps-report.md`).
 //!
 //! Radiator's hub is workspace → flat panes with no tab or split layer
 //! (`crates/proto/src/types.rs` in `radiator-cli`), no `agent.start`, and no
-//! metadata storage today. This module flattens tabs into one hub pane list
-//! per workspace, runs agents as a `serve` command plus a follow-up
-//! `pane.send_text`, and keeps Drove's ownership tokens in a local journal
-//! keyed by hub pane id whenever the hub can't store them itself — degrading
-//! to `Ownership::Unknown` if the journal and the hub ever disagree (spec
-//! §9, D16).
+//! metadata storage on every hub build. This module flattens tabs into one
+//! hub pane list per workspace, runs agents as a `serve` command plus a
+//! follow-up `pane.send_text`, and keeps Drove's ownership tokens in a local
+//! journal keyed by hub pane id whenever the hub can't store them itself —
+//! degrading to `Ownership::Unknown` if the journal and the hub ever
+//! disagree (spec §9, D16).
 //!
-//! The hub additions the gaps report proposes (`pane.set_metadata`,
-//! `PaneInfo.process`, `pane.tail`, `workspace.rename`, `hub.capabilities`)
-//! are a parallel hub PR, not landed yet. Every call against them goes
-//! through `RadiatorClient::request_optional`, which turns the hub's
-//! `unknown_method` error into `Ok(None)` instead of a failure, so this
-//! backend runs unchanged against a hub with or without them.
+//! Hub commit `80c0f1d` (`radiator-cli`) landed `pane.set_metadata`,
+//! `PaneInfo.metadata`, `PaneInfo.process`, `pane.tail`, `workspace.rename`
+//! and `hub.capabilities`. `hub.capabilities` is queried once per client
+//! (`RadiatorClient::hub_capabilities`, cached) and gates whether metadata
+//! tokens and process info are trusted from the hub at all: a hub that
+//! reports metadata support is authoritative for tokens and the local
+//! journal is never consulted; a hub that doesn't is served from the
+//! journal alone (D35). An older hub that lacks `hub.capabilities` itself
+//! answers `unknown_method`, which is treated the same as a hub that
+//! answers with every capability `false`.
 
 use std::{
     collections::BTreeMap,
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -46,10 +53,25 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// The hub name Radiator itself defaults to (`radiator-cli`'s `--hub-name`).
 pub const DEFAULT_HUB_NAME: &str = "main";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RadiatorClient {
     socket_path: PathBuf,
     journal_root: PathBuf,
+    /// `hub.capabilities`, queried once and cached for the life of this
+    /// client (D35) — the hub's answer is static per build, so there is no
+    /// reason to ask again on every `snapshot()`/`report_tokens` call.
+    capabilities: Mutex<Option<HubCapabilities>>,
+}
+
+/// The subset of `hub.capabilities`'s reply this backend gates behavior on.
+/// Unrecognized/missing fields default to `false`, so an older hub that
+/// predates one of these flags (or the whole method) never fails to parse.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct HubCapabilities {
+    #[serde(default)]
+    metadata: bool,
+    #[serde(default)]
+    process: bool,
 }
 
 /// What a `report_tokens`/journal lookup found for one backend resource id.
@@ -67,6 +89,7 @@ impl RadiatorClient {
         Self {
             socket_path,
             journal_root: journal_root(),
+            capabilities: Mutex::new(None),
         }
     }
 
@@ -78,7 +101,35 @@ impl RadiatorClient {
         Self {
             socket_path,
             journal_root,
+            capabilities: Mutex::new(None),
         }
+    }
+
+    /// `hub.capabilities`, queried once and cached (D35). An older hub with
+    /// no `hub.capabilities` at all answers `unknown_method`, folded into
+    /// the same all-`false` default as a hub that explicitly reports no
+    /// optional features (or one whose reply doesn't parse) — either way
+    /// that is a stable fact about this hub build, worth caching. A
+    /// transport failure is not: it is reported as an all-`false` default
+    /// for this call only, without being written to the cache, so a
+    /// transient blip doesn't permanently strand this client on the
+    /// journal-only path once the hub is reachable again. The lock is held
+    /// across the whole check-request-fill sequence so concurrent callers
+    /// on a cache miss share one `hub.capabilities` round trip rather than
+    /// each firing their own.
+    fn hub_capabilities(&self) -> HubCapabilities {
+        let mut cache = self.capabilities.lock().expect("capabilities cache lock");
+        if let Some(cached) = *cache {
+            return cached;
+        }
+        let queried = match self.request_optional("hub.capabilities", json!({})) {
+            Ok(reply) => reply
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
+            Err(_) => return HubCapabilities::default(),
+        };
+        *cache = Some(queried);
+        queried
     }
 
     pub fn discover(explicit_socket: Option<&Path>, hub_name: Option<&str>) -> Self {
@@ -176,10 +227,9 @@ impl RadiatorClient {
         self.request("hub.ping", json!({}))
     }
 
-    /// The hub's raw `hub.snapshot` value, kept as `Value` because the gaps
-    /// report's proposed `PaneInfo.metadata`/`PaneInfo.process` fields may or
-    /// may not be present depending on whether the parallel hub PR has
-    /// landed; callers that want those look them up with
+    /// The hub's raw `hub.snapshot` value, kept as `Value` because
+    /// `PaneInfo.metadata`/`PaneInfo.process` (D35) are still absent from an
+    /// older hub's payload; callers that want those look them up with
     /// [`find_pane_field`] rather than a fixed struct.
     fn raw_snapshot(&self) -> Result<Value> {
         self.request("hub.snapshot", json!({}))
@@ -251,46 +301,55 @@ impl RadiatorClient {
         Ok(())
     }
 
-    /// `workspace.rename` is a proposed hub addition (gaps report item 4).
-    /// Returns whether the hub actually applied it, so a caller can warn
-    /// instead of failing when it hasn't landed yet.
-    pub fn rename_workspace(&self, id: &str, name: &str) -> Result<bool> {
-        let outcome = self.request_optional("workspace.rename", json!({"id": id, "name": name}))?;
-        Ok(outcome.is_some())
+    /// Renames a workspace via `workspace.rename` (D35). Fails outright when
+    /// the hub refuses — including an older hub that doesn't have the
+    /// method at all — rather than warning and leaving the hub's name in
+    /// place, since a caller that asked for a rename needs to know it
+    /// didn't happen.
+    pub fn rename_workspace(&self, id: &str, name: &str) -> Result<()> {
+        self.request("workspace.rename", json!({"id": id, "name": name}))?;
+        Ok(())
     }
 
-    /// `pane.set_metadata` is a proposed hub addition (gaps report item 1).
-    /// On a hub that has it, tokens are written through to the hub, and any
-    /// journal entry left over from before the hub supported metadata (an
-    /// older hub, or one caught mid rolling-upgrade) is cleared — the hub is
-    /// now authoritative for `id`, so a stale journal entry must not linger
-    /// to be read back as a conflict. On a hub that still lacks it, tokens
-    /// land in the local journal instead.
+    /// Writes `id`'s ownership tokens through to the hub via
+    /// `pane.set_metadata` when it reports metadata support, clearing any
+    /// journal entry left over from before the hub could store metadata (an
+    /// older hub, or one caught mid rolling-upgrade) — the hub is now
+    /// authoritative for `id`, so a stale journal entry must not linger to
+    /// be read back as a conflict. On a hub that reports no metadata
+    /// support, tokens land in the local journal instead and the hub is
+    /// never called (D35).
     pub fn report_tokens(&self, id: &str, tokens: &BTreeMap<String, String>) -> Result<()> {
-        let outcome =
-            self.request_optional("pane.set_metadata", json!({"id": id, "set": tokens}))?;
-        if outcome.is_none() {
-            self.journal_merge(id, tokens)?;
-        } else {
+        if self.hub_capabilities().metadata {
+            self.request("pane.set_metadata", json!({"id": id, "set": tokens}))?;
             self.journal_clear(id)?;
+        } else {
+            self.journal_merge(id, tokens)?;
         }
         Ok(())
     }
 
     /// Resolve what this backend believes `id`'s ownership tokens are. The
-    /// hub is authoritative whenever it reports anything at all — the
-    /// journal only fills in for a hub that can't store metadata yet, and
-    /// once a hub gains `pane.set_metadata` its answer must supersede
-    /// whatever the journal was tracking beforehand, not merely agree with
-    /// it (a stale journal entry from before the hub could report metadata
-    /// is not the same as a live disagreement, spec §9, brief item 3).
-    /// `Unknown` is reserved for a hub that reports nothing and a journal
-    /// that has nothing either.
+    /// hub is authoritative whenever it reports metadata support at all —
+    /// the journal only fills in for a hub that can't store metadata, and
+    /// once a hub gains that support its answer must supersede whatever the
+    /// journal was tracking beforehand, not merely agree with it (a stale
+    /// journal entry from before the hub could report metadata is not the
+    /// same as a live disagreement, spec §9, D35). `Unknown` is reserved for
+    /// a metadata-capable hub with nothing recorded for `id`, and for a
+    /// non-capable hub whose journal has nothing either.
     pub fn resolve_ownership(&self, id: &str) -> Result<Ownership> {
-        let hub_tokens = self.hub_reported_metadata(id)?;
-        if let Some(hub) = hub_tokens {
+        if self.hub_capabilities().metadata {
+            // Read the hub's answer before clearing the journal: if
+            // `hub.snapshot` fails, `?` returns early and the (possibly
+            // still-needed) journal entry is left in place rather than
+            // deleted ahead of a read that never completed.
+            let hub_tokens = self.hub_reported_metadata(id)?;
             self.journal_clear(id)?;
-            return Ok(Ownership::Known(hub));
+            return Ok(match hub_tokens {
+                Some(hub) => Ownership::Known(hub),
+                None => Ownership::Unknown,
+            });
         }
         let journal_tokens = self.load_journal()?.panes.get(id).cloned();
         Ok(match journal_tokens {
@@ -305,10 +364,13 @@ impl RadiatorClient {
             .and_then(|value| serde_json::from_value(value.clone()).ok()))
     }
 
-    /// Process info from the gaps report's proposed `PaneInfo.process`
-    /// field. `None` means the hub hasn't reported it (whether because it
-    /// lacks the field or the pane truly has nothing to report), not an
-    /// error — capability `process_info` stays `false` until this is real.
+    /// Process info from `PaneInfo.process` (D35). `None` means the hub
+    /// hasn't reported it for this pane (whether because it predates the
+    /// field or the pane truly has nothing to report — a chat pane, or a
+    /// term pane restored before the hub tracked spawn specs), not an
+    /// error. `capabilities().process_info` reflects `hub.capabilities`'s
+    /// `process` flag, which callers use to decide whether to trust this at
+    /// all.
     pub fn process_info(&self, id: &str) -> Result<Option<ProcessInfo>> {
         let snapshot = self.raw_snapshot()?;
         let Some(process) = find_pane_field(&snapshot, id, "process") else {
@@ -341,8 +403,7 @@ impl RadiatorClient {
 
     /// `address`'s tokens as reported by the hub's `metadata` field on the
     /// already-fetched `raw` snapshot, falling back to the local journal
-    /// only when the hub has no `metadata` field at all (an older hub that
-    /// predates `pane.set_metadata`/`workspace.set_metadata`) — mirrors
+    /// only when the hub reports no metadata support at all (D35) — mirrors
     /// [`Self::resolve_ownership`]'s hub-wins rule without a second
     /// `hub.snapshot` round trip per resource.
     fn tokens_from_snapshot_or_journal(
@@ -350,14 +411,15 @@ impl RadiatorClient {
         address: &str,
         reported: Option<&Value>,
     ) -> BTreeMap<String, String> {
-        match reported.and_then(|value| serde_json::from_value(value.clone()).ok()) {
-            Some(tokens) => tokens,
-            None => self
-                .load_journal()
-                .ok()
-                .and_then(|journal| journal.panes.get(address).cloned())
-                .unwrap_or_default(),
+        if self.hub_capabilities().metadata {
+            return reported
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
         }
+        self.load_journal()
+            .ok()
+            .and_then(|journal| journal.panes.get(address).cloned())
+            .unwrap_or_default()
     }
 
     fn journal_path(&self) -> PathBuf {
@@ -411,6 +473,7 @@ impl RadiatorClient {
 
 impl Backend for RadiatorClient {
     fn capabilities(&self) -> Capabilities {
+        let hub = self.hub_capabilities();
         Capabilities {
             tabs: false,
             splits_and_ratios: false,
@@ -423,12 +486,11 @@ impl Backend for RadiatorClient {
             agent_start: false,
             agent_prompt: true,
             adopt_caller: true,
-            // `pane.set_metadata` is a proposed hub addition (gaps report
-            // item 1); tokens live in the local journal until it lands.
-            metadata_tokens: false,
-            // `PaneInfo.process` is a proposed hub addition (gaps report
-            // item 3).
-            process_info: false,
+            // From `hub.capabilities` (D35): tokens live in the local
+            // journal only when the hub reports no metadata support.
+            metadata_tokens: hub.metadata,
+            // From `hub.capabilities` (D35).
+            process_info: hub.process,
             events: true,
             // `pane.tail` landed in the hub protocol PR (radiator-hub-
             // protocol, event seq 127/169), so `tail()` calls it directly.
@@ -592,13 +654,7 @@ impl Backend for RadiatorClient {
     }
 
     fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<()> {
-        if !RadiatorClient::rename_workspace(self, workspace_id, label)? {
-            eprintln!(
-                "warning: Radiator hub at {} has no workspace.rename yet; workspace `{workspace_id}` keeps its hub-assigned name",
-                self.socket_path.display()
-            );
-        }
-        Ok(())
+        RadiatorClient::rename_workspace(self, workspace_id, label)
     }
 
     fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<()> {
@@ -908,6 +964,45 @@ mod tests {
         });
     }
 
+    /// Like [`fake_hub`], but answers a fixed sequence of requests (one
+    /// accept per request, since [`RadiatorClient`] opens a fresh connection
+    /// per RPC) — for tests where a method call triggers more than one
+    /// request, such as a cached `hub.capabilities` lookup ahead of the
+    /// call under test.
+    fn fake_hub_sequence(path: PathBuf, handlers: Vec<Box<dyn FnOnce(Value) -> Value + Send>>) {
+        let listener = bind(&path).expect("bind fake hub");
+        thread::spawn(move || {
+            for handler in handlers {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let response = handler(request);
+                serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+                stream.get_mut().write_all(b"\n").expect("newline");
+            }
+        });
+    }
+
+    fn capabilities_response(
+        metadata: bool,
+        process: bool,
+    ) -> Box<dyn FnOnce(Value) -> Value + Send> {
+        Box::new(move |request| {
+            assert_eq!(request["method"], "hub.capabilities");
+            json!({
+                "id": request["id"],
+                "result": {
+                    "metadata": metadata,
+                    "process": process,
+                    "readiness_output": true,
+                    "workspace_rename": true,
+                }
+            })
+        })
+    }
+
     #[test]
     fn explicit_socket_wins_over_hub_name_and_environment() {
         let path = resolve_socket_path(Some(Path::new("/tmp/custom.sock")), Some("dev"));
@@ -1034,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_workspace_reports_unsupported_without_failing() {
+    fn rename_workspace_errors_when_the_hub_refuses() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("hub-no-rename.sock");
         fake_hub(path.clone(), |request| {
@@ -1042,10 +1137,83 @@ mod tests {
             json!({"id": request["id"], "error": {"code": "unknown_method", "message": "no such method: workspace.rename"}})
         });
 
-        let applied = RadiatorClient::new(path)
+        let error = RadiatorClient::new(path)
             .rename_workspace("w0", "renamed")
-            .expect("rename call succeeds even when unsupported");
-        assert!(!applied);
+            .expect_err("hub refusal must surface as an error");
+        assert!(error.to_string().contains("unknown_method"));
+    }
+
+    #[test]
+    fn capabilities_reflect_a_hub_that_supports_metadata_and_process() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-full-capabilities.sock");
+        fake_hub(path.clone(), capabilities_response(true, true));
+
+        let capabilities = Backend::capabilities(&RadiatorClient::new(path));
+        assert!(capabilities.metadata_tokens);
+        assert!(capabilities.process_info);
+    }
+
+    #[test]
+    fn capabilities_reflect_a_hub_that_supports_neither() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-no-capabilities.sock");
+        fake_hub(path.clone(), capabilities_response(false, false));
+
+        let capabilities = Backend::capabilities(&RadiatorClient::new(path));
+        assert!(!capabilities.metadata_tokens);
+        assert!(!capabilities.process_info);
+    }
+
+    #[test]
+    fn capabilities_treat_a_pre_d35_hub_as_supporting_neither() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-pre-d35.sock");
+        fake_hub(path.clone(), |request| {
+            assert_eq!(request["method"], "hub.capabilities");
+            json!({"id": request["id"], "error": {"code": "unknown_method", "message": "no such method: hub.capabilities"}})
+        });
+
+        let capabilities = Backend::capabilities(&RadiatorClient::new(path));
+        assert!(!capabilities.metadata_tokens);
+        assert!(!capabilities.process_info);
+    }
+
+    #[test]
+    fn hub_capabilities_is_queried_once_and_cached_across_calls() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("hub-capabilities-cached.sock");
+        // Only one `hub.capabilities` exchange is served; a second call
+        // that hit the network again would hang waiting for a connection
+        // nothing is listening for.
+        fake_hub(path.clone(), capabilities_response(false, false));
+
+        let client = RadiatorClient::new(path);
+        let first = Backend::capabilities(&client);
+        let second = Backend::capabilities(&client);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn hub_capabilities_does_not_cache_a_transport_failure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory
+            .path()
+            .join("hub-capabilities-transport-failure.sock");
+        let client = RadiatorClient::new(path.clone());
+
+        // Nothing is listening yet, so the request fails to connect at all
+        // — not with `unknown_method`. That failure must not be cached as
+        // "no optional features", or the client would be stuck on the
+        // journal-only path forever even once the hub comes up.
+        let before = Backend::capabilities(&client);
+        assert!(!before.metadata_tokens);
+        assert!(!before.process_info);
+
+        fake_hub(path, capabilities_response(true, true));
+        let after = Backend::capabilities(&client);
+        assert!(after.metadata_tokens);
+        assert!(after.process_info);
     }
 
     #[test]
@@ -1053,36 +1221,16 @@ mod tests {
         let state_home = tempfile::tempdir().expect("tempdir");
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("hub-no-metadata.sock");
-        let listener = bind(&path).expect("bind fake hub");
-        thread::spawn(move || {
-            // First: `pane.set_metadata`, unsupported.
-            {
-                let stream = listener.accept().expect("accept");
-                let mut stream = BufReader::new(stream);
-                let mut line = String::new();
-                stream.read_line(&mut line).expect("read");
-                let request: Value = serde_json::from_str(&line).expect("request JSON");
-                assert_eq!(request["method"], "pane.set_metadata");
-                let response = json!({"id": request["id"], "error": {"code": "unknown_method", "message": "no such method: pane.set_metadata"}});
-                serde_json::to_writer(stream.get_mut(), &response).expect("write");
-                stream.get_mut().write_all(b"\n").expect("newline");
-            }
-            // Second: `hub.snapshot`, from `resolve_ownership`, with no
-            // `metadata` field anywhere in it.
-            {
-                let stream = listener.accept().expect("accept");
-                let mut stream = BufReader::new(stream);
-                let mut line = String::new();
-                stream.read_line(&mut line).expect("read");
-                let request: Value = serde_json::from_str(&line).expect("request JSON");
-                assert_eq!(request["method"], "hub.snapshot");
-                let response = json!({
-                    "id": request["id"],
-                    "result": {"workspaces": [], "seq": 0}
-                });
-                serde_json::to_writer(stream.get_mut(), &response).expect("write");
-                stream.get_mut().write_all(b"\n").expect("newline");
-            }
+        // Only `hub.capabilities` is ever called: `report_tokens` and
+        // `resolve_ownership` both consult (and cache) the same capability
+        // flag first, see it is `false`, and never touch `pane.set_metadata`
+        // or `hub.snapshot` at all — the journal alone answers both calls.
+        fake_hub(path.clone(), |request| {
+            assert_eq!(request["method"], "hub.capabilities");
+            json!({
+                "id": request["id"],
+                "result": {"metadata": false, "process": false}
+            })
         });
 
         let client = RadiatorClient::with_journal_root(path, state_home.path().to_owned());
@@ -1122,27 +1270,33 @@ mod tests {
         let mut hub_tokens = BTreeMap::new();
         hub_tokens.insert("drove_digest".to_owned(), "new".to_owned());
         let hub_tokens_for_response = hub_tokens.clone();
-        fake_hub(path, move |request| {
-            assert_eq!(request["method"], "hub.snapshot");
-            json!({
-                "id": request["id"],
-                "result": {
-                    "workspaces": [{
-                        "id": "w0",
-                        "name": "dev",
-                        "runner": "idle",
-                        "panes": [{
-                            "id": "w0:p1",
-                            "kind": "term",
-                            "title": "p",
-                            "runner": "idle",
-                            "metadata": hub_tokens_for_response,
-                        }],
-                    }],
-                    "seq": 1,
-                }
-            })
-        });
+        fake_hub_sequence(
+            path,
+            vec![
+                capabilities_response(true, false),
+                Box::new(move |request| {
+                    assert_eq!(request["method"], "hub.snapshot");
+                    json!({
+                        "id": request["id"],
+                        "result": {
+                            "workspaces": [{
+                                "id": "w0",
+                                "name": "dev",
+                                "runner": "idle",
+                                "panes": [{
+                                    "id": "w0:p1",
+                                    "kind": "term",
+                                    "title": "p",
+                                    "runner": "idle",
+                                    "metadata": hub_tokens_for_response,
+                                }],
+                            }],
+                            "seq": 1,
+                        }
+                    })
+                }),
+            ],
+        );
 
         let ownership = client
             .resolve_ownership("w0:p1")
@@ -1221,23 +1375,32 @@ mod tests {
     fn snapshot_flattens_every_pane_into_one_synthetic_tab_per_workspace() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("hub-snapshot.sock");
-        fake_hub(path.clone(), |request| {
-            json!({
-                "id": request["id"],
-                "result": {
-                    "workspaces": [{
-                        "id": "w0",
-                        "name": "dev",
-                        "runner": "idle",
-                        "panes": [
-                            {"id": "w0:p1", "kind": "term", "title": "shell", "runner": "idle"},
-                            {"id": "w0:p2", "kind": "chat", "title": "aide", "runner": "idle"},
-                        ],
-                    }],
-                    "seq": 3,
-                }
-            })
-        });
+        fake_hub_sequence(
+            path.clone(),
+            vec![
+                // `snapshot()` reads `hub.snapshot` first, then queries
+                // (and caches) `hub.capabilities` while resolving the first
+                // resource's tokens.
+                Box::new(|request| {
+                    json!({
+                        "id": request["id"],
+                        "result": {
+                            "workspaces": [{
+                                "id": "w0",
+                                "name": "dev",
+                                "runner": "idle",
+                                "panes": [
+                                    {"id": "w0:p1", "kind": "term", "title": "shell", "runner": "idle"},
+                                    {"id": "w0:p2", "kind": "chat", "title": "aide", "runner": "idle"},
+                                ],
+                            }],
+                            "seq": 3,
+                        }
+                    })
+                }),
+                capabilities_response(false, false),
+            ],
+        );
 
         let snapshot = RadiatorClient::new(path).snapshot().expect("snapshot");
         assert_eq!(snapshot.workspaces.len(), 1);
@@ -1309,29 +1472,38 @@ mod tests {
     fn snapshot_reads_pane_and_workspace_tokens_from_hub_metadata() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("hub-snapshot-tokens.sock");
-        fake_hub(path.clone(), |request| {
-            assert_eq!(request["method"], "hub.snapshot");
-            json!({
-                "id": request["id"],
-                "result": {
-                    "workspaces": [{
-                        "id": "w0",
-                        "name": "dev",
-                        "runner": "idle",
-                        "metadata": {"drove_name": "default"},
-                        "panes": [{
-                            "id": "w0:p1",
-                            "kind": "term",
-                            "title": "shell",
-                            "runner": "idle",
-                            "metadata": {"drove_digest": "abc123"},
-                            "process": {"pid": 99, "argv": ["bash"]},
-                        }],
-                    }],
-                    "seq": 1,
-                }
-            })
-        });
+        fake_hub_sequence(
+            path.clone(),
+            vec![
+                // `snapshot()` reads `hub.snapshot` first, then queries
+                // (and caches) `hub.capabilities` while resolving the first
+                // resource's tokens.
+                Box::new(|request| {
+                    assert_eq!(request["method"], "hub.snapshot");
+                    json!({
+                        "id": request["id"],
+                        "result": {
+                            "workspaces": [{
+                                "id": "w0",
+                                "name": "dev",
+                                "runner": "idle",
+                                "metadata": {"drove_name": "default"},
+                                "panes": [{
+                                    "id": "w0:p1",
+                                    "kind": "term",
+                                    "title": "shell",
+                                    "runner": "idle",
+                                    "metadata": {"drove_digest": "abc123"},
+                                    "process": {"pid": 99, "argv": ["bash"]},
+                                }],
+                            }],
+                            "seq": 1,
+                        }
+                    })
+                }),
+                capabilities_response(true, true),
+            ],
+        );
 
         let snapshot = RadiatorClient::new(path).snapshot().expect("snapshot");
         assert_eq!(
