@@ -83,3 +83,9 @@ it; `>>` appends still succeed.
 - content-addressed-resources = D21: every IR resource has a digest; ownership tokens drove_name/drove_profile/drove_digest; drift is token comparison first.
 - restart-in-place = D22: changed digest restarts the command in the same pane; only topology changes replace.
 - readiness-host-side = D23; adopt-no-caller = D24; prompt-file = D25; lint-later = D26.
+- radiator-hub-protocol = additions: pane.set_metadata, PaneInfo.metadata + PaneInfo.process, pane.tail, workspace.rename, hub.capabilities (from recon-radiator-gaps-report.md). Drove PR 5 codes against these shapes; hub PR lands them.
+- repo-visibility = public (2026-09-06): GitHub Actions minutes are free for public repos.
+- pr-review-process = cubic + agent reviewer: every PR gets a cubic review (triggered on open) and a Sonnet reviewer who folds cubic findings in; merge needs APPROVE from the agent reviewer and green CI.
+- main-protection = ruleset protect-main (2026-09-06): no deletion, no force push, changes via PR with required checks fmt/clippy/test(ubuntu,macos)/docs/audit; repository admins bypass so the commit reactor's local main commits can be pushed. 0 required approvals because agent reviewers post as the repo owner.
+- windows-path-bug: two planner tests fail on Windows (cwd normalized with Unix separators); CI Windows leg dropped in PR 1; fix scheduled after PR 2 (planner v2) lands, since planner.rs is rewritten there.
+- pr-lifecycle = .context/PR-WORKFLOW.md: worker owns the PR to done (all threads answered, APPROVE, green, current), reviewer owns the verdict and re-reviews each push, controller merges.
