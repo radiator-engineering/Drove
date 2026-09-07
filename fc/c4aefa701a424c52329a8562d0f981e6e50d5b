@@ -1,0 +1,19 @@
+docs/superpowers/specs/2026-09-06-drove-v4-one-command-design.md
+  s_1221f4d81bbcdb::t_644dc5a36870a3 1-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "fcc4aefa701a424c52329a8562d0f981e6e50d5b",
+  "prompts": {},
+  "sessions": {
+    "s_1221f4d81bbcdb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9a34faa-3c0b-4b2f-af5d-ad08a1ea6c48",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
