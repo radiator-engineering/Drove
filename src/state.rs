@@ -159,6 +159,92 @@ impl ManagedProfile {
     }
 }
 
+/// Prunes a managed profile against the live backend snapshot (D48): a
+/// `workspace`, `placement` or `pane` resource whose recorded `backend_id`
+/// is absent from the snapshot's matching id set is gone, and is dropped
+/// from the returned copy together with what it carried. A missing
+/// workspace also drops every placement and pane whose `backend_id` is
+/// namespaced under it (Herdr ids nest `<workspace>:t1`, `<workspace>:p1`
+/// directly off the workspace id, not off the tab); a missing placement
+/// drops the panes recorded under it by identity (`ManagedResource::parent`
+/// holds the placement's identity, not its backend id, so cascading here
+/// cannot use the same prefix trick). `agent` and `task` resources are left
+/// alone: their own `backend_id`/`parent` are not part of this workspace
+/// tree (a task has no `backend_id` at all), so they are out of scope for
+/// this prune. Returns the pruned profile and the dropped identities,
+/// sorted.
+pub fn prune_missing(
+    managed: &ManagedProfile,
+    snapshot: &crate::backend::herdr::SessionSnapshot,
+) -> (ManagedProfile, Vec<String>) {
+    let workspace_ids: BTreeSet<&str> = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect();
+    let tab_ids: BTreeSet<&str> = snapshot
+        .tabs
+        .iter()
+        .map(|tab| tab.tab_id.as_str())
+        .collect();
+    let pane_ids: BTreeSet<&str> = snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect();
+
+    let mut dropped = BTreeSet::new();
+    let mut missing_workspace_backend_ids = BTreeSet::new();
+    let mut missing_placement_identities = BTreeSet::new();
+
+    for (identity, resource) in &managed.resources {
+        match resource.kind.as_str() {
+            "workspace" if !workspace_ids.contains(resource.backend_id.as_str()) => {
+                missing_workspace_backend_ids.insert(resource.backend_id.clone());
+                dropped.insert(identity.clone());
+            }
+            "placement" if !tab_ids.contains(resource.backend_id.as_str()) => {
+                missing_placement_identities.insert(identity.clone());
+                dropped.insert(identity.clone());
+            }
+            "pane" if !pane_ids.contains(resource.backend_id.as_str()) => {
+                dropped.insert(identity.clone());
+            }
+            _ => {}
+        }
+    }
+
+    for (identity, resource) in &managed.resources {
+        match resource.kind.as_str() {
+            "placement" | "pane" => {
+                let under_missing_workspace = missing_workspace_backend_ids.iter().any(|ws| {
+                    resource
+                        .backend_id
+                        .strip_prefix(ws.as_str())
+                        .is_some_and(|rest| rest.starts_with(':'))
+                });
+                if under_missing_workspace {
+                    dropped.insert(identity.clone());
+                }
+            }
+            _ => {}
+        }
+        if resource.kind == "pane"
+            && let Some(parent) = &resource.parent
+            && missing_placement_identities.contains(parent)
+        {
+            dropped.insert(identity.clone());
+        }
+    }
+
+    let mut pruned = managed.clone();
+    pruned
+        .resources
+        .retain(|identity, _| !dropped.contains(identity));
+
+    (pruned, dropped.into_iter().collect())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedResource {
     /// IR resource kind (`workspace`, `pane`, `agent`, `task`) or
@@ -217,6 +303,153 @@ fn state_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::herdr::{PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo};
+
+    fn resource(kind: &str, backend_id: &str, parent: Option<&str>) -> ManagedResource {
+        ManagedResource {
+            kind: kind.into(),
+            backend_id: backend_id.into(),
+            parent: parent.map(str::to_owned),
+            digest: "digest".into(),
+            adopted: None,
+            last_outcome: None,
+        }
+    }
+
+    fn full_managed() -> ManagedProfile {
+        let mut managed = ManagedProfile::default();
+        managed
+            .resources
+            .insert("core".into(), resource("workspace", "w1", None));
+        managed.resources.insert(
+            "core/main".into(),
+            resource("placement", "w1:t1", Some("core")),
+        );
+        managed.resources.insert(
+            "review".into(),
+            resource("pane", "w1:p1", Some("core/main")),
+        );
+        managed
+            .resources
+            .insert("maintenance".into(), resource("workspace", "w2", None));
+        managed.resources.insert(
+            "maintenance/main".into(),
+            resource("placement", "w2:t1", Some("maintenance")),
+        );
+        managed.resources.insert(
+            "logs".into(),
+            resource("pane", "w2:p1", Some("maintenance/main")),
+        );
+        managed
+            .resources
+            .insert("build".into(), resource("task", "", None));
+        managed
+    }
+
+    fn full_snapshot() -> SessionSnapshot {
+        SessionSnapshot {
+            workspaces: vec![
+                WorkspaceInfo {
+                    workspace_id: "w1".into(),
+                    label: String::new(),
+                    tokens: Default::default(),
+                },
+                WorkspaceInfo {
+                    workspace_id: "w2".into(),
+                    label: String::new(),
+                    tokens: Default::default(),
+                },
+            ],
+            tabs: vec![
+                TabInfo {
+                    tab_id: "w1:t1".into(),
+                    workspace_id: "w1".into(),
+                    label: String::new(),
+                },
+                TabInfo {
+                    tab_id: "w2:t1".into(),
+                    workspace_id: "w2".into(),
+                    label: String::new(),
+                },
+            ],
+            panes: vec![
+                PaneInfo {
+                    pane_id: "w1:p1".into(),
+                    tab_id: "w1:t1".into(),
+                    workspace_id: "w1".into(),
+                    cwd: None,
+                    tokens: Default::default(),
+                    process_info: None,
+                },
+                PaneInfo {
+                    pane_id: "w2:p1".into(),
+                    tab_id: "w2:t1".into(),
+                    workspace_id: "w2".into(),
+                    cwd: None,
+                    tokens: Default::default(),
+                    process_info: None,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_missing_drops_nothing_against_a_full_snapshot() {
+        let managed = full_managed();
+        let (pruned, dropped) = prune_missing(&managed, &full_snapshot());
+        assert!(dropped.is_empty());
+        assert_eq!(pruned.resources.len(), managed.resources.len());
+    }
+
+    #[test]
+    fn prune_missing_workspace_drops_its_placement_and_panes() {
+        let managed = full_managed();
+        let mut snapshot = full_snapshot();
+        snapshot.workspaces.retain(|w| w.workspace_id != "w1");
+        snapshot.tabs.retain(|t| t.workspace_id != "w1");
+        snapshot.panes.retain(|p| p.workspace_id != "w1");
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(dropped, vec!["core", "core/main", "review"]);
+        assert!(!pruned.resources.contains_key("core"));
+        assert!(!pruned.resources.contains_key("core/main"));
+        assert!(!pruned.resources.contains_key("review"));
+        assert!(pruned.resources.contains_key("maintenance"));
+        assert!(pruned.resources.contains_key("maintenance/main"));
+        assert!(pruned.resources.contains_key("logs"));
+        assert!(pruned.resources.contains_key("build"));
+    }
+
+    #[test]
+    fn prune_missing_placement_drops_only_its_panes() {
+        let managed = full_managed();
+        let mut snapshot = full_snapshot();
+        snapshot.tabs.retain(|t| t.tab_id != "w1:t1");
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(dropped, vec!["core/main", "review"]);
+        assert!(pruned.resources.contains_key("core"));
+        assert!(!pruned.resources.contains_key("core/main"));
+        assert!(!pruned.resources.contains_key("review"));
+        assert!(pruned.resources.contains_key("maintenance"));
+    }
+
+    #[test]
+    fn prune_missing_pane_drops_only_that_pane() {
+        let managed = full_managed();
+        let mut snapshot = full_snapshot();
+        snapshot.panes.retain(|p| p.pane_id != "w1:p1");
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(dropped, vec!["review"]);
+        assert!(pruned.resources.contains_key("core"));
+        assert!(pruned.resources.contains_key("core/main"));
+        assert!(!pruned.resources.contains_key("review"));
+    }
 
     #[test]
     fn local_state_serializes_approvals() {

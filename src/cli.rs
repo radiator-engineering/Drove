@@ -303,36 +303,42 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
     }
 
     let client = select::open(&backend_id, &target)?;
-    if let Err(error) = client.snapshot() {
-        let socket = backend_socket_display(&backend_id, &target);
-        if cli.json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "profile": profile.name,
-                    "backend": backend_id,
-                    "status": "not_running",
-                    "error": error.to_string(),
-                    "socket": socket,
-                })
-            );
-        } else {
-            println!(
-                "not running: cannot reach {backend_id} at {} ({error})",
-                socket.display()
-            );
+    let live_snapshot = match client.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let socket = backend_socket_display(&backend_id, &target);
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "profile": profile.name,
+                        "backend": backend_id,
+                        "status": "not_running",
+                        "error": error.to_string(),
+                        "socket": socket,
+                    })
+                );
+            } else {
+                println!(
+                    "not running: cannot reach {backend_id} at {} ({error})",
+                    socket.display()
+                );
+            }
+            return Ok(ExitCode::from(3));
         }
-        return Ok(ExitCode::from(3));
-    }
+    };
 
     let state = LocalState::load(&repo_root)?;
     // Backends cannot read ownership tokens back yet (PR 3), so a resource's
-    // observed state comes only from local state's own record of the last
-    // apply (D16's declared fallback) until live discovery lands.
-    let snapshot = state
-        .profile(&profile.name)
-        .map(|managed| managed.to_snapshot(&profile.name, client.caller_pane_id()))
-        .unwrap_or_default();
+    // observed state comes from local state's own record of the last apply
+    // (D16's declared fallback), pruned against the live snapshot first
+    // (D48): a recorded resource whose backend id no longer exists is
+    // dropped so the planner sees it as absent and plans its creation again,
+    // rather than trusting a stale id from a session that was wiped and
+    // restarted. `plan` and `status` never write the prune back.
+    let managed = state.profile(&profile.name).cloned().unwrap_or_default();
+    let (pruned, dropped) = crate::state::prune_missing(&managed, &live_snapshot);
+    let snapshot = pruned.to_snapshot(&profile.name, client.caller_pane_id());
     let plan = build_plan(profile, &snapshot)?;
 
     // Only `status` and `plan` reach here: Render/Run/Down/Lint/Ls returned
@@ -342,7 +348,10 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         cli.command,
         Some(Command::Status { .. }) | Some(Command::Plan { .. })
     ));
-    print_plan(&plan, cli.json)?;
+    // Only `status` annotates what the prune dropped (D48); `plan` renders
+    // the plan alone, unchanged.
+    let is_status = matches!(cli.command, Some(Command::Status { .. }));
+    print_plan(&plan, cli.json, is_status.then_some(dropped.as_slice()))?;
     print_warnings(&compiled.warnings);
     Ok(if plan.status == SyncStatus::InSync {
         ExitCode::SUCCESS
@@ -597,6 +606,25 @@ fn up_command(
 ) -> Result<ExitCode> {
     let client = select::open(backend_id, target)?;
     let mut state = LocalState::load(repo_root)?;
+    // D48: probe the target once, up front. When it is already reachable,
+    // prune local state against its live snapshot and save the pruned set
+    // before anything is applied, so a resource whose backend id the
+    // session no longer has (stopped and restarted, wiping Herdr's
+    // workspaces and id counter) is planned as a fresh create instead of
+    // trusted as already there. When the target isn't reachable yet (first
+    // start), there is nothing live to prune against; `up` below starts the
+    // session and applies against local state as recorded, unchanged from
+    // today. The same probe result is reused for the Radiator reachability
+    // check below, rather than reaching the backend a second time.
+    let live_snapshot = client.snapshot();
+    if let Ok(live_snapshot) = &live_snapshot {
+        let managed = state.profile(profile_arg).cloned().unwrap_or_default();
+        let (pruned, dropped) = crate::state::prune_missing(&managed, live_snapshot);
+        if !dropped.is_empty() {
+            state.profiles.insert(profile_arg.to_owned(), pruned);
+            state.save()?;
+        }
+    }
     let snapshot = state
         .profile(profile_arg)
         .map(|managed| managed.to_snapshot(profile_arg, client.caller_pane_id()))
@@ -609,14 +637,14 @@ fn up_command(
         .iter()
         .any(|action| action.kind == Action::Core(CoreAction::Conflict))
     {
-        print_plan(&plan, json)?;
+        print_plan(&plan, json, None)?;
         return Ok(ExitCode::from(2));
     }
 
     let is_herdr = backend_id == select::HERDR_BACKEND;
     // A Radiator hub has no headless-start verb (D37): if it is unreachable,
     // fail with the hub name rather than applying against a dead socket.
-    if !is_herdr && client.snapshot().is_err() {
+    if !is_herdr && live_snapshot.is_err() {
         let hub = target.name.as_deref().unwrap_or(radiator::DEFAULT_HUB_NAME);
         if json {
             println!(
@@ -893,10 +921,24 @@ fn backend_socket_display(backend_id: &str, target: &select::Target) -> PathBuf 
     }
 }
 
-fn print_plan(plan: &Plan, json: bool) -> Result<()> {
+/// Prints a plan, or (from `status`) a plan plus the identities D48 pruned
+/// from local state before it was built — dropped because their recorded
+/// backend id no longer exists in the live snapshot, so the plan below now
+/// recreates them. `pruned` is `None` for every caller but `status`, so
+/// `plan`'s JSON output carries no `"pruned"` key and is unchanged.
+fn print_plan(plan: &Plan, json: bool, pruned: Option<&[String]>) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(plan)?);
+        let mut value = serde_json::to_value(plan)?;
+        if let Some(pruned) = pruned
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("pruned".into(), serde_json::json!(pruned));
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
+    }
+    for identity in pruned.unwrap_or_default() {
+        println!("recreate {identity}: backend id no longer exists; recreating");
     }
     print!("{}", plan.render());
     Ok(())

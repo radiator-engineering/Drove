@@ -1,7 +1,15 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    thread,
+};
 
 use assert_cmd::Command;
+use interprocess::local_socket::{Listener, ListenerOptions, traits::Listener as _};
 use predicates::prelude::*;
+use serde_json::{Value, json};
+use sha2::Digest;
 
 fn example_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -627,4 +635,359 @@ fn down_with_a_missing_herdr_binary_still_reports_the_detach_then_fails() {
             "nothing owned by profile `default`",
         ))
         .stderr(predicate::str::contains("cannot run the herdr binary"));
+}
+
+// D48: local state is pruned against the live backend snapshot before a
+// plan is built, so a resource whose recorded backend id no longer exists
+// (the session was stopped and restarted, wiping Herdr's workspaces and id
+// counter) is planned as a fresh create instead of trusted as already
+// there (issue 24).
+
+#[cfg(unix)]
+fn bind_fake_herdr(path: &Path) -> std::io::Result<Listener> {
+    use interprocess::local_socket::{GenericFilePath, prelude::*};
+
+    ListenerOptions::new()
+        .name(path.to_fs_name::<GenericFilePath>()?)
+        .create_sync()
+}
+
+#[cfg(windows)]
+fn bind_fake_herdr(path: &Path) -> std::io::Result<Listener> {
+    use interprocess::local_socket::{GenericNamespaced, prelude::*};
+
+    ListenerOptions::new()
+        .name(
+            path.to_string_lossy()
+                .to_string()
+                .to_ns_name::<GenericNamespaced>()?,
+        )
+        .create_sync()
+}
+
+/// Answers exactly one `session.snapshot` request with `snapshot`, then
+/// exits — enough for one `drove status`/`drove plan` run, which opens one
+/// connection per request and makes exactly one request when the snapshot
+/// it gets back has no panes to probe process info for.
+fn serve_one_snapshot(path: PathBuf, snapshot: Value) -> thread::JoinHandle<()> {
+    let listener = bind_fake_herdr(&path).expect("bind fake Herdr socket");
+    thread::spawn(move || {
+        let stream = listener.accept().expect("accept fake Herdr connection");
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).expect("read request");
+        let request: Value = serde_json::from_str(&line).expect("request JSON");
+        assert_eq!(request["method"], "session.snapshot");
+        let response = json!({"id": request["id"], "result": {"snapshot": snapshot}});
+        serde_json::to_writer(stream.get_mut(), &response).expect("write response");
+        stream.get_mut().write_all(b"\n").expect("newline");
+    })
+}
+
+fn state_file_path(state_home: &Path, repo_root: &Path) -> PathBuf {
+    let digest = sha2::Sha256::digest(repo_root.to_string_lossy().as_bytes());
+    state_home
+        .join("projects")
+        .join(format!("{}.json", hex::encode(digest)))
+}
+
+/// Answers a `session.snapshot` request with `snapshot`, then a `ping` with
+/// `pong` — enough for one `drove up --no-focus` run against a session
+/// that is already reachable and already in sync once D48 has pruned it, so
+/// `ensure_session` finds it `Running` without shelling out and there is no
+/// backend action or task left to apply.
+fn serve_snapshot_then_ping(path: PathBuf, snapshot: Value) -> thread::JoinHandle<()> {
+    let listener = bind_fake_herdr(&path).expect("bind fake Herdr socket");
+    thread::spawn(move || {
+        for _ in 0..2 {
+            let stream = listener.accept().expect("accept fake Herdr connection");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read request");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let result = match request["method"].as_str().expect("method") {
+                "session.snapshot" => json!({"snapshot": snapshot}),
+                "ping" => json!({"type": "pong"}),
+                other => panic!("unexpected method {other}"),
+            };
+            let response = json!({"id": request["id"], "result": result});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write response");
+            stream.get_mut().write_all(b"\n").expect("newline");
+        }
+    })
+}
+
+fn write_state_with_stale_workspace(state_home: &Path, repo_root: &Path) {
+    let state_path = state_file_path(state_home, repo_root);
+    fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
+    let state = json!({
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "profiles": {
+            "default": {
+                "desired_digest": "",
+                "resources": {
+                    "dev": {
+                        "kind": "workspace",
+                        "backend_id": "w9",
+                        "parent": null,
+                        "digest": "stale-digest",
+                        "adopted": null,
+                        "last_outcome": null,
+                    }
+                },
+            }
+        },
+        "approvals": [],
+        "journal": [],
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state file");
+}
+
+#[test]
+fn status_reports_recreate_for_a_workspace_the_live_session_no_longer_has() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_stale_workspace(&state_home, directory.path());
+
+    let socket = directory.path().join("herdr.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []}),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    let output = command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "--json",
+            "status",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("\"pruned\""))
+        .get_output()
+        .stdout
+        .clone();
+    server.join().expect("fake Herdr server thread");
+
+    let plan: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(plan["status"], "out_of_sync");
+    assert_eq!(plan["pruned"], json!(["dev"]));
+    let creates_dev = plan["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .any(|action| action["address"] == "dev" && action["kind"]["core"] == "create_workspace");
+    assert!(
+        creates_dev,
+        "expected a CreateWorkspace action for `dev`: {plan}"
+    );
+
+    // `status` never writes: the state file still records the stale id.
+    let state_path = state_file_path(&state_home, directory.path());
+    let saved: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read state")).expect("state JSON");
+    assert_eq!(
+        saved["profiles"]["default"]["resources"]["dev"]["backend_id"],
+        "w9"
+    );
+}
+
+#[test]
+fn status_text_reports_recreate_for_a_pruned_resource() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_stale_workspace(&state_home, directory.path());
+
+    let socket = directory.path().join("herdr-text.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []}),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "status",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(
+            "recreate dev: backend id no longer exists; recreating",
+        ));
+    server.join().expect("fake Herdr server thread");
+}
+
+#[test]
+fn plan_prunes_for_its_own_output_but_never_writes_or_reports_pruned() {
+    // Spec section 7 (D48): "plan leaves the state file byte-identical."
+    // `plan` sees the same pruned snapshot `status` does (it still plans a
+    // fresh create for `dev`), but it neither writes the prune back to
+    // local state nor annotates its output with what was pruned — that
+    // annotation is `status`-only.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_stale_workspace(&state_home, directory.path());
+    let state_path = state_file_path(&state_home, directory.path());
+    let before = fs::read(&state_path).expect("read state before plan");
+
+    let socket = directory.path().join("herdr-plan.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []}),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    let output = command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "--json",
+            "plan",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    server.join().expect("fake Herdr server thread");
+
+    let plan: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(plan["status"], "out_of_sync");
+    assert!(
+        plan.as_object()
+            .expect("plan object")
+            .get("pruned")
+            .is_none(),
+        "`plan --json` must carry no \"pruned\" key at all, not even an empty one: {plan}"
+    );
+    let creates_dev = plan["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .any(|action| action["address"] == "dev" && action["kind"]["core"] == "create_workspace");
+    assert!(
+        creates_dev,
+        "expected a CreateWorkspace action for `dev`: {plan}"
+    );
+
+    let after = fs::read(&state_path).expect("read state after plan");
+    assert_eq!(
+        before, after,
+        "`plan` must leave the state file byte-identical"
+    );
+}
+
+#[test]
+fn up_saves_the_pruned_managed_set_before_applying() {
+    // D48: `up` prunes local state against the live snapshot, like
+    // `plan`/`status`, but — unlike them — saves the pruned set before
+    // applying anything. Here the profile declares no workspaces, so once
+    // the stale `dev` entry is pruned away the plan is empty: `up` never
+    // touches the backend beyond the snapshot/ping pair `ensure_session`
+    // needs, but the prune is still expected to have been saved.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(&drovefile, "profile(name = \"default\")").expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_stale_workspace(&state_home, directory.path());
+    let state_path = state_file_path(&state_home, directory.path());
+
+    let socket = directory.path().join("herdr-up.sock");
+    let server = serve_snapshot_then_ping(
+        socket.clone(),
+        json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []}),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "up",
+            "--no-focus",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    server.join().expect("fake Herdr server thread");
+
+    let saved: Value = serde_json::from_slice(&fs::read(&state_path).expect("read state after up"))
+        .expect("state JSON");
+    assert!(
+        saved["profiles"]["default"]["resources"]
+            .as_object()
+            .expect("resources object")
+            .is_empty(),
+        "up should have saved the pruned (now empty) resource set: {saved}"
+    );
 }
