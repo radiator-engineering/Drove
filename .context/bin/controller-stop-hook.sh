@@ -9,7 +9,7 @@ set -u
 # the reactor reports for them. They carry LOG_DRIVEN_WORKER=<name> in their env.
 [ -n "${LOG_DRIVEN_WORKER:-}" ] && exit 0
 payload="$(cat 2>/dev/null || true)"
-# Spawned workers in other herdr panes are not the controller either: once layout.sh
+# Spawned workers in other herdr panes are not the controller either: once the workspace setup
 # has recorded the controller's pane, only that pane is held to the result rule.
 REPO0="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
 if [ -n "${HERDR_PANE_ID:-}" ] && [ -f "$REPO0/.context/layout.json" ] && command -v jq >/dev/null; then
@@ -67,7 +67,7 @@ done <<<"$changed"
 last_line="$(tail -1 "$LOG" 2>/dev/null)"
 last=0
 if jq -e 'select(.type=="result" and ((.by==null) or (.by=="controller")))' <<<"$last_line" >/dev/null 2>&1; then
-  # append-event.sh's ts field is second-resolution only, so when the matching
+  # eventlog append's ts field is second-resolution only, so when the matching
   # result is the log's own last line, use the LOG FILE's mtime instead: the
   # append (a single atomic >>) stamps it with real nanosecond resolution, so
   # a later write to any other file compares strictly greater, collision-free.
@@ -85,7 +85,7 @@ fi
 [ "$newest" -gt "$last" ] || exit 0
 
 list="$(tr '\n' ',' <<<"$changed" | sed 's/,$//')"
-reason="Changed files have no result event yet: $list. This repo is log-driven: the commit reactor only commits what a result names. Before you finish, run: append-event.sh result ref=<main file> paths=\"$list\" summary=\"<one line>\" (do not git commit; do not ping the reactors). If you did not make some of these changes, still list them or tell the user they are uncommitted."
+reason="Changed files have no result event yet: $list. This repo is log-driven: the commit reactor only commits what a result names. Before you finish, run: eventlog append result ref=<main file> paths=\"$list\" summary=\"<one line>\" (do not git commit; do not ping the reactors). If you did not make some of these changes, still list them or tell the user they are uncommitted."
 if command -v jq >/dev/null; then jq -nc --arg r "$reason" '{decision:"block",reason:$r}'
 else printf '{"decision":"block","reason":%s}\n' "\"$(sed 's/"/\\"/g' <<<"$reason")\""; fi
 exit 0

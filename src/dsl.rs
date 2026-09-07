@@ -644,7 +644,7 @@ mod tests {
 control = workspace("control", panes = [
     herdr.tab("coordinator", split = herdr.DOWN, ratios = [0.5], panes = [
         caller_pane("controller"),
-        pane("eventlog", serve = ["eventlog-view.sh", "-f"]),
+        pane("eventlog", serve = ["eventlog", "view", "--follow"]),
     ]),
     herdr.tab("monitor", panes = [pane("agentmon", serve = ["htop"])]),
 ])

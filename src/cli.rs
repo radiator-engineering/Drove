@@ -1545,7 +1545,7 @@ mod tests {
 control = workspace("control", tabs = [
     tab("coordinator", split = "down", ratios = [0.5], panes = [
         pane("controller", adopt = "caller"),
-        pane("eventlog", serve = ["eventlog-view.sh", "-f"], ready = output("ready")),
+        pane("eventlog", serve = ["eventlog", "view", "--follow"], ready = output("ready")),
     ]),
 ])
 profile("default", workspaces = [control])

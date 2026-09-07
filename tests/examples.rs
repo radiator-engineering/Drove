@@ -121,7 +121,7 @@ fn log_driven_example_compiles_with_reactors_and_extends() {
 
     let default_profile = compiled.config.profile("default").expect("default profile");
     assert_eq!(default_profile.workspaces.len(), 3);
-    assert_eq!(default_profile.tasks.len(), 2);
+    assert!(default_profile.tasks.is_empty());
 
     let maintenance = default_profile
         .workspaces
@@ -133,8 +133,8 @@ fn log_driven_example_compiles_with_reactors_and_extends() {
         .tabs
         .iter()
         .flat_map(|tab| &tab.panes)
-        .find(|pane| pane.name == "commit-reactor")
-        .expect("commit-reactor pane");
+        .find(|pane| pane.name == "committer-reactor")
+        .expect("committer-reactor pane");
     assert!(commit_reactor_pane.on_start.is_some());
 
     let core_profile = compiled.config.profile("core").expect("core profile");
@@ -168,7 +168,12 @@ fn example_pane_content_digests_equal_the_v2_values() {
         );
     }
 
-    let log_driven = example_ir("log-driven/Drovefile");
+    let log_driven = compile(&fixture_path("v3/log-driven/Drovefile"))
+        .expect("frozen v3 fixture")
+        .config
+        .profile("default")
+        .expect("default profile")
+        .to_ir();
     for (name, expected) in LOG_DRIVEN_V2_PANE_DIGESTS {
         assert_eq!(
             &pane_digest(&log_driven, name),
@@ -206,15 +211,21 @@ fn v2_fixtures_still_compile_but_warn() {
 
 #[test]
 fn v2_and_v3_forms_share_every_pane_content_digest() {
-    // D30: upgrading a Drovefile from its v2 form to the migrated v3 form must
+    // D30: compare the frozen pre-eventlog v3 layout with its v2 form.
+    // Upgrading a Drovefile from its v2 form to the migrated v3 form must
     // leave every pane's content digest identical, so `drove up` after the
     // upgrade proposes no restarts.
     for (v2, v3) in [
         ("v2/basic/Drovefile", "basic/Drovefile"),
-        ("v2/log-driven/Drovefile", "log-driven/Drovefile"),
+        ("v2/log-driven/Drovefile", "v3/log-driven/Drovefile"),
     ] {
         let v2_digests = pane_content_digests(&fixture_path(v2));
-        let v3_digests = pane_content_digests(&example_path(v3));
+        let v3_path = if v3.starts_with("v3/") {
+            fixture_path(v3)
+        } else {
+            example_path(v3)
+        };
+        let v3_digests = pane_content_digests(&v3_path);
         assert_eq!(
             v2_digests, v3_digests,
             "pane content digests drifted between the v2 form `{v2}` and the v3 form `{v3}`"

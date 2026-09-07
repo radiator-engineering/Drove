@@ -1,11 +1,22 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/jjmartin/.cargo/bin/eventlog guard --agent claude",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|Bash"
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/.context/bin/controller-stop-hook.sh\""
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.context/bin/controller-stop-hook.sh\"",
+            "type": "command"
           }
         ]
       }
