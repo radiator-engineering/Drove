@@ -1674,3 +1674,265 @@ fn up_against_a_session_that_was_just_started_prunes_before_applying() {
          saved state, not trusted as still there: {saved}"
     );
 }
+
+/// Answers every accepted connection according to `request["method"]`,
+/// recording each request and returning them all once a request whose
+/// method is `stop_after` has been answered. Generic (any request sequence,
+/// keyed purely by method) rather than positional, so the exact number and
+/// order of backend calls a real `up` apply makes doesn't have to be
+/// predicted exactly, only the methods that matter to the test.
+#[cfg(unix)]
+fn serve_until(
+    path: PathBuf,
+    stop_after: &'static str,
+    respond: impl Fn(&str) -> Value + Send + 'static,
+) -> thread::JoinHandle<Vec<Value>> {
+    let listener = bind_fake_herdr(&path).expect("bind fake Herdr socket");
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        loop {
+            let stream = listener.accept().expect("accept fake Herdr connection");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read request");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let method = request["method"].as_str().expect("method").to_owned();
+            let result = respond(&method);
+            let response = json!({"id": request["id"], "result": result});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write response");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            let done = method == stop_after;
+            requests.push(request);
+            if done {
+                return requests;
+            }
+        }
+    })
+}
+
+/// D51 point 1's full spec test: "up against an unreachable target with
+/// non-empty stale state creates every declared resource and never calls
+/// focus on a stale id." The declared workspace `dev` must be created fresh
+/// (the stale local record names a workspace id the freshly started
+/// session's empty snapshot doesn't have) and, with focus enabled, the
+/// `workspace.focus` call must carry the newly created id, not the stale
+/// one.
+#[cfg(unix)]
+#[test]
+fn up_against_an_unreachable_target_creates_every_resource_and_focuses_the_fresh_id() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "shell"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    // The stale record names workspace id `w9` (see
+    // `write_state_with_stale_workspace`) — absent from the freshly started
+    // session below, whose only workspace comes back as `w42`.
+    write_state_with_stale_workspace(&state_home, directory.path());
+    let state_path = state_file_path(&state_home, directory.path());
+
+    let log = directory.path().join("argv.log");
+    let herdr = write_fake_herdr(directory.path(), &log, "exit 0");
+
+    let socket = directory.path().join("herdr-focus.sock");
+    let socket_for_thread = socket.clone();
+    let log_for_thread = log.clone();
+    let server = thread::spawn(move || {
+        loop {
+            if fs::read_to_string(&log_for_thread)
+                .map(|contents| contents.contains("server --session"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        serve_until(socket_for_thread, "workspace.focus", |method| match method {
+            "ping" => json!({"type": "pong"}),
+            "session.snapshot" => json!({"snapshot": {
+                "version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": [],
+            }}),
+            "workspace.create" => json!({
+                "workspace_id": "w42",
+                "tab": {"tab_id": "w42:t1", "label": "1"},
+            }),
+            "layout.apply" => json!({
+                "layout": {
+                    "workspace_id": "w42",
+                    "tab_id": "w42:t1",
+                    "root": {"type": "pane", "pane_id": "w42:p1"},
+                }
+            }),
+            "tab.rename" => json!({"type": "ok"}),
+            "workspace.focus" => json!({"type": "ok"}),
+            other => panic!("unexpected method {other}"),
+        })
+        .join()
+        .expect("fake Herdr server thread")
+    });
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "up",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    let requests = server.join().expect("fake Herdr socket thread");
+
+    let creates_workspace = requests
+        .iter()
+        .any(|request| request["method"] == "workspace.create");
+    assert!(
+        creates_workspace,
+        "every declared resource must be created fresh: {requests:?}"
+    );
+    let focus = requests
+        .iter()
+        .find(|request| request["method"] == "workspace.focus")
+        .expect("a workspace.focus call");
+    assert_eq!(
+        focus["params"]["workspace_id"], "w42",
+        "focus must target the freshly created workspace id, never the \
+         stale `w9` from local state: {requests:?}"
+    );
+
+    let saved: Value = serde_json::from_slice(&fs::read(&state_path).expect("read state after up"))
+        .expect("state JSON");
+    let saved_text = saved.to_string();
+    assert!(
+        !saved_text.contains("w9"),
+        "the stale workspace id must not survive in saved state: {saved}"
+    );
+    assert!(
+        saved_text.contains("w42"),
+        "the freshly created workspace id must be recorded: {saved}"
+    );
+}
+
+/// D51 point 3's full spec test: "caller env id absent from the snapshot
+/// leads to a create, not an adopt." `HERDR_PANE_ID` names a pane the live
+/// snapshot doesn't list, so the pane declaring `adopt = "caller"` must plan
+/// as a normal create (the group's "not observed" reason), never as the
+/// adopted-pane path.
+#[test]
+fn status_with_a_caller_pane_id_absent_from_the_snapshot_plans_a_create_not_an_adopt() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "shell", adopt = "caller"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let socket = directory.path().join("herdr-caller.sock");
+    let server = serve_one_snapshot(socket.clone(), empty_snapshot());
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_PANE_ID", "w1:p9")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "status",
+        ])
+        .assert()
+        .code(2)
+        .stdout(
+            predicate::str::contains(
+                "placement group declared but not observed; applying as a new layout",
+            )
+            .and(predicate::str::contains("adopting the invoking pane").not()),
+        );
+    server.join().expect("fake Herdr server thread");
+}
+
+/// D51 point 2's spec test: "snapshot with one failing `pane.process_info`
+/// still returns the other panes", exercised end to end through
+/// `status --json`, which must list the pane under
+/// `"process_info_unavailable"`.
+#[test]
+fn status_json_lists_a_pane_whose_process_info_call_failed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(&drovefile, "profile(name = \"default\")").expect("Drovefile");
+
+    let socket = directory.path().join("herdr-process-info.sock");
+    let server = serve_scripted(
+        socket.clone(),
+        vec![
+            FakeAnswer::Result(json!({"snapshot": {
+                "version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [],
+                "panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}],
+                "agents": [],
+            }})),
+            FakeAnswer::Error {
+                code: "pane_not_found",
+                message: "pane w1:p1 does not exist",
+            },
+        ],
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    let output = command
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "--json",
+            "status",
+        ])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    server.join().expect("fake Herdr server thread");
+
+    let report: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(
+        report["process_info_unavailable"],
+        json!(["w1:p1"]),
+        "status --json must list the pane whose process_info call failed: {report}"
+    );
+}
