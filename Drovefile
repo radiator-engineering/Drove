@@ -1,0 +1,37 @@
+load("drove/reactors.star", "reactor")
+
+backend("herdr")
+herdr.session("drove")
+
+control = workspace("control", panes = [
+    herdr.tab("coordinator", split = herdr.DOWN, ratios = [0.5], panes = [
+        caller_pane("controller"),
+        pane("eventlog", serve = ["eventlog-view.sh", "-f"]),
+    ]),
+    herdr.tab("monitor: system + agents", panes = [
+        pane("agentmon", serve = any_of(["agentmon", "--since", "launch"], ["htop"])),
+    ]),
+])
+
+maintenance = workspace("maintenance", panes = [
+    herdr.tab("lazygit", panes = [pane("gitlog", serve = any_of(["lazygit"], ["bash"]))]),
+    reactor("commit", agent = "cursor-committer", model = "composer-2.5-fast",
+            script = "cursor-commit-reactor.sh"),
+    reactor("doc-sync", agent = "doc-worker", model = "sonnet",
+            script = "doc-sync-reactor.sh", after = ["commit-reactor"]),
+])
+
+files = workspace("files", panes = [
+    herdr.tab("files", panes = [pane("spiceedit", serve = any_of(["spiceedit"], ["bash"]))]),
+])
+
+default = profile("default", workspaces = [control, maintenance, files])
+
+monitoring_ws = workspace("monitoring", panes = [
+    herdr.tab("log + history", split = herdr.DOWN, ratios = [0.7], panes = [
+        pane("eventlog", serve = ["eventlog-view.sh", "--follow"]),
+        pane("gitlog", serve = ["git", "log", "--oneline", "-20"]),
+    ]),
+])
+
+profile("monitoring", session = "drove-mon", workspaces = [monitoring_ws])

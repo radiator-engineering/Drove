@@ -14,14 +14,16 @@ herdr.session("drove")    # Herdr flavor: which named session
 radiator.hub("main")      # Radiator flavor: which named hub
 ```
 
-A Drovefile may declare both flavor instances; only the active backend's declaration is used. The backend id and target instance resolve in this order, most specific first:
+A Drovefile may declare both flavor instances; only the active backend's declaration is used. A profile may also name its own session or hub (see `profile` below), overriding the file-level declaration for that profile only. The backend id and target instance resolve in this order, most specific first:
 
 1. CLI: `--backend <id>`, `--target <name>` (`--session` is a Herdr alias of `--target`; `--socket` is an explicit override).
-2. Environment: `DROVE_BACKEND`; `HERDR_SESSION` or `RADIATOR_HUB` per backend; `HERDR_SOCKET_PATH` as before.
-3. Drovefile: `backend(...)`, `herdr.session(...)`, `radiator.hub(...)`.
-4. Built-in: backend `herdr`; Herdr session `default`; Radiator hub `main`.
+2. `DROVE_*` environment: `DROVE_BACKEND` (no `DROVE_*` variable names a target instance yet).
+3. Profile: `profile(..., session = ..., backend = ...)`.
+4. Drovefile: `backend(...)`, `herdr.session(...)`, `radiator.hub(...)`.
+5. Ambient host environment: `HERDR_SESSION` or `RADIATOR_HUB` per backend; `HERDR_SOCKET_PATH` as before.
+6. Built-in: backend `herdr`; Herdr session `default`; Radiator hub `main`.
 
-A Drovefile's declaration is a default that an explicit flag or an ambient session overrides.
+A Drovefile's declaration is a default that an explicit flag, `DROVE_BACKEND`, or a profile's own `session`/`backend` overrides. Ambient host environment (`HERDR_SESSION`, `RADIATOR_HUB`) ranks below the file, so a profile that names its own session is not silently redirected by whatever session the calling terminal happens to sit in — it only takes over when the Drovefile leaves the target unset.
 
 ## `profile`
 
@@ -32,6 +34,8 @@ profile(
     tasks = [],
     extends = None,
     without = [],
+    session = None,     # Herdr session name (or Radiator hub name, when backend = "radiator")
+    backend = None,     # overrides the file-level backend() for this profile only
 )
 ```
 
@@ -40,9 +44,35 @@ profile(
 ```python
 profile("default", workspaces = [control, maintenance, files])
 profile("core", extends = default, without = [files])
+profile("monitoring", session = "drove-mon", workspaces = [monitor])
 ```
 
 `extends` must reference an already-declared profile. `profile()` returns the value it registers. Composition is resolved after the whole file evaluates — the sandbox never touches other profiles or the filesystem during Starlark evaluation itself.
+
+A profile that leaves `session`/`backend` unset inherits the file-level `backend(...)` / `herdr.session(...)` / `radiator.hub(...)`; a child profile created with `extends` inherits its parent's `session`/`backend` unless it sets its own. This lets one Drovefile declare several profiles that each live in a different Herdr session — see `profile("monitoring", ...)` in this repository's own `Drovefile` for a profile that runs in a second session, `drove-mon`, entirely separate from `default`'s session.
+
+### The positional profile, and no-profile rules
+
+The profile name is a positional argument, both on the bare command and on every subcommand: `drove monitoring`, `drove plan monitoring`, `drove status monitoring`. `--profile NAME` is an alias with no deprecation warning; giving both is fine as long as they agree, and an error if they don't.
+
+With no profile named, either positionally or with `--profile`, Drove picks one:
+
+1. The profile named `default`, if the Drovefile declares one.
+2. Else, the file's only profile, if it declares exactly one.
+3. Otherwise, exit 2 and list every declared profile.
+
+Naming a profile the file doesn't declare is also exit 2, with the same list.
+
+### `drove ls`
+
+`drove ls` prints every declared profile with its resolved backend, target name, and whether that target answers a `ping` on its resolved socket:
+
+```
+default: backend=herdr target=drove reachable=true
+monitoring: backend=herdr target=drove-mon reachable=false
+```
+
+`--json` gives the same rows as a JSON array (`profile`, `backend`, `target`, `reachable`).
 
 ## Workspaces, panes, and groups
 
@@ -153,19 +183,31 @@ See `docs/upgrading-v3.md` for the full v2 → v3 migration.
 ## Commands
 
 ```sh
-drove status [--profile NAME] [--json]
-drove plan   [--profile NAME] [--json]
-drove up     [--profile NAME] [--yes] [--allow-replace]
-drove render [--profile NAME] [--json]
-drove run    [NAME] [--yes]
-drove down   [--profile NAME] [--purge] [--yes]
-drove lint   [--profile NAME] [--json]
+drove        [PROFILE] [--profile NAME] [--yes] [--allow-replace] [--workspace NAME] [--no-focus] [--json]
+drove status [PROFILE] [--profile NAME] [--json]
+drove plan   [PROFILE] [--profile NAME] [--json]
+drove up     [PROFILE] [--profile NAME] [--yes] [--allow-replace] [--workspace NAME] [--no-focus] [--json]
+drove render [PROFILE] [--profile NAME] [--json]
+drove run    [PROFILE] [NAME] [--yes]
+drove down   [PROFILE] [--profile NAME] [--purge] [--yes]
+drove lint   [PROFILE] [--profile NAME] [--json]
+drove ls     [--json]
 ```
+
+`drove` with no subcommand is `drove up`; both take the profile positionally (see "The positional profile" above).
 
 `drove render` prints the compiled intermediate representation (IR schema version 3): a flat, deterministically ordered list of typed resources, each carrying a content digest, plus a topology digest per placement group (`was` renames and moving a pane between tabs change the topology digest, never the content one). Given a v2 Drovefile, it also prints every deprecation warning and the file's v3 form. It performs no backend I/O.
 
 `drove lint` warns on a `was` that matches nothing live and on a task with no `check`; it always exits `0`.
 
-`drove up` also runs every `auto = True` task the plan proposes (`RunTask` actions), in `after` order; reconciling workspaces, panes and agents against a live backend is a later PR. `drove run NAME` runs one task and its `after` prerequisites, and nothing else declared in the profile; with no `NAME`, it lists every declared task and its last recorded outcome. `drove down` selects the resources local state records as owned by this profile, runs each one's `on_stop` hook, then stops tracking it (`--purge` also passes each resource's stored backend id to the backend's `close_pane`); it never touches a pane local state doesn't record as owned by this profile.
+`drove up` takes you from nothing to a running, focused session in one step:
+
+1. Resolve the backend and target (session or hub).
+2. If the target isn't reachable and the backend is Herdr, start that session's server headlessly (`herdr server --session NAME`) and wait for its socket; if it can't come up, exit 1 with the exact `herdr --session NAME` command to run yourself. On Radiator, an unreachable hub just fails with the hub name — there's no headless-start verb.
+3. Apply the plan: every workspace, placement, pane and agent action, plus every `auto = True` task in `after` order (`RunTask` actions), behind the same `--yes` gate destructive actions already use. A `Conflict` still exits 2 without applying anything.
+4. Focus the profile's first declared workspace (or the one named by `--workspace NAME`). If your terminal is outside Herdr (`HERDR_ENV` unset) and stdout is a TTY, `up` then execs `herdr session attach NAME` so you land in the session. `--no-focus` skips both steps; `--json` implies `--no-focus`.
+5. Print one summary line: `profile NAME: N created, M changed, K tasks run, in sync`, or, when nothing needed applying, `profile NAME: already running, brought to front`.
+
+`drove run NAME` runs one task and its `after` prerequisites, and nothing else declared in the profile; with no `NAME`, it lists every declared task and its last recorded outcome. `drove down` selects the resources local state records as owned by this profile, runs each one's `on_stop` hook, then stops tracking it (`--purge` also passes each resource's stored backend id to the backend's `close_pane`); it never touches a pane local state doesn't record as owned by this profile.
 
 Use `--backend ID`, `--target NAME`, `--file PATH`, `--socket PATH`, or `--session NAME` when discovery defaults are not appropriate.

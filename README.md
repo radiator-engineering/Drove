@@ -75,20 +75,29 @@ profile(
 )
 ```
 
-`backend(...)` declares which backend the project reconciles onto; `herdr` is the Herdr flavor's namespace for placement (tabs, splits, ratios). A pane can run a command, host a coding agent, and gate its readiness on output or a port. A `task` runs a one-shot setup step with a `check` that lets Drove skip it once it has run. See the [Drovefile reference](docs/drovefile.md) for every resource and field, and `examples/log-driven/Drovefile` for a full multi-agent workspace.
+`backend(...)` declares which backend the project reconciles onto; `herdr` is the Herdr flavor's namespace for placement (tabs, splits, ratios). A pane can run a command, host a coding agent, and gate its readiness on output or a port. A `task` runs a one-shot setup step with a `check` that lets Drove skip it once it has run. See the [Drovefile reference](docs/drovefile.md) for every resource and field, and `examples/log-driven/Drovefile` (or this repository's own `Drovefile`) for a full multi-agent workspace.
 
 Then run:
 
 ```sh
-drove render
-drove plan
-drove status
-drove up
+drove
 ```
 
-`drove render` prints the compiled model as a flat, ordered list of resources, each with a content digest. It does no backend I/O. `drove plan` and `drove status` compare the model to the live backend and report drift. `drove up`, the default command, applies the plan. Reconciliation is being wired in backend by backend; see the reference for the current state of each command.
+`drove` with no subcommand resolves the profile named `default` (or the file's only profile), starts the target Herdr session if it isn't already running, applies the plan, and brings the session's first workspace to the front — attaching your terminal to it if you're not already inside Herdr. It prints one summary line: `profile default: N created, M changed, K tasks run, in sync`, or `profile default: already running, brought to front`. Give a profile name to target a different one: `drove other-profile`.
 
-Use `--profile NAME` for a named profile, `--backend ID` / `--target NAME` (or `--session NAME` on Herdr) to override the declared backend and instance, and `--file PATH` when Drove cannot find the `Drovefile` by searching parent directories. Run `drove lint` to catch a stale `was = "..."` rename or a task with no `check`.
+Other commands:
+
+```sh
+drove ls       # every declared profile, its backend, target, and reachability
+drove plan     # compare the model to the live backend and report drift, read-only
+drove status   # same comparison as plan, read-only
+drove render   # print the compiled model: a flat, ordered list of resources with content digests, no backend I/O
+drove lint     # catch a stale was = "..." rename or a task with no check
+drove run      # run one declared task and its prerequisites
+drove down     # stop tracking this profile's resources, running each one's on_stop hook first
+```
+
+Use `--profile NAME` (an alias of the positional profile), `--backend ID` / `--target NAME` (or `--session NAME` on Herdr) to override the declared backend and instance, and `--file PATH` when Drove cannot find the `Drovefile` by searching parent directories.
 
 ## Development
 
