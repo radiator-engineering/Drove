@@ -185,13 +185,39 @@ fn print_profile_list(reason: &str, config: &DroveConfig) {
     println!("{reason}; declared profiles: {}", names.join(", "));
 }
 
-fn run_with(cli: Cli) -> Result<ExitCode> {
+/// `drove run PROFILE` (no task) parses identically to `drove run TASK`:
+/// `Run`'s `task` positional comes before its `profile` positional, so clap
+/// binds a single bare word to `task`. If that word names a declared
+/// profile and no declared task shares the name, reinterpret it as the
+/// profile instead (D42).
+fn disambiguate_run_positional(cli: &mut Cli, config: &DroveConfig) {
+    let Some(Command::Run { task, profile, .. }) = &mut cli.command else {
+        return;
+    };
+    if profile.is_some() {
+        return;
+    }
+    let Some(name) = task.as_deref() else {
+        return;
+    };
+    let names_a_profile = config.profiles.contains_key(name);
+    let names_a_task = config
+        .profiles
+        .values()
+        .any(|declared| declared.tasks.iter().any(|t| t.name == name));
+    if names_a_profile && !names_a_task {
+        *profile = task.take();
+    }
+}
+
+fn run_with(mut cli: Cli) -> Result<ExitCode> {
     let current = std::env::current_dir().context("cannot read current directory")?;
     let drovefile = match &cli.file {
         Some(path) => path.clone(),
         None => find_drovefile(&current)?,
     };
     let compiled = compile(&drovefile)?;
+    disambiguate_run_positional(&mut cli, &compiled.config);
 
     if matches!(cli.command, Some(Command::Ls)) {
         return ls_command(&cli, &compiled.config, cli.json);
@@ -957,6 +983,58 @@ profile("default", workspaces = [control])
         assert!(cli.command.is_none());
         assert_eq!(cli.profile_arg.as_deref(), Some("monitoring"));
         assert_eq!(positional_profile(&cli), Some("monitoring"));
+    }
+
+    #[test]
+    fn run_disambiguates_a_bare_profile_name_from_a_task_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\", tasks = [task(name = \"scaffold\", run = [\"true\"])])\n\
+             profile(name = \"monitoring\")",
+        )
+        .expect("write Drovefile");
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+
+        // `drove run monitoring`: the bare word names a profile and no
+        // declared task, so it is reinterpreted as the profile.
+        let mut cli = Cli::try_parse_from(["drove", "run", "monitoring"]).expect("parse");
+        disambiguate_run_positional(&mut cli, &compiled.config);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                task: None,
+                profile: Some(ref name),
+                ..
+            }) if name == "monitoring"
+        ));
+
+        // `drove run scaffold`: the bare word names a task, so it stays put
+        // even though the file happens to also declare a `default` profile.
+        let mut cli = Cli::try_parse_from(["drove", "run", "scaffold"]).expect("parse");
+        disambiguate_run_positional(&mut cli, &compiled.config);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                task: Some(ref name),
+                profile: None,
+                ..
+            }) if name == "scaffold"
+        ));
+
+        // `drove run scaffold monitoring`: both positionals already given,
+        // so there is nothing to disambiguate.
+        let mut cli =
+            Cli::try_parse_from(["drove", "run", "scaffold", "monitoring"]).expect("parse");
+        disambiguate_run_positional(&mut cli, &compiled.config);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                task: Some(ref task),
+                profile: Some(ref profile),
+                ..
+            }) if task == "scaffold" && profile == "monitoring"
+        ));
     }
 
     #[test]

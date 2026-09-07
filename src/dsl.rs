@@ -407,12 +407,20 @@ fn resolve_profiles(raw_profiles: Vec<JsonValue>, repo_root: &Path) -> Result<Ve
             .unwrap_or_default();
         let mut session = raw
             .get("session")
-            .and_then(JsonValue::as_str)
-            .map(str::to_owned);
+            .map(|value| {
+                value.as_str().map(str::to_owned).with_context(|| {
+                    format!("profile `{name}` declares `session` that is not a string")
+                })
+            })
+            .transpose()?;
         let mut backend = raw
             .get("backend")
-            .and_then(JsonValue::as_str)
-            .map(str::to_owned);
+            .map(|value| {
+                value.as_str().map(str::to_owned).with_context(|| {
+                    format!("profile `{name}` declares `backend` that is not a string")
+                })
+            })
+            .transpose()?;
 
         if let Some(extends) = raw.get("extends").and_then(JsonValue::as_str) {
             let base = resolved
@@ -1075,6 +1083,32 @@ profile(name = "overrides", extends = "default", session = "own-session")
         let overrides = compiled.config.profile("overrides").expect("overrides");
         assert_eq!(overrides.session.as_deref(), Some("own-session"));
         assert_eq!(overrides.backend.as_deref(), Some("herdr"));
+    }
+
+    #[test]
+    fn profile_rejects_a_non_string_session() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\", session = 42)",
+        )
+        .expect("write fixture");
+
+        let error = compile(&directory.path().join("Drovefile")).expect_err("non-string session");
+        assert!(error.to_string().contains("`session` that is not a string"));
+    }
+
+    #[test]
+    fn profile_rejects_a_non_string_backend() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\", backend = 42)",
+        )
+        .expect("write fixture");
+
+        let error = compile(&directory.path().join("Drovefile")).expect_err("non-string backend");
+        assert!(error.to_string().contains("`backend` that is not a string"));
     }
 
     #[test]
