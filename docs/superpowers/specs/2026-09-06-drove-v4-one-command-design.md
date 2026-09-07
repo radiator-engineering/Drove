@@ -214,3 +214,65 @@ Issue #29. `executor::down` calls `close_pane` for every recorded pane when `--p
 3. Ordering stays: hooks, detach/close, save, then D47 session stop.
 
 Tests: unit test in `src/executor.rs` with a fake backend whose `close_pane` fails for one id, asserting every id is detached, state is saved, and the report carries the failure; end-to-end test in `tests/cli.rs` with a state file that records a pane the fake session lacks, asserting `drove down --purge` exits 0, prints the `pruned` line, and the state file is empty afterwards; one test with the session unreachable asserting the warning and the D47 stop still running.
+
+## 10. Amendment: plan from the live session (D51)
+
+Audit findings (`.context/reports/audit-summary.md`, group A). Every path that builds a plan or acts on a backend id must take its picture of the session after the session is known to be the one that will receive the work, and one transient failure must not turn into "not running".
+
+**Decision D51.**
+
+1. `up`: when `ensure_session` reports it started the session (not `Running`), `up_command` re-fetches the snapshot, re-runs `prune_missing`, saves, and re-plans before applying. The report gains `"session_started": true`. A plan built before the start is discarded.
+2. `HerdrClient::snapshot`: a failing `pane.process_info` call leaves that pane's `process_info` as `None` and continues; only the `session.snapshot` call decides reachability. A `status --json` report lists such panes under `"process_info_unavailable": [ids]`.
+3. `caller_pane_id` is set only when the value of `HERDR_PANE_ID` is one of the snapshot's pane ids; otherwise it is `None` and a pane declaring `adopt = "caller"` plans as a normal create with reason `caller pane not in session`.
+4. `lint` opens the backend, fetches the snapshot and prunes exactly as `plan` does before answering `is_live`; when the backend is unreachable it says so and treats nothing as live.
+5. `LocalState::load`: a file that exists but does not deserialize is renamed to `<path>.corrupt-<rfc3339>` with a printed warning, and loading continues from empty. A missing `schema_version` is tolerated the same way as today's `#[serde(default)]` fields.
+6. Target name `default`: `select::resolve` normalises a resolved name of exactly `default` (from any level) to `None`, so the socket path is Herdr's bare `~/.config/herdr/herdr.sock`. The `default` special case in `resolve_socket_path` stays as belt and braces.
+7. `stop_failed_because_not_running` scans the stream line by line for the first line that parses as JSON with a `code`, instead of requiring the whole trimmed stream to parse.
+8. Harness: the fake Herdr used by `tests/cli.rs` and the unit tests in `src/backend/herdr.rs` can be scripted to answer any method with `{"error": {"code": "...", "message": "..."}}`; the tests for 1 and 2 use it.
+
+Tests: `up` against an unreachable target with non-empty stale state creates every declared resource and never calls focus on a stale id; snapshot with one failing `pane.process_info` still returns the other panes; caller env id absent from the snapshot leads to a create, not an adopt; `lint` prunes; corrupt state file is renamed and the command proceeds; `--session default`, `DROVE_SESSION=default`, `herdr.session("default")` and ambient `HERDR_SESSION=default` all resolve to the bare socket; stop output with a leading non-JSON line is still recognised.
+
+## 11. Amendment: apply records progress as it happens (D52)
+
+Audit findings, group B. `apply_plan_gated` applies actions with `?`, so the first backend error discards every id created so far; `record_ownership` never runs and the retry duplicates the resources.
+
+**Decision D52.**
+
+1. Ownership is recorded and state saved after each successful action, in the same loop, using the current `record_ownership` logic split per action. A killed process leaves state describing exactly what was created.
+2. A failing action does not abort the loop. Its error is collected into `ApplyReport::failed: Vec<{action, error}>`; actions that depend on the failed one (a tab in a workspace whose create failed, a pane in a tab whose create failed, a task `after` a failed task) are skipped and reported as `skipped: depends on <id>`. Independent actions continue.
+3. `up` exits 1 when any action failed, after printing one line per failure and per skip, and after saving. The next `up` plans only what is still missing.
+4. `status` lists journal entries with `completed: false` as `interrupted <action> (<digest>)`, and `--json` reports them under `"interrupted"`. `run` of the same task prints `previous run of <task> did not finish; rerunning` before executing.
+
+Tests: fake backend failing on the second of three creates leaves the first recorded and the third applied when independent, or skipped when dependent; a rerun plans only the failed one; the exit code is 1 with both lines printed; `status` shows an interrupted journal entry.
+
+## 12. Amendment: the planner never reports success for an edit it cannot apply, and detects command drift (D53, D54)
+
+Audit findings, groups C and D. `cwd`, `env` and `on_start` changes on a pane, and `cwd`/`env` on a workspace, plan as a label rename that changes nothing live and record the new digest as converged. Pane reorder and split-direction changes plan as `SetRatio` alone. Nothing compares what a pane runs to what it declares.
+
+**Decision D53.**
+
+1. Pane `cwd` or `env` change: plans as destructive `ClosePane` + `SplitPane` with reason `cwd changed; a pane cannot change directory in place` (or `env changed; ...`), gated exactly like the D22 placement move. Exception: a pane with a `serve` command, when the Herdr `run_command` verb accepts a working directory, plans as `RestartCommand` with the new cwd instead; the worker verifies the verb's parameters against `herdr api schema --json` and documents the outcome in the PR.
+2. Workspace `cwd` or `env` change: plans as `RenameWorkspace` plus, for each pane in the workspace that inherits the changed value, the pane rule above. The reason names the workspace.
+3. Pane `on_start` change: no backend action; the new digest is recorded and the plan prints `on_start changed for <pane>; runs on next create`.
+4. Pane reorder or split-direction change with the same set of panes: plans as `Conflict` with reason `cannot reorder panes or change the split in place; remove the tab and re-add it`. `SetRatio` is emitted only when the pane order and split direction are unchanged.
+5. Any `RenamePane` or `RenameWorkspace` action carries only a label change; the planner asserts this and emits `Conflict` with reason `unsupported change: <fields>` for any other digest difference it cannot map to a verb.
+
+**Decision D54.**
+
+1. For every pane with a `serve` command whose backend reports `process_info`, `plan` compares `process_info.command` to the declared argv. Normalisation: trailing whitespace trimmed, a leading `sh -c` / `bash -c` / `zsh -c` wrapper unwrapped, and comparison on the argv vector. A pane whose `process_info` is `None` (shell idle, or unavailable per D51) counts as drifted when a `serve` command is declared.
+2. A mismatch plans `RestartCommand` with reason `drifted: running <observed>` (or `drifted: nothing running`), regardless of the recorded digest. `status` shows the pane as `drift` and `--json` reports `"drifted": [{id, declared, observed}]`.
+3. `up` applies it like any `RestartCommand`. No new flag; a user who wants a pane left alone removes its `serve`.
+
+Tests: each edit case in the audit's table (`.context/reports/audit-planner.md` section A) has a planner test asserting the action and reason; e2e `up` after a cwd edit shows `[destructive]` and refuses without approval; drift test with a fake `process_info` returning a different command emits `RestartCommand`; `None` with a declared `serve` emits it too; a matching command emits nothing.
+
+## 13. Amendment: identity beyond the id string (D55)
+
+Audit findings, group E. Herdr reuses ids after a restart, and the state file is keyed by repo path only, so a resource is treated as the same one whenever its id string still exists.
+
+**Decision D55.**
+
+1. `ManagedProfile` gains `target: Option<{backend, session}>`, the resolved backend id and session name (`None` for an unnamed session) at the last save. On load, a profile whose `target` differs from the resolved one is treated as empty for this run with the line `state recorded for <old>; starting fresh for <new>`, and overwritten on the next save. A profile with no `target` is stamped with the current one on first load.
+2. `ManagedResource` gains `label: Option<String>` and `cwd: Option<String>`, recorded at apply time from what Drove sent. `prune_missing` also drops a workspace or tab whose live label differs from the recorded one and whose recorded label is the one Drove set (a user rename is distinguished by the digest still matching; the worker documents the rule), and a pane whose live `cwd` differs from the recorded one. Dropped ids are reported with reason `id reused` instead of `not in session`.
+3. Harness: `tests/herdr_contract.rs` checks the fields Drove reads (`root_pane.tab_id`, `tab.tab_id`, `snapshot.panes[].cwd`, the `session_stop_failed` code) against `herdr api schema --json`, and checks `resolve_socket_path` against the socket column of `herdr session list` for the running default session when Herdr is installed.
+
+Tests: same-id different-label workspace is pruned as reused; same-id same-label is kept; a state file stamped for session `a` used with session `b` plans everything as creates and prints the line; a legacy file is stamped without changing its resources.
