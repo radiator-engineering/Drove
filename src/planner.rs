@@ -287,12 +287,27 @@ fn effective_owner<'a>(observed: &'a Observed, profile: &str) -> Option<&'a Owne
         .filter(|owner| owner.profile == profile)
 }
 
+/// Whether `digest` predates the composite per-category format (D53:
+/// [`crate::ir`]'s `composite_digest`) — a pre-D53 single hash, or any other
+/// value that doesn't parse as a JSON object, such as a hand-built digest in
+/// a test. A resource still recorded this way carries no field breakdown to
+/// diff against, so every call site here treats it as converged (a one-time
+/// migration amnesty) rather than guessing what changed from a format that
+/// never said. `cli::up_command` re-stamps the fresh composite digest for a
+/// resource still in this state once it has confirmed the resource is still
+/// live, ending the amnesty without the planner ever reporting an edit for
+/// it; D54's drift check is unaffected either way, since it never reads the
+/// digest at all.
+pub(crate) fn is_legacy_digest(digest: &str) -> bool {
+    !serde_json::from_str::<Value>(digest).is_ok_and(|value| value.is_object())
+}
+
 /// Compares two composite digests (D53: [`crate::ir`]'s `composite_digest`)
-/// category by category, returning the categories whose value differs.
-/// `None` when either side isn't that JSON-object shape — a plain digest
-/// recorded before this feature, or a hand-built one in a test — so callers
-/// can fall back to the pre-D53 whole-digest behavior for that one
-/// transition apply.
+/// category by category, returning the categories whose value differs. Only
+/// meaningful once both sides have already been confirmed to parse as that
+/// shape ([`is_legacy_digest`]) — `None` when either doesn't, so a defensive
+/// caller can still fall back to treating the resource as unclassifiable
+/// rather than panicking.
 fn diff_categories(old: &str, new: &str) -> Option<BTreeSet<String>> {
     let old = serde_json::from_str::<Value>(old).ok()?;
     let new = serde_json::from_str::<Value>(new).ok()?;
@@ -489,14 +504,14 @@ fn plan_workspace(
         Some(observed) => {
             if let Some(owner) = effective_owner(observed, &profile.name)
                 && owner.digest != resource.digest
+                && !is_legacy_digest(&owner.digest)
             {
                 let changed = diff_categories(&owner.digest, &resource.digest);
                 // D53 point 2: only the workspace's own `label`/`cwd`/`env`
                 // warrant a `RenameWorkspace` here — a pane-only change
                 // (the `children` category alone) is already planned by
                 // that pane's own rule and would otherwise fight it with a
-                // spurious rename every run. Unclassifiable (legacy) digests
-                // keep the old always-rename behavior, conservatively.
+                // spurious rename every run.
                 let own_field_changed = changed
                     .as_ref()
                     .map(|changed| changed.iter().any(|key| key != "children"))
@@ -518,8 +533,8 @@ fn plan_workspace(
                 // D53 point 2: `cwd`/`env` changing cascades the pane rule
                 // (point 1) to every pane that inherits it — a pane with no
                 // `cwd` of its own. Only fires when the category breakdown
-                // says so; a legacy digest cascades nothing (it already
-                // renamed, conservatively, above) rather than guessing.
+                // says so (a legacy digest never reaches here at all, see
+                // the `is_legacy_digest` guard above).
                 let place_changed = changed
                     .as_ref()
                     .is_some_and(|changed| changed.contains("cwd") || changed.contains("env"));
@@ -583,6 +598,7 @@ fn plan_group(
     if let Some(observed) = observed
         && let Some(owner) = effective_owner(observed, &profile.name)
         && owner.digest != group.topology_digest
+        && !is_legacy_digest(&owner.digest)
     {
         let backend_id = Some(observed.backend_id.clone());
         let changed = diff_categories(&owner.digest, &group.topology_digest);
@@ -590,8 +606,8 @@ fn plan_group(
         // (the same set of panes) has no backend verb — `SetRatio` would
         // silently apply the new ratio list to the old physical order. A
         // pane added or removed keeps the legacy `RenameTab` + `SetRatio`
-        // pair (right per the audit); so does a digest with no category
-        // breakdown yet (recorded before this feature).
+        // pair (right per the audit); a legacy digest never reaches here at
+        // all (see the `is_legacy_digest` guard above).
         let reordered = changed.as_ref().is_some_and(|changed| {
             changed.contains("order_split") && !changed.contains("pane_set")
         });
@@ -685,6 +701,7 @@ fn plan_pane(
             (Some(_), Some(owner)) => {
                 adopted.insert(resource.name.clone(), true);
                 if owner.digest != resource.digest
+                    && !is_legacy_digest(&owner.digest)
                     && let Some(observed) = observed
                 {
                     push_pane_content_change(&id, observed, owner, resource, ranked);
@@ -786,10 +803,14 @@ fn plan_normal_pane(
         return; // unmanaged: never touched
     };
 
-    if owner.digest == resource.digest && observed.parent.as_deref() == resource.parent.as_deref() {
-        // Converged by digest: still worth a look at what's actually
-        // running, for a serve pane (D54) — a digest only ever compares two
-        // declared states, so it's blind to a change made by hand.
+    let converged_by_digest = owner.digest == resource.digest || is_legacy_digest(&owner.digest);
+    if converged_by_digest && observed.parent.as_deref() == resource.parent.as_deref() {
+        // Converged by digest (or recorded under a pre-D53 digest this
+        // planner can't diff by category, so it's given the benefit of the
+        // doubt — see `is_legacy_digest`): still worth a look at what's
+        // actually running, for a serve pane (D54) — a digest only ever
+        // compares two declared states, so it's blind to a change made by
+        // hand.
         if serves {
             check_drift(id, resource, observed, ranked);
         }
@@ -930,22 +951,11 @@ fn push_pane_content_change(
     ranked: &mut Vec<RankedAction>,
 ) {
     let backend_id = Some(observed.backend_id.clone());
+    // Both call sites already guard `!is_legacy_digest(&owner.digest)`
+    // before reaching here, so this only defends against a future caller
+    // that doesn't: never plan an edit against a digest this planner can't
+    // actually diff by category.
     let Some(changed) = diff_categories(&owner.digest, &resource.digest) else {
-        if pane_serves(resource) {
-            push_restart_command(
-                id,
-                backend_id,
-                "serve command changed; restarting in place".into(),
-                ranked,
-            );
-        } else {
-            push_rename_pane(
-                id,
-                backend_id,
-                "pane label or configuration changed".into(),
-                ranked,
-            );
-        }
         return;
     };
 
@@ -1449,24 +1459,39 @@ mod tests {
 
     #[test]
     fn changed_serve_command_restarts_in_place() {
-        let profile = one_pane_profile();
-        let ir = profile.to_ir();
-        let snapshot = converged_shell(&ir).owned(
-            "pane",
-            "review",
-            "w1:p1",
-            Some("dev/main"),
-            "default",
-            "stale-digest",
-        );
-        let plan = build_plan(&profile, &snapshot).expect("plan");
+        let old = pane_profile(json!({"name": "review", "serve": [["bash"]]}));
+        let new = pane_profile(json!({"name": "review", "serve": [["bash", "-x"]]}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
         assert_eq!(kinds(&plan), [Action::Core(CoreAction::RestartCommand)]);
         assert!(!plan.actions[0].destructive);
         assert_eq!(plan.actions[0].backend_id.as_deref(), Some("w1:p1"));
+        assert_eq!(
+            plan.actions[0].reason,
+            "serve command changed; restarting in place"
+        );
     }
 
     #[test]
-    fn changed_non_serve_pane_is_renamed_not_restarted() {
+    fn changed_non_serve_pane_label_is_renamed_not_restarted() {
+        let old = pane_profile(json!({"name": "review", "label": "old"}));
+        let new = pane_profile(json!({"name": "review", "label": "new"}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
+    }
+
+    // D53 migration: a pane, workspace, or group still recorded under a
+    // pre-D53 digest (a single hash, or any other string that doesn't parse
+    // as the composite category-hash object) can't be diffed by category, so
+    // it must not be misread as "everything changed" and recreated or
+    // restarted — see `is_legacy_digest`. The controller flagged this after
+    // review: every existing state file records the old format, and the
+    // first `up`/`plan`/`status` after upgrading must not treat that alone
+    // as an edit.
+
+    #[test]
+    fn legacy_pane_digest_is_treated_as_converged_not_changed() {
         let profile = profile_from(json!({
             "name": "default",
             "workspaces": [{
@@ -1484,7 +1509,90 @@ mod tests {
             "stale-digest",
         );
         let plan = build_plan(&profile, &snapshot).expect("plan");
-        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
+        assert!(
+            plan.actions.is_empty(),
+            "a legacy pane digest must not be read as a change: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_digest_is_treated_as_converged_not_changed() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "a",
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        let snapshot = Snapshot::default()
+            .owned("workspace", "dev", "w1", None, "default", "stale-digest")
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                group_digest(&ir, "dev/main"),
+            )
+            .owned(
+                "pane",
+                "review",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&ir, "review"),
+            );
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(
+            plan.actions.is_empty(),
+            "a legacy workspace digest must not be read as a change: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_group_digest_is_treated_as_converged_not_changed() {
+        let profile = two_pane_group("a", "b");
+        let ir = profile.to_ir();
+        let snapshot = Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(&ir, "workspace", "dev"),
+            )
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                "stale-digest",
+            )
+            .owned(
+                "pane",
+                "a",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&ir, "a"),
+            )
+            .owned(
+                "pane",
+                "b",
+                "w1:p2",
+                Some("dev/main"),
+                "default",
+                pane_digest(&ir, "b"),
+            );
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(
+            plan.actions.is_empty(),
+            "a legacy group topology digest must not be read as a change: {plan:?}"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::{
         ExecutionContext, HostCommandRunner, TaskOutcome, UpOutcome, down, list_tasks,
         run_named_task, up,
     },
+    ir::Ir,
     model::{DroveConfig, Profile},
     planner::{Action, CoreAction, Plan, SyncStatus, build_plan},
     state::LocalState,
@@ -691,6 +692,39 @@ fn down_command(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Rewrites every workspace, pane, and placement digest in `managed` still
+/// recorded under the pre-D53 single-hash format to the resource's current
+/// composite digest, when that resource is still declared in `ir` — so the
+/// D53 migration amnesty (`crate::planner::is_legacy_digest`) ends after one
+/// `up` instead of persisting forever. A resource no longer declared is left
+/// alone; the normal detach/prune path handles it. Returns whether anything
+/// changed, so the caller knows whether to save.
+fn restamp_legacy_digests(managed: &mut crate::state::ManagedProfile, ir: &Ir) -> bool {
+    let mut changed = false;
+    for (id, resource) in &mut managed.resources {
+        if !crate::planner::is_legacy_digest(&resource.digest) {
+            continue;
+        }
+        let fresh = match resource.kind.as_str() {
+            "placement" => ir
+                .placements
+                .iter()
+                .find(|group| &group.id == id)
+                .map(|group| group.topology_digest.clone()),
+            kind => ir
+                .resources
+                .iter()
+                .find(|candidate| candidate.kind == kind && &candidate.name == id)
+                .map(|candidate| candidate.digest.clone()),
+        };
+        if let Some(fresh) = fresh {
+            resource.digest = fresh;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// `drove up` / `drove [PROFILE]` (D43): start the session if it is not
 /// running, apply the plan (tasks and backend actions), bring the target
 /// workspace to the front, and — from a terminal outside Herdr — attach to the
@@ -719,11 +753,21 @@ fn up_command(
     // session and applies against local state as recorded, unchanged from
     // today. The same probe result is reused for the Radiator reachability
     // check below, rather than reaching the backend a second time.
+    let ir = profile.to_ir();
     let live_snapshot = client.snapshot();
     if let Ok(live_snapshot) = &live_snapshot {
         let managed = state.profile(profile_arg).cloned().unwrap_or_default();
-        let (pruned, dropped) = crate::state::prune_missing(&managed, live_snapshot);
-        if !dropped.is_empty() {
+        let (mut pruned, dropped) = crate::state::prune_missing(&managed, live_snapshot);
+        // D53 migration: a resource confirmed still live (it survived the
+        // prune above) but still recorded under the pre-D53 single-hash
+        // digest can't be diffed by category, so the planner treats it as
+        // converged (`planner::is_legacy_digest`) rather than guessing what
+        // changed from a format that carries no field breakdown at all. That
+        // has to end after one `up`, not stay true forever, so re-stamp the
+        // fresh composite digest here — outside the plan entirely, so it
+        // never shows up as an edit.
+        let restamped = restamp_legacy_digests(&mut pruned, &ir);
+        if !dropped.is_empty() || restamped {
             state.profiles.insert(profile_arg.to_owned(), pruned);
             state.save()?;
         }
@@ -851,7 +895,7 @@ fn up_command(
     let report = up(
         client.as_ref(),
         profile,
-        &profile.to_ir(),
+        &ir,
         &plan,
         &ctx,
         &mut state,

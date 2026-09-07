@@ -2134,3 +2134,56 @@ fn e2e_up_after_a_cwd_edit_shows_destructive_and_refuses_without_approval() {
             "warning: a destructive action needs approval; re-run with --yes to apply it",
         ));
 }
+
+// D53 migration: every state file recorded before this feature carries the
+// old single-hash digest, which can't be diffed by category. `up` must not
+// read that alone as an edit to a converged layout — flagged by the
+// controller on review — and must re-stamp the fresh composite digest so
+// this one-time amnesty doesn't persist forever.
+#[test]
+fn up_treats_a_legacy_digest_as_converged_and_restamps_it() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    // Unchanged from what the (legacy) state file already recorded: nothing
+    // here actually needs to change.
+    fs::write(&drovefile, drovefile_with_pane_cwd("a")).expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_review_pane(&state_home, directory.path(), "stale-digest");
+
+    let socket = directory.path().join("herdr-restamp.sock");
+    serve_cwd_edit_layout(socket.clone());
+    Command::cargo_bin("drove")
+        .expect("binary")
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "up",
+            "--no-focus",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "already running, brought to front",
+        ));
+
+    let state_path = state_file_path(&state_home, directory.path());
+    let saved: Value = serde_json::from_slice(&fs::read(&state_path).expect("read state after up"))
+        .expect("state JSON");
+    for id in ["dev", "dev/main", "review"] {
+        let digest = saved["profiles"]["default"]["resources"][id]["digest"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{id} digest string: {saved}"));
+        assert_ne!(
+            digest, "stale-digest",
+            "the legacy digest for `{id}` should have been re-stamped: {saved}"
+        );
+        assert!(
+            digest.starts_with('{'),
+            "the re-stamped digest for `{id}` should be the composite JSON shape: {digest}"
+        );
+    }
+}
