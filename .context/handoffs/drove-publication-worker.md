@@ -1,0 +1,18 @@
+# Drove publication worker — v0.1.3
+
+You are a spawned PR worker, Codex gpt-5.5/high, in direct execution mode.
+Worktree: /Users/jjmartin/Development/Drove-worktrees/publish-013
+Branch: release/0.1.3-native-recovery. Initial accepted head9b48d3a, base origin/main1b71bf0.
+Controller: herdr --session drove agent prompt w1:p1. Reviewer: w7Q:p1.
+
+User explicitly authorized pushing all accepted local changes, PR review, controller merge, patch release and public verification. Follow .context/PR-WORKFLOW.md until PR DONE. This brief carries the same established PR-worker exception as pr34-identity: you MAY commit ONLY on your own branch in this external worktree. Never commit on main, never merge a PR, never create/push a release tag. Do not append to the log. Do not start agents. No attribution trailers.
+
+Own the existing seven accepted repair commits through9b48d3a plus version0.1.3 preparation and any review/CI/packaging fixes necessary for that release. Verify tags/registry; controller independently found latest0.1.2. Update Cargo.toml/Cargo.lock/CHANGELOG.md, package contents, release/install docs as needed. Keep APIs scoped to the audited repair. Read .context/reports/drove-consumer-repair.md and source; preserve inherited coordination artifacts. Do not replace upstream eventlog with another local runtime. Eventlog0.2.0 publication is owned by upstream controller; coordinate any dependency link/version requirement through Drove controller.
+
+Claimed editing scope in this external worktree: files changed in origin/main..9b48d3a, src,tests,examples,scripts,.github,Cargo.toml,Cargo.lock,CHANGELOG.md,dist-workspace.toml,README.md,AGENTS.md,docs and native consumer config/adapter as required by review. No production .context/events.jsonl, no root checkout/state/pane/reactor edits. Report scope expansion. Controller retains root log ownership and claims only your brief in that root; your code changes are isolated outside its root.
+
+First run cargo fmt --all --check and relevant package checks; prior validation was changed-file rustfmt, so fix genuine all-file format failures required by CI. Run full tests, strict Clippy, docs warnings, cargo package/dry-run verification (check examples/.context assets and frozen fixtures are included), and live Herdr smoke when relevant. Source has331 passing tests plus live hook/restart/timeout/resume proofs. CI scripts/smoke-herdr.sh may be stale; investigate failures, don't weaken tests. The accepted implementation intentionally refuses legacy direct-exec pane restarts and creates new shell-backed panes.
+
+Push branch and open ONE release PR including accepted fixes and version0.1.3. Description must state concrete behavior, verification, known limits. Diff exceeds2000 lines: explicitly request @cubic-dev-ai review this. Notify controller/reviewer of URL and head. Stay alive, poll comments/checks every60s, address or answer every inline review thread and resolve, keep branch current with origin/main, request reviewer re-review after changes. Same-account reviewer posts COMMENTED review ending APPROVE, per pr-review-template; count that documented verdict. Do not bypass checks. Only finish PR DONE when green, current and approved with all threads handled.
+
+Controller will append/commit these publication briefs in root shortly; before final approval ensure the local main coordination-only commit is included (merge local main into your own branch if necessary; never modify local main). Ask controller if unclear. Root will not edit production source while review runs. Write any operational report outside repo and send its path. Remain available for release publication failures after controller merge.
