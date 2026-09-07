@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::{
-    backend::{Backend, herdr, radiator, select},
+    backend::{Backend, SessionState, herdr, radiator, select},
     dsl::{compile, find_drovefile},
     executor::{
         ExecutionContext, HostCommandRunner, TaskOutcome, UpOutcome, down, list_tasks,
@@ -266,11 +266,11 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         return run_command(profile, &repo_root, task.as_deref(), *yes, cli.json);
     }
 
-    if matches!(cli.command, Some(Command::Lint { .. })) {
-        return lint_command(profile, &repo_root, cli.json);
-    }
-
     let (backend_id, target) = resolve_backend(&cli, &compiled.config, profile);
+
+    if matches!(cli.command, Some(Command::Lint { .. })) {
+        return lint_command(profile, &backend_id, &target, &repo_root, cli.json);
+    }
 
     if let Some(Command::Down { purge, yes, .. }) = &cli.command {
         return down_command(
@@ -338,7 +338,16 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
     // restarted. `plan` and `status` never write the prune back.
     let managed = state.profile(&profile.name).cloned().unwrap_or_default();
     let (pruned, dropped) = crate::state::prune_missing(&managed, &live_snapshot);
-    let snapshot = pruned.to_snapshot(&profile.name, client.caller_pane_id());
+    // D51 point 3: `HERDR_PANE_ID` (or Radiator's `RADIATOR_PANE_ID`) is
+    // only trusted when it names a pane the live snapshot just fetched
+    // actually lists — a stale value (a closed pane whose id was reused, or
+    // the var leaking into an unrelated shell) is dropped, so a pane
+    // declaring `adopt = "caller"` plans as a normal create instead of
+    // adopting a phantom.
+    let caller_pane_id = client
+        .caller_pane_id()
+        .filter(|id| live_snapshot.panes.iter().any(|pane| &pane.pane_id == id));
+    let snapshot = pruned.to_snapshot(&profile.name, caller_pane_id);
     let plan = build_plan(profile, &snapshot)?;
 
     // Only `status` and `plan` reach here: Render/Run/Down/Lint/Ls returned
@@ -358,6 +367,7 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         cli.json,
         is_status.then_some(dropped.as_slice()),
         is_status.then_some(interrupted.as_slice()),
+        is_status.then_some(live_snapshot.process_info_unavailable.as_slice()),
     )?;
     print_warnings(&compiled.warnings);
     Ok(if plan.status == SyncStatus::InSync {
@@ -471,12 +481,30 @@ fn run_command(
 
 /// `drove lint` (D26, D34): a stale `was =` that matches nothing live, and a
 /// task with no `check`. Minimal on purpose — always exits 0, warnings only.
-fn lint_command(profile: &Profile, repo_root: &Path, json: bool) -> Result<ExitCode> {
+/// D51 point 4: `is_live` used to answer purely from local state, so a
+/// session that was restarted since the last `up`/`plan` (wiping Herdr's
+/// workspaces and ids) still looked live here. `lint` now opens the backend,
+/// fetches its snapshot and prunes exactly as `plan`/`status` do first; when
+/// the backend is unreachable, it says so and treats nothing as live, the
+/// same as the unpruned fallback before this fix.
+fn lint_command(
+    profile: &Profile,
+    backend_id: &str,
+    target: &select::Target,
+    repo_root: &Path,
+    json: bool,
+) -> Result<ExitCode> {
     let state = LocalState::load(repo_root)?;
-    let snapshot = state
-        .profile(&profile.name)
-        .map(|managed| managed.to_snapshot(&profile.name, None))
-        .unwrap_or_default();
+    let managed = state.profile(&profile.name).cloned().unwrap_or_default();
+    let client = select::open(backend_id, target)?;
+    // An unreachable backend leaves nothing pruned-in as live, the same
+    // conservative fallback `up_command` uses when the target isn't
+    // reachable yet: `is_live` below then answers `false` for every `was =`.
+    let (managed, backend_unreachable) = match client.snapshot() {
+        Ok(live) => (crate::state::prune_missing(&managed, &live).0, false),
+        Err(_) => (crate::state::ManagedProfile::default(), true),
+    };
+    let snapshot = managed.to_snapshot(&profile.name, None);
 
     let is_live = |name: &str| {
         snapshot
@@ -487,6 +515,11 @@ fn lint_command(profile: &Profile, repo_root: &Path, json: bool) -> Result<ExitC
     };
 
     let mut warnings = Vec::new();
+    if backend_unreachable {
+        warnings.push(format!(
+            "cannot reach {backend_id}; every `was =` is reported as matching nothing live"
+        ));
+    }
     for workspace in &profile.workspaces {
         if let Some(was) = &workspace.was
             && !is_live(was)
@@ -683,11 +716,67 @@ fn up_command(
             state.save()?;
         }
     }
+    // D51 point 3: only trust `HERDR_PANE_ID`/`RADIATOR_PANE_ID` when the
+    // live snapshot just fetched (if any) actually lists it; with no live
+    // snapshot yet (the target wasn't reachable), there is nothing to
+    // confirm it against, so it is not trusted here either.
+    let caller_pane_id = client.caller_pane_id().filter(|id| {
+        live_snapshot
+            .as_ref()
+            .is_ok_and(|live| live.panes.iter().any(|pane| &pane.pane_id == id))
+    });
     let snapshot = state
         .profile(profile_arg)
-        .map(|managed| managed.to_snapshot(profile_arg, client.caller_pane_id()))
+        .map(|managed| managed.to_snapshot(profile_arg, caller_pane_id))
         .unwrap_or_default();
-    let plan = build_plan(profile, &snapshot)?;
+    let mut plan = build_plan(profile, &snapshot)?;
+
+    let is_herdr = backend_id == select::HERDR_BACKEND;
+    // The session name for the headless start and the attach.
+    let session = target.name.as_deref().unwrap_or("default");
+
+    // D51 point 1: when the target wasn't reachable at the up-front probe
+    // above, `plan` was built from local state exactly as recorded before
+    // this run — nothing has pruned it. Herdr wipes every workspace and
+    // restarts its id counter on a fresh start (issue 24), so if starting
+    // the session here finds it wasn't already running, that picture is
+    // stale: re-fetch the now-live snapshot, re-run `prune_missing`, save,
+    // and rebuild the plan before the `Conflict` check or anything is
+    // applied, discarding the plan built above. Only attempted when the
+    // up-front probe found the target unreachable: when it already
+    // succeeded, the prune above already ran against a live snapshot and
+    // `ensure_session` is guaranteed to find the session already `Running`
+    // (no restart to react to), so there is nothing to redo here — this
+    // also avoids a second, redundant `ensure_session` call on that path,
+    // since `up()` below always makes its own (idempotently, against the
+    // now-running session, since it also owns reporting `CannotStart`
+    // uniformly when starting fails).
+    let mut session_started = false;
+    if is_herdr
+        && live_snapshot.is_err()
+        && let Some(ext) = client.herdr()
+        && let SessionState::Started = ext.ensure_session(session)?
+    {
+        session_started = true;
+        if let Ok(live) = client.snapshot() {
+            let managed = state.profile(profile_arg).cloned().unwrap_or_default();
+            let (pruned, dropped) = crate::state::prune_missing(&managed, &live);
+            if !dropped.is_empty() {
+                state.profiles.insert(profile_arg.to_owned(), pruned);
+            }
+            state.save()?;
+            // D51 point 3: same cross-check as above, against the snapshot
+            // just fetched from the now-started session.
+            let caller_pane_id = client
+                .caller_pane_id()
+                .filter(|id| live.panes.iter().any(|pane| &pane.pane_id == id));
+            let snapshot = state
+                .profile(profile_arg)
+                .map(|managed| managed.to_snapshot(profile_arg, caller_pane_id))
+                .unwrap_or_default();
+            plan = build_plan(profile, &snapshot)?;
+        }
+    }
 
     // A `Conflict` never applies anything and exits 2 (D43 step 3).
     if plan
@@ -695,11 +784,10 @@ fn up_command(
         .iter()
         .any(|action| action.kind == Action::Core(CoreAction::Conflict))
     {
-        print_plan(&plan, json, None, None)?;
+        print_plan(&plan, json, None, None, None)?;
         return Ok(ExitCode::from(2));
     }
 
-    let is_herdr = backend_id == select::HERDR_BACKEND;
     // A Radiator hub has no headless-start verb (D37): if it is unreachable,
     // fail with the hub name rather than applying against a dead socket.
     if !is_herdr && live_snapshot.is_err() {
@@ -720,9 +808,8 @@ fn up_command(
         return Ok(ExitCode::from(1));
     }
 
-    // The session name for the headless start and the attach; a workspace to
-    // bring to the front (the flag, else the profile's first workspace).
-    let session = target.name.as_deref().unwrap_or("default");
+    // The workspace to bring to the front: the flag, else the profile's
+    // first workspace.
     let focus_target = workspace.or_else(|| profile.workspaces.first().map(|w| w.name.as_str()));
     // `--json` implies `--no-focus` (D43 step 4).
     let do_focus = !no_focus && !json;
@@ -762,7 +849,7 @@ fn up_command(
         return Ok(ExitCode::from(1));
     }
 
-    print_up_summary(profile, &report, json)?;
+    print_up_summary(profile, &report, session_started, json)?;
     // D52 point 3: one line per failure and per skip, printed after the
     // summary and after everything already applied has been saved.
     if !json {
@@ -800,7 +887,11 @@ fn up_command(
 
 /// The `--json` body for the `up` summary (D43 step 5), built pure so its
 /// shape is testable without capturing stdout.
-fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> serde_json::Value {
+fn up_summary_json(
+    profile: &Profile,
+    report: &crate::executor::UpReport,
+    session_started: bool,
+) -> serde_json::Value {
     let tasks: Vec<_> = report
         .tasks
         .iter()
@@ -824,6 +915,7 @@ fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> ser
         "tasks": tasks,
         "failed": failed,
         "skipped": skipped,
+        "session_started": session_started,
     });
     match &report.outcome {
         UpOutcome::Reconciled {
@@ -852,10 +944,11 @@ fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> ser
 fn print_up_summary(
     profile: &Profile,
     report: &crate::executor::UpReport,
+    session_started: bool,
     json: bool,
 ) -> Result<()> {
     if json {
-        println!("{}", up_summary_json(profile, report));
+        println!("{}", up_summary_json(profile, report, session_started));
         return Ok(());
     }
     match &report.outcome {
@@ -1019,16 +1112,17 @@ fn backend_socket_display(backend_id: &str, target: &select::Target) -> PathBuf 
     }
 }
 
-/// Prints a plan, or (from `status`) a plan plus the identities D48 pruned
-/// from local state before it was built — dropped because their recorded
-/// backend id no longer exists in the live snapshot, so the plan below now
-/// recreates them. `pruned` is `None` for every caller but `status`, so
-/// `plan`'s JSON output carries no `"pruned"` key and is unchanged.
+/// recreates them — a journal entry an earlier apply began but never
+/// finished (D52 point 4), and (D51 point 2) the pane ids whose
+/// `process_info` this run's snapshot could not fetch. Each is `None` for
+/// every caller but `status`, so `plan`'s JSON output carries none of those
+/// keys and is unchanged.
 fn print_plan(
     plan: &Plan,
     json: bool,
     pruned: Option<&[String]>,
     interrupted: Option<&[(&str, &str)]>,
+    process_info_unavailable: Option<&[String]>,
 ) -> Result<()> {
     if json {
         let mut value = serde_json::to_value(plan)?;
@@ -1043,6 +1137,12 @@ fn print_plan(
                     .collect();
                 object.insert("interrupted".into(), serde_json::json!(rows));
             }
+            if let Some(process_info_unavailable) = process_info_unavailable {
+                object.insert(
+                    "process_info_unavailable".into(),
+                    serde_json::json!(process_info_unavailable),
+                );
+            }
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -1054,6 +1154,9 @@ fn print_plan(
     // (a killed `run`/hook) is surfaced here instead of silently retried.
     for (action, digest) in interrupted.unwrap_or_default() {
         println!("interrupted {action} ({digest})");
+    }
+    for pane_id in process_info_unavailable.unwrap_or_default() {
+        println!("warning: could not read process info for pane {pane_id}");
     }
     print!("{}", plan.render());
     Ok(())
@@ -1558,6 +1661,7 @@ profile("default", workspaces = [control])
                 changed: 1,
                 tasks_run: 3,
             }),
+            true,
         );
         assert_eq!(object["profile"], "dev");
         assert_eq!(object["status"], "in_sync");
@@ -1565,6 +1669,7 @@ profile("default", workspaces = [control])
         assert_eq!(object["changed"], 1);
         assert_eq!(object["tasks_run"], 3);
         assert_eq!(object["focused"], "w1");
+        assert_eq!(object["session_started"], true);
     }
 
     #[test]
@@ -1606,8 +1711,9 @@ profile("default", workspaces = [control])
             name: "dev".into(),
             ..Default::default()
         };
-        let object = up_summary_json(&profile, &report(UpOutcome::AlreadyRunning));
+        let object = up_summary_json(&profile, &report(UpOutcome::AlreadyRunning), false);
         assert_eq!(object["status"], "already_running");
+        assert_eq!(object["session_started"], false);
         // The reconciled counts are absent in this form.
         assert!(object.get("created").is_none());
     }

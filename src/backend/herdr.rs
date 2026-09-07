@@ -109,6 +109,11 @@ impl HerdrClient {
         self.request("ping", json!({}))
     }
 
+    /// `session.snapshot` decides reachability on its own (D51 point 2): a
+    /// failing `pane.process_info` call for one pane — a race with the pane
+    /// closing between the two round trips, or a transient socket hiccup —
+    /// leaves that pane's `process_info` as `None` and is recorded in
+    /// `process_info_unavailable` instead of failing the whole snapshot.
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
         let result = self.request("session.snapshot", json!({}))?;
         let snapshot = result
@@ -118,9 +123,20 @@ impl HerdrClient {
         let mut snapshot: SessionSnapshot =
             serde_json::from_value(snapshot).context("invalid Herdr session snapshot")?;
         for pane in &mut snapshot.panes {
-            pane.process_info = self.pane_process_info(&pane.pane_id)?;
+            match self.pane_process_info(&pane.pane_id) {
+                Ok(info) => pane.process_info = info,
+                Err(_) => {
+                    pane.process_info = None;
+                    snapshot.process_info_unavailable.push(pane.pane_id.clone());
+                }
+            }
         }
-        snapshot.caller_pane_id = caller_pane_id_from_env();
+        // D51 point 3: only trust `HERDR_PANE_ID` when it names a pane the
+        // snapshot actually lists; a stale value (the pane was closed and
+        // the id reused, or the var leaked into an unrelated shell) is
+        // dropped so `adopt = "caller"` plans as a normal create instead of
+        // adopting a phantom pane.
+        snapshot.caller_pane_id = live_caller_pane_id(caller_pane_id_from_env(), &snapshot.panes);
         Ok(snapshot)
     }
 
@@ -464,6 +480,13 @@ impl Backend for HerdrClient {
         }
     }
 
+    /// Not cross-checked against a live snapshot here — that would cost a
+    /// second `session.snapshot` request on every call, when the caller
+    /// almost always has a freshly fetched one already in hand. D51 point 3
+    /// is enforced instead at each call site in `src/cli.rs` that already
+    /// holds a live `SessionSnapshot`: it filters this method's result
+    /// against that snapshot's `panes`, so a stale or leaked env value that
+    /// names a pane the snapshot doesn't list is dropped.
     fn caller_pane_id(&self) -> Option<String> {
         caller_pane_id_from_env()
     }
@@ -739,24 +762,28 @@ fn run_stop_session(bin: &OsStr, name: &str) -> Result<SessionStop> {
 /// Whether a failed `herdr session stop --json` reports the documented
 /// `session_stop_failed` code (D47) — the only stop failure read as
 /// "already stopped" rather than propagated as an error. Herdr's exact wire
-/// shape for a `--json` CLI failure isn't pinned by the spec, so this checks
-/// both stdout and stderr for a JSON object naming that code either at the
-/// top level (`{"code": "session_stop_failed", ...}`) or nested under
-/// `error` (Herdr's socket API error shape, `{"error": {"code": ...}}`);
-/// text that fails to parse as JSON, or names any other code, does not
-/// count.
+/// shape for a `--json` CLI failure isn't pinned by the spec, so this scans
+/// each stream line by line (D51 point 7) for the first line that parses as
+/// a JSON object naming that code either at the top level
+/// (`{"code": "session_stop_failed", ...}`) or nested under `error`
+/// (Herdr's socket API error shape, `{"error": {"code": ...}}`) — a leading
+/// non-JSON line (a deprecation notice, a channel-update nudge) no longer
+/// hides the JSON payload that follows it. A line that fails to parse as
+/// JSON, or names any other code, does not count.
 fn stop_failed_because_not_running(stdout: &[u8], stderr: &[u8]) -> bool {
     [stdout, stderr].into_iter().any(|bytes| {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return false;
         };
-        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
-            return false;
-        };
-        let code = value
-            .get("code")
-            .or_else(|| value.get("error").and_then(|error| error.get("code")));
-        code.and_then(Value::as_str) == Some("session_stop_failed")
+        text.lines().any(|line| {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                return false;
+            };
+            let code = value
+                .get("code")
+                .or_else(|| value.get("error").and_then(|error| error.get("code")));
+            code.and_then(Value::as_str) == Some("session_stop_failed")
+        })
     })
 }
 
@@ -793,6 +820,12 @@ pub struct SessionSnapshot {
     /// Herdr-managed pane (D8, D24). Not part of the wire payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pane_id: Option<String>,
+    /// Pane ids whose `pane.process_info` call failed during this snapshot
+    /// (D51 point 2) — the pane is still listed under `panes`, just with
+    /// `process_info: None`. Not part of the wire payload; `status --json`
+    /// reports it under `"process_info_unavailable"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process_info_unavailable: Vec<String>,
 }
 
 impl SessionSnapshot {
@@ -884,6 +917,14 @@ impl ExportedLayout {
 
 fn caller_pane_id_from_env() -> Option<String> {
     env::var("HERDR_PANE_ID").ok().filter(|id| !id.is_empty())
+}
+
+/// D51 point 3: only trusts `candidate` (from `HERDR_PANE_ID`) when it names
+/// a pane `panes` actually lists — a stale value (a closed pane whose id was
+/// reused, or the var leaking into an unrelated shell) is dropped rather
+/// than reported as the caller's pane.
+fn live_caller_pane_id(candidate: Option<String>, panes: &[PaneInfo]) -> Option<String> {
+    candidate.filter(|id| panes.iter().any(|pane| &pane.pane_id == id))
 }
 
 fn find_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -1929,6 +1970,136 @@ exit 0"#,
             .expect_err("truncated response");
         assert!(error.to_string().contains("truncated response"));
         server.join().expect("server thread");
+    }
+
+    /// One scripted answer for [`serve_scripted`] (D51 point 8): either a
+    /// `result` value, or `{"error": {"code", "message"}}` — enough to
+    /// exercise a real Herdr API error (a transient `pane.process_info`
+    /// failure, a documented `session_stop_failed`) without a live Herdr.
+    enum FakeAnswer {
+        Result(Value),
+        Error {
+            code: &'static str,
+            message: &'static str,
+        },
+    }
+
+    /// A fake Herdr socket that answers each accepted connection with the
+    /// next entry of `script`, in order, regardless of which method was
+    /// requested — enough to drive a fixed request sequence, since every
+    /// `HerdrClient` request connects fresh per call (D51 point 8). Mirrors
+    /// `tests/cli.rs`'s harness of the same name and shape; the two cannot
+    /// share code across the integration-test/unit-test boundary.
+    fn serve_scripted(path: PathBuf, script: Vec<FakeAnswer>) -> thread::JoinHandle<()> {
+        let listener = bind(&path).expect("bind fake Herdr");
+        thread::spawn(move || {
+            for answer in script {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let response = match answer {
+                    FakeAnswer::Result(result) => json!({"id": request["id"], "result": result}),
+                    FakeAnswer::Error { code, message } => {
+                        json!({"id": request["id"], "error": {"code": code, "message": message}})
+                    }
+                };
+                serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+                stream.get_mut().write_all(b"\n").expect("newline");
+            }
+        })
+    }
+
+    #[test]
+    fn snapshot_reports_a_failed_pane_instead_of_failing_the_whole_snapshot() {
+        // D51 point 2: `pane.process_info` can fail for one pane (a race
+        // with the pane closing between the snapshot and the follow-up
+        // call) without that failure sinking the whole `session.snapshot`.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-partial-process-info.sock");
+        let snapshot = json!({
+            "version": "0.8.2",
+            "protocol": 1,
+            "workspaces": [],
+            "tabs": [],
+            "panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
+            ],
+            "agents": [],
+        });
+        let server = serve_scripted(
+            path.clone(),
+            vec![
+                FakeAnswer::Result(json!({"snapshot": snapshot})),
+                FakeAnswer::Result(json!({"process_info": {}})),
+                FakeAnswer::Error {
+                    code: "pane_not_found",
+                    message: "pane w1:p2 does not exist",
+                },
+            ],
+        );
+
+        let snapshot = HerdrClient::new(path).snapshot().expect("snapshot");
+        server.join().expect("server thread");
+
+        assert_eq!(snapshot.panes.len(), 2);
+        assert_eq!(snapshot.panes[0].process_info, None);
+        assert_eq!(snapshot.panes[1].process_info, None);
+        assert_eq!(snapshot.process_info_unavailable, ["w1:p2"]);
+    }
+
+    fn fake_pane(pane_id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            cwd: None,
+            tokens: std::collections::BTreeMap::new(),
+            process_info: None,
+        }
+    }
+
+    #[test]
+    fn live_caller_pane_id_drops_a_stale_or_absent_candidate() {
+        // D51 point 3: a stale or leaked `HERDR_PANE_ID` (a closed pane
+        // whose id was reused, or the var escaping into an unrelated shell)
+        // must not be reported as the caller's pane when the live snapshot
+        // doesn't actually list it.
+        let panes = [fake_pane("w1:p1")];
+        assert_eq!(
+            live_caller_pane_id(Some("w1:p9".to_owned()), &panes),
+            None,
+            "a pane id absent from the live snapshot must be dropped"
+        );
+        assert_eq!(live_caller_pane_id(None, &panes), None);
+    }
+
+    #[test]
+    fn live_caller_pane_id_keeps_a_candidate_the_snapshot_lists() {
+        let panes = [fake_pane("w1:p1"), fake_pane("w1:p2")];
+        assert_eq!(
+            live_caller_pane_id(Some("w1:p1".to_owned()), &panes),
+            Some("w1:p1".to_owned())
+        );
+    }
+
+    #[test]
+    fn stop_failed_because_not_running_scans_past_a_leading_non_json_line() {
+        // D51 point 7: Herdr sometimes writes a plain warning line to
+        // stdout/stderr ahead of its JSON result; the check must scan every
+        // line rather than require the whole trimmed output to parse as one
+        // JSON value.
+        let stdout =
+            b"warning: legacy session format detected\n{\"code\": \"session_stop_failed\"}\n";
+        assert!(stop_failed_because_not_running(stdout, b""));
+    }
+
+    #[test]
+    fn stop_failed_because_not_running_rejects_an_unrelated_error_code() {
+        let stdout = b"{\"code\": \"pane_not_found\"}\n";
+        assert!(!stop_failed_because_not_running(stdout, b""));
     }
 
     #[cfg(unix)]

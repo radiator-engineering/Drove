@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalState {
+    /// Absent from an older or hand-trimmed state file: tolerated as `0`,
+    /// the same as every other `#[serde(default)]` field here (D51 point 5).
+    #[serde(default)]
     pub schema_version: u32,
     pub repo_root: PathBuf,
     #[serde(default)]
@@ -25,15 +28,54 @@ pub struct LocalState {
 }
 
 impl LocalState {
+    /// Loads local state from `repo_root`'s state file. A file that exists
+    /// but does not deserialize (a partial write from a crash, hand-editing,
+    /// or an older/newer schema shape) is not fatal (D51 point 5): it is
+    /// renamed aside to `<path>.corrupt-<timestamp>` with a printed warning,
+    /// and loading continues from empty, the same as a missing file. A
+    /// missing `schema_version` is tolerated the same way today's
+    /// `#[serde(default)]` fields are — deserialization only fails on a
+    /// field with the wrong shape, not a merely-absent optional one.
     pub fn load(repo_root: &Path) -> Result<Self> {
-        let path = state_path(repo_root);
+        Self::load_from(state_path(repo_root), repo_root)
+    }
+
+    /// The body of [`LocalState::load`], taking the state file path
+    /// explicitly rather than deriving it from `state_path` (which reads a
+    /// process-global env var), so tests can point it at a fixture without
+    /// mutating the environment.
+    fn load_from(path: PathBuf, repo_root: &Path) -> Result<Self> {
         match fs::read(&path) {
-            Ok(bytes) => {
-                let mut state: Self =
-                    serde_json::from_slice(&bytes).context("invalid Drove local state")?;
-                state.path = path;
-                Ok(state)
-            }
+            Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
+                Ok(mut state) => {
+                    state.path = path;
+                    Ok(state)
+                }
+                Err(error) => {
+                    let corrupt_path =
+                        path.with_extension(format!("json.corrupt-{}", filename_safe_timestamp()));
+                    fs::rename(&path, &corrupt_path).with_context(|| {
+                        format!(
+                            "cannot move invalid Drove local state {} aside to {}",
+                            path.display(),
+                            corrupt_path.display()
+                        )
+                    })?;
+                    eprintln!(
+                        "warning: Drove local state at {} was invalid ({error}); moved aside to {} and starting from empty",
+                        path.display(),
+                        corrupt_path.display()
+                    );
+                    Ok(Self {
+                        schema_version: 1,
+                        repo_root: repo_root.to_owned(),
+                        profiles: BTreeMap::new(),
+                        approvals: BTreeSet::new(),
+                        journal: Vec::new(),
+                        path,
+                    })
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 schema_version: 1,
                 repo_root: repo_root.to_owned(),
@@ -301,6 +343,43 @@ pub struct JournalEntry {
     pub completed: bool,
     #[serde(default)]
     pub success: Option<bool>,
+}
+
+/// An RFC 3339 UTC timestamp with `:` replaced by `-` so it is safe in a
+/// filename on every platform this project supports (Windows rejects `:` in
+/// a path component), for the corrupt-state rename in [`LocalState::load`].
+/// No datetime crate is a dependency, so this converts `SystemTime` by hand
+/// (Howard Hinnant's `civil_from_days`, the standard days-since-epoch to
+/// Gregorian-date algorithm).
+fn filename_safe_timestamp() -> String {
+    let now = std::time::SystemTime::now();
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let time_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}Z")
+}
+
+/// Days-since-1970-01-01 to a Gregorian `(year, month, day)`, per Howard
+/// Hinnant's public-domain `civil_from_days` algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 fn state_path(repo_root: &Path) -> PathBuf {
@@ -617,5 +696,54 @@ mod tests {
                 .resources
                 .contains_key("old")
         );
+    }
+
+    #[test]
+    fn load_from_a_missing_file_starts_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let state = LocalState::load_from(path.clone(), Path::new("/repo")).expect("load");
+        assert!(state.profiles.is_empty());
+        assert_eq!(state.path, path);
+    }
+
+    #[test]
+    fn load_from_a_corrupt_file_moves_it_aside_and_starts_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"{not valid json").expect("write corrupt state");
+
+        let state = LocalState::load_from(path.clone(), Path::new("/repo")).expect("load");
+
+        assert!(state.profiles.is_empty());
+        assert!(!path.exists(), "corrupt file should have been moved aside");
+        let siblings: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            siblings
+                .iter()
+                .any(|name| name.starts_with("state.json.corrupt-")),
+            "expected a state.json.corrupt-* sibling, found {siblings:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_a_file_missing_schema_version_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        fs::write(&path, br#"{"repo_root": "/repo"}"#).expect("write state");
+
+        let state = LocalState::load_from(path, Path::new("/repo")).expect("load");
+
+        assert_eq!(state.schema_version, 0);
+        assert!(state.profiles.is_empty());
     }
 }

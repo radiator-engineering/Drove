@@ -127,6 +127,20 @@ pub fn resolve(
             .map(str::to_owned),
     };
 
+    // D51 point 6: Herdr's actual unnamed session lives at the bare
+    // `~/.config/herdr/herdr.sock`, not `sessions/default/herdr.sock`
+    // (`resolve_socket_path` already special-cases this for its own
+    // ambient-env fallback). A resolved name of exactly `default`, from any
+    // level (`--session default`, `DROVE_SESSION=default`,
+    // `herdr.session("default")`, ambient `HERDR_SESSION=default`), means
+    // the same thing: normalise it to "no named session" here, once, rather
+    // than requiring every call site to know about the exception.
+    let name = if backend == HERDR_BACKEND && name.as_deref() == Some("default") {
+        None
+    } else {
+        name
+    };
+
     (
         backend,
         Target {
@@ -720,5 +734,81 @@ mod tests {
             &BackendTargets::default(),
         );
         assert_eq!(target.socket, Some(PathBuf::from("/tmp/explicit.sock")));
+    }
+
+    #[test]
+    fn a_herdr_target_name_of_default_normalises_to_no_named_session() {
+        // `--session default`.
+        let cli = CliInputs {
+            session: Some("default"),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            cli,
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
+            ProfileInputs::default(),
+            Some(HERDR_BACKEND),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name, None);
+
+        // `DROVE_SESSION=default`.
+        let explicit_env = ExplicitEnvInputs {
+            drove_session: Some("default".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &explicit_env,
+            &AmbientEnvInputs::default(),
+            ProfileInputs::default(),
+            Some(HERDR_BACKEND),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name, None);
+
+        // `herdr.session("default")` (the file level).
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
+            ProfileInputs::default(),
+            Some(HERDR_BACKEND),
+            &targets(Some("default"), None),
+        );
+        assert_eq!(target.name, None);
+
+        // Ambient `HERDR_SESSION=default`.
+        let ambient = AmbientEnvInputs {
+            herdr_session: Some("default".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
+            ProfileInputs::default(),
+            Some(HERDR_BACKEND),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name, None);
+    }
+
+    #[test]
+    fn a_non_default_herdr_target_name_is_unaffected() {
+        let cli = CliInputs {
+            session: Some("drove"),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            cli,
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
+            ProfileInputs::default(),
+            Some(HERDR_BACKEND),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name.as_deref(), Some("drove"));
     }
 }
