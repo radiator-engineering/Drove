@@ -32,6 +32,7 @@ tests/examples.rs
 tests/cli.rs
   s_e94bdc75c06cee::t_4a0b346b758437 1526
   s_e94bdc75c06cee::t_f5e287863f8fea 1331,1397-1525,1527-1593
+  s_e94bdc75c06cee::t_07a414b6b48daa 1396
 docs/drovefile.md
   s_e94bdc75c06cee::t_df221d33e4e4cb 132-146
   s_e94bdc75c06cee::t_ac35fd789b9165 218-219
