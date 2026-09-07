@@ -572,7 +572,12 @@ fn down_command(
 
     if !json {
         if session_unreachable {
-            println!("warning: session not reachable; detaching without closing panes");
+            let target_word = if backend_id == select::HERDR_BACKEND {
+                "session"
+            } else {
+                "hub"
+            };
+            println!("warning: {target_word} not reachable; detaching without closing panes");
         }
         for id in &pruned {
             println!("pruned {id} (not in session)");
