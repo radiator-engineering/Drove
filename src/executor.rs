@@ -16,7 +16,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    backend::{Backend, PaneSpec},
+    backend::{Backend, PaneSpec, SessionState},
     ir::{Ir, Resource},
     model::{Profile, Task, canonical_digest},
     planner::{Action, CoreAction, HerdrAction, Plan, PlannedAction},
@@ -528,19 +528,480 @@ struct ApplyState {
     pane_ids: BTreeMap<String, String>,
 }
 
+impl ApplyState {
+    /// Seeds the resolver with the backend ids a previous run recorded, so an
+    /// action against a parent that already converged (and so needs no action
+    /// this run) still resolves that parent's id. Without this, a later `up`
+    /// that only adds a pane to an existing group cannot find the group's
+    /// workspace, since nothing populated `workspace_ids` for it this run.
+    fn seeded_from(managed: Option<&crate::state::ManagedProfile>) -> Self {
+        let mut state = Self::default();
+        let Some(managed) = managed else {
+            return state;
+        };
+        for (address, resource) in &managed.resources {
+            if resource.backend_id.is_empty() {
+                continue;
+            }
+            let map = match resource.kind.as_str() {
+                "workspace" => &mut state.workspace_ids,
+                "placement" => &mut state.group_ids,
+                "pane" => &mut state.pane_ids,
+                _ => continue,
+            };
+            map.insert(address.clone(), resource.backend_id.clone());
+        }
+        state
+    }
+}
+
 /// Applies every action in `plan` against `backend`, resolving each verb's
 /// concrete arguments from `ir`, and returns each action's [`Outcome`] in
 /// order. A flavor action on a backend without that flavor is surfaced as
 /// [`Outcome::Unsupported`] and the loop continues, so core resources in the
-/// same plan are still created (D29).
+/// same plan are still created (D29). Destructive actions are always applied;
+/// [`up`] uses `apply_plan_gated` instead to hold them behind `--yes`.
 pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Result<Vec<(String, Outcome)>> {
-    let mut state = ApplyState::default();
-    let mut outcomes = Vec::with_capacity(plan.actions.len());
-    for action in &plan.actions {
-        let outcome = apply_action(backend, ir, &mut state, action)?;
-        outcomes.push((action.address.clone(), outcome));
+    Ok(apply_plan_gated(backend, ir, plan, true, ApplyState::default())?.0)
+}
+
+/// Like [`apply_plan`], but when `approve` is false every destructive action
+/// (a topology-change `ClosePane`, D22) is left unapplied and reported as
+/// [`Outcome::Skipped`] — the same `--yes` gate a task's `run` sits behind.
+/// Returns the per-action outcomes together with the backend ids created
+/// along the way, so a caller can record ownership from what actually ran.
+fn apply_plan_gated(
+    backend: &dyn Backend,
+    ir: &Ir,
+    plan: &Plan,
+    approve: bool,
+    seed: ApplyState,
+) -> Result<(Vec<(String, Outcome)>, ApplyState)> {
+    let mut state = seed;
+    let mut outcomes: Vec<Option<(String, Outcome)>> =
+        (0..plan.actions.len()).map(|_| None).collect();
+
+    // A `SetRatio` addresses a split gap, so it must run after the panes that
+    // create the group's gaps. The plan orders every Herdr tab action ahead of
+    // the pane splits (its rank sorts before the pane rank), which is right for
+    // `plan`/`status` output but would apply a ratio before its gap exists when
+    // a pane is added to an existing group. So apply the ratios last, keeping
+    // each action's outcome in its original plan position.
+    let is_deferred =
+        |action: &PlannedAction| matches!(action.kind, Action::Herdr(HerdrAction::SetRatio));
+    let order = plan
+        .actions
+        .iter()
+        .enumerate()
+        .filter(|(_, action)| !is_deferred(action))
+        .chain(
+            plan.actions
+                .iter()
+                .enumerate()
+                .filter(|(_, action)| is_deferred(action)),
+        );
+
+    for (index, action) in order {
+        let outcome = if action.destructive && !approve {
+            Outcome::Skipped
+        } else {
+            apply_action(backend, ir, &mut state, action)?
+        };
+        outcomes[index] = Some((action.address.clone(), outcome));
     }
-    Ok(outcomes)
+
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("every action applied exactly once"))
+        .collect();
+    Ok((outcomes, state))
+}
+
+/// What `drove up` did, reported as one summary line (D43 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpOutcome {
+    /// The session was reachable (or just started headlessly) and the plan's
+    /// tasks and backend actions were applied.
+    Reconciled {
+        created: usize,
+        changed: usize,
+        tasks_run: usize,
+    },
+    /// Nothing was out of sync; the workspace was only brought to the front.
+    AlreadyRunning,
+    /// The Herdr session's server was not reachable and could not be started
+    /// headlessly (D43 step 2); `hint` is the command to run by hand.
+    CannotStart { hint: String },
+}
+
+/// The full result of one [`up`] run.
+#[derive(Debug, Clone)]
+pub struct UpReport {
+    pub outcome: UpOutcome,
+    /// Per-task run results, for `--json` output and the process exit code.
+    pub tasks: Vec<(String, TaskOutcome)>,
+    /// The backend id of the workspace brought to the front, if any.
+    pub focused: Option<String>,
+    /// A destructive action was left unapplied for want of `--yes` (D22).
+    pub blocked_destructive: bool,
+}
+
+/// `drove up` end to end (D43): ensure the session is reachable, run the
+/// plan's tasks, apply its backend actions behind the `--yes` gate, record
+/// what was created, and bring the target workspace to the front. The caller
+/// (`src/cli.rs`) is responsible for the `Conflict` early exit before calling
+/// this, for printing the summary, and for the `exec herdr session attach`
+/// step, which is not exercised here.
+#[allow(clippy::too_many_arguments)]
+pub fn up(
+    backend: &dyn Backend,
+    profile: &Profile,
+    ir: &Ir,
+    plan: &Plan,
+    ctx: &ExecutionContext<'_>,
+    state: &mut LocalState,
+    approve: bool,
+    session: &str,
+    focus_workspace: Option<&str>,
+    do_focus: bool,
+) -> Result<UpReport> {
+    // Step 2: make the session reachable. Herdr starts its own server
+    // headlessly; a flavorless backend (Radiator) has no such verb, so the
+    // caller checks its reachability separately (D43 step 2, D44).
+    if let Some(ext) = backend.herdr()
+        && let SessionState::CannotStart { hint } = ext.ensure_session(session)?
+    {
+        return Ok(UpReport {
+            outcome: UpOutcome::CannotStart { hint },
+            tasks: Vec::new(),
+            focused: None,
+            blocked_destructive: false,
+        });
+    }
+
+    let was_in_sync = plan.actions.is_empty();
+
+    // Step 3: run the plan's tasks, then apply its backend actions and record
+    // the resources that came into being so the next run sees them in sync.
+    let tasks = execute_plan_tasks(profile, plan, ctx, state, approve)?;
+    // Seed the resolver with what a previous run recorded, so an action
+    // against a parent that already converged still finds its backend id.
+    let seed = ApplyState::seeded_from(state.profile(ctx.profile));
+    let (outcomes, applied) = apply_plan_gated(backend, ir, plan, approve, seed)?;
+    record_ownership(state, ctx.profile, ir, plan, &outcomes, &applied)?;
+
+    let blocked_destructive = !approve && plan.has_destructive_actions();
+    let (created, changed) = count_applied(plan, &outcomes);
+    let tasks_run = tasks
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, TaskOutcome::Ran(_)))
+        .count();
+
+    // Step 4: bring the target workspace to the front.
+    let focused = if do_focus {
+        focus_first_workspace(backend, state, ctx.profile, &applied, focus_workspace)?
+    } else {
+        None
+    };
+
+    let outcome = if was_in_sync {
+        UpOutcome::AlreadyRunning
+    } else {
+        UpOutcome::Reconciled {
+            created,
+            changed,
+            tasks_run,
+        }
+    };
+    Ok(UpReport {
+        outcome,
+        tasks,
+        focused,
+        blocked_destructive,
+    })
+}
+
+/// Splits the plan's applied actions into a created count and a changed count
+/// for the summary line. Only [`Outcome::Applied`] actions count; a skipped,
+/// unsupported, task, detach, or conflict action does not.
+fn count_applied(plan: &Plan, outcomes: &[(String, Outcome)]) -> (usize, usize) {
+    let mut created = 0;
+    let mut changed = 0;
+    for (action, (_, outcome)) in plan.actions.iter().zip(outcomes) {
+        if *outcome != Outcome::Applied {
+            continue;
+        }
+        match action.kind {
+            Action::Core(CoreAction::CreateWorkspace | CoreAction::CreatePane)
+            | Action::Herdr(
+                HerdrAction::CreateTab | HerdrAction::SplitPane | HerdrAction::StartAgent,
+            ) => created += 1,
+            Action::Core(
+                CoreAction::RenameWorkspace
+                | CoreAction::RenamePane
+                | CoreAction::RestartCommand
+                | CoreAction::ClosePane
+                | CoreAction::PromptAgent,
+            )
+            | Action::Herdr(HerdrAction::RenameTab | HerdrAction::SetRatio) => changed += 1,
+            _ => {}
+        }
+    }
+    (created, changed)
+}
+
+/// Brings the profile's target workspace to the front through
+/// `workspace.focus` (D43 step 4). The workspace's backend id comes from what
+/// this run just created, else from what a previous run recorded in local
+/// state (the already-in-sync case). A flavorless backend has no
+/// `focus_workspace` verb, so this is a no-op there.
+fn focus_first_workspace(
+    backend: &dyn Backend,
+    state: &LocalState,
+    profile: &str,
+    applied: &ApplyState,
+    workspace: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(name) = workspace else {
+        return Ok(None);
+    };
+    let Some(ext) = backend.herdr() else {
+        return Ok(None);
+    };
+    let backend_id = applied
+        .workspace_ids
+        .get(name)
+        .cloned()
+        .or_else(|| {
+            state
+                .profile(profile)
+                .and_then(|managed| managed.resources.get(name))
+                .map(|resource| resource.backend_id.clone())
+        })
+        .filter(|id| !id.is_empty());
+    let Some(backend_id) = backend_id else {
+        return Ok(None);
+    };
+    ext.focus_workspace(&backend_id)?;
+    Ok(Some(backend_id))
+}
+
+/// Records ownership of the resources a plan just applied, so the next
+/// `build_plan` sees them as owned and converged. The backend id comes from
+/// what this apply created, else the action's own backend id (a rename or
+/// restart of an already-known resource), else what local state already held.
+/// A `Detach` drops the resource; an `AdoptPane` records the caller pane even
+/// though no backend verb ran (D24).
+fn record_ownership(
+    state: &mut LocalState,
+    profile: &str,
+    ir: &Ir,
+    plan: &Plan,
+    outcomes: &[(String, Outcome)],
+    applied: &ApplyState,
+) -> Result<()> {
+    enum Change {
+        Upsert(String, ManagedResource),
+        Remove(String),
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    let existing = state.profile(profile).cloned().unwrap_or_default();
+
+    let resolve = |name: &str, ids: &BTreeMap<String, String>, own: Option<&str>| -> String {
+        ids.get(name)
+            .cloned()
+            .or_else(|| own.map(str::to_owned))
+            .or_else(|| {
+                existing
+                    .resources
+                    .get(name)
+                    .map(|resource| resource.backend_id.clone())
+            })
+            .unwrap_or_default()
+    };
+
+    for (action, (_, outcome)) in plan.actions.iter().zip(outcomes) {
+        let address = action.address.as_str();
+        match action.kind {
+            Action::Core(CoreAction::AdoptPane) => {
+                if let (Ok(digest), Ok(parent)) =
+                    (digest_of(ir, "pane", address), pane_group_id(ir, address))
+                {
+                    let backend_id =
+                        resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "pane".into(),
+                            backend_id,
+                            parent: Some(parent),
+                            digest: digest.to_owned(),
+                            adopted: Some(true),
+                            last_outcome: None,
+                        },
+                    ));
+                }
+                continue;
+            }
+            Action::Core(CoreAction::Detach) => {
+                changes.push(Change::Remove(address.to_owned()));
+                continue;
+            }
+            _ => {}
+        }
+
+        if *outcome != Outcome::Applied {
+            continue;
+        }
+
+        match action.kind {
+            Action::Core(CoreAction::CreateWorkspace | CoreAction::RenameWorkspace) => {
+                if let Ok(digest) = digest_of(ir, "workspace", address) {
+                    let backend_id = resolve(
+                        address,
+                        &applied.workspace_ids,
+                        action.backend_id.as_deref(),
+                    );
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "workspace".into(),
+                            backend_id,
+                            parent: None,
+                            digest: digest.to_owned(),
+                            adopted: None,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            Action::Herdr(
+                HerdrAction::CreateTab | HerdrAction::RenameTab | HerdrAction::SetRatio,
+            ) => {
+                if let (Some(digest), Some(workspace)) = (
+                    group_topology_digest(ir, address),
+                    group_workspace(ir, address),
+                ) {
+                    let backend_id =
+                        resolve(address, &applied.group_ids, action.backend_id.as_deref());
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "placement".into(),
+                            backend_id,
+                            parent: Some(workspace.to_owned()),
+                            digest: digest.to_owned(),
+                            adopted: None,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+                // A fresh `CreateTab` builds every pane in the group with no
+                // per-pane action, so record each one here (its parent is the
+                // group) — otherwise the next run would see them unobserved
+                // and split them in again.
+                if action.kind == Action::Herdr(HerdrAction::CreateTab)
+                    && let Ok(group) = placement_group(ir, address)
+                {
+                    for pane in &group.panes {
+                        if let Ok(digest) = digest_of(ir, "pane", pane) {
+                            let backend_id = resolve(pane, &applied.pane_ids, None);
+                            changes.push(Change::Upsert(
+                                pane.clone(),
+                                ManagedResource {
+                                    kind: "pane".into(),
+                                    backend_id,
+                                    parent: Some(address.to_owned()),
+                                    digest: digest.to_owned(),
+                                    adopted: None,
+                                    last_outcome: None,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            Action::Core(
+                CoreAction::CreatePane | CoreAction::RenamePane | CoreAction::RestartCommand,
+            )
+            | Action::Herdr(HerdrAction::SplitPane) => {
+                if let (Ok(digest), Ok(parent)) =
+                    (digest_of(ir, "pane", address), pane_group_id(ir, address))
+                {
+                    let backend_id =
+                        resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+                    let adopted = existing
+                        .resources
+                        .get(address)
+                        .and_then(|resource| resource.adopted);
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "pane".into(),
+                            backend_id,
+                            parent: Some(parent),
+                            digest: digest.to_owned(),
+                            adopted,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            Action::Herdr(HerdrAction::StartAgent) | Action::Core(CoreAction::PromptAgent) => {
+                if let (Ok(digest), Ok(pane)) =
+                    (digest_of(ir, "agent", address), agent_parent(ir, address))
+                {
+                    let backend_id =
+                        resolve(&pane, &applied.pane_ids, action.backend_id.as_deref());
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "agent".into(),
+                            backend_id,
+                            parent: Some(pane),
+                            digest: digest.to_owned(),
+                            adopted: None,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            // A topology-change `ClosePane` is immediately followed by a
+            // `SplitPane` in the same plan that re-records the pane under its
+            // new group, so there is nothing to remove here.
+            _ => {}
+        }
+    }
+
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let managed = state.profile_mut(profile);
+    for change in changes {
+        match change {
+            Change::Upsert(id, resource) => {
+                managed.resources.insert(id, resource);
+            }
+            Change::Remove(id) => {
+                managed.resources.remove(&id);
+            }
+        }
+    }
+    state.save()
+}
+
+fn group_topology_digest<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
+    ir.placements
+        .iter()
+        .find(|group| group.id == id)
+        .map(|group| group.topology_digest.as_str())
+}
+
+fn group_workspace<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
+    ir.placements
+        .iter()
+        .find(|group| group.id == id)
+        .map(|group| group.workspace.as_str())
 }
 
 /// Routes one planned action to the backend through a single exhaustive
@@ -644,8 +1105,26 @@ fn apply_herdr(
         HerdrAction::CreateTab => {
             let group = placement_group(ir, &action.address)?;
             let workspace_id = backend_id(state.workspace_ids.get(&group.workspace), action)?;
-            let tab_id = ext.create_tab(&workspace_id, &group.label, group.split, &group.ratios)?;
-            state.group_ids.insert(action.address.clone(), tab_id);
+            // A fresh group plans one `CreateTab` and no per-pane splits, so
+            // this builds the whole tab: every declared pane, then the ratios.
+            let specs = group
+                .panes
+                .iter()
+                .map(|pane| pane_spec(ir, pane))
+                .collect::<Result<Vec<_>>>()?;
+            let layout = ext.create_tab(
+                &workspace_id,
+                &group.label,
+                group.split,
+                &group.ratios,
+                &specs,
+            )?;
+            state
+                .group_ids
+                .insert(action.address.clone(), layout.tab_id);
+            for (pane, pane_id) in group.panes.iter().zip(layout.pane_ids) {
+                state.pane_ids.insert(pane.clone(), pane_id);
+            }
             Ok(Outcome::Applied)
         }
         HerdrAction::RenameTab => {
@@ -720,8 +1199,15 @@ fn pane_create_inputs(ir: &Ir, state: &ApplyState, pane: &str) -> Result<(String
         .get(&group.workspace)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("workspace `{}` has no backend id yet", group.workspace))?;
+    Ok((workspace_id, pane_spec(ir, pane)?))
+}
+
+/// The [`PaneSpec`] for one declared pane: its label, cwd, command and env,
+/// independent of any workspace backend id (used when building the panes of a
+/// fresh Herdr tab up front, before their splits run).
+fn pane_spec(ir: &Ir, pane: &str) -> Result<PaneSpec> {
     let fields = resource_fields(ir, "pane", pane)?;
-    let spec = PaneSpec {
+    Ok(PaneSpec {
         label: string_field(fields, "label").or_else(|| Some(pane.to_owned())),
         cwd: string_field(fields, "cwd").map(std::path::PathBuf::from),
         command: {
@@ -729,8 +1215,7 @@ fn pane_create_inputs(ir: &Ir, state: &ApplyState, pane: &str) -> Result<(String
             (!argv.is_empty()).then_some(argv)
         },
         env: string_map(fields, "env"),
-    };
-    Ok((workspace_id, spec))
+    })
 }
 
 /// The first `serve` candidate's argv (D8: `any_of` tries them in order; the
@@ -1320,6 +1805,607 @@ mod tests {
             }
         }
         // No `herdr()` override: it inherits the default `None`.
+    }
+
+    /// A fake Herdr for the `up` flow (D43): it hands out backend ids for
+    /// every workspace, Herdr tab and pane it is asked to create, records the
+    /// verbs it receives, and answers `ensure_session` with a state the test
+    /// sets.
+    struct RecordingHerdr {
+        session: SessionState,
+        calls: Mutex<Vec<String>>,
+        next_id: Mutex<u32>,
+    }
+
+    impl RecordingHerdr {
+        fn running() -> Self {
+            Self {
+                session: SessionState::Running,
+                calls: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+
+        fn cannot_start(hint: &str) -> Self {
+            Self {
+                session: SessionState::CannotStart { hint: hint.into() },
+                calls: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+
+        fn id(&self, prefix: &str) -> String {
+            let mut next = self.next_id.lock().expect("id lock");
+            let id = format!("{prefix}{next}");
+            *next += 1;
+            id
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().expect("calls lock").push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl Backend for RecordingHerdr {
+        fn snapshot(&self) -> Result<crate::backend::herdr::SessionSnapshot> {
+            Ok(Default::default())
+        }
+        fn caller_pane_id(&self) -> Option<String> {
+            None
+        }
+        fn create_workspace(&self, label: &str, _cwd: &Path) -> Result<String> {
+            self.record(format!("create_workspace:{label}"));
+            Ok(self.id("w"))
+        }
+        fn rename_workspace(&self, id: &str, label: &str) -> Result<()> {
+            self.record(format!("rename_workspace:{id}:{label}"));
+            Ok(())
+        }
+        fn create_pane(&self, workspace_id: &str, spec: &PaneSpec) -> Result<String> {
+            let label = spec.label.clone().unwrap_or_default();
+            self.record(format!("create_pane:{workspace_id}:{label}"));
+            Ok(self.id("p"))
+        }
+        fn close_pane(&self, id: &str) -> Result<()> {
+            self.record(format!("close_pane:{id}"));
+            Ok(())
+        }
+        fn rename_pane(&self, id: &str, label: &str) -> Result<()> {
+            self.record(format!("rename_pane:{id}:{label}"));
+            Ok(())
+        }
+        fn restart_command(&self, id: &str, _argv: &[String]) -> Result<()> {
+            self.record(format!("restart_command:{id}"));
+            Ok(())
+        }
+        fn prompt_agent(&self, id: &str, _prompt: &str) -> Result<()> {
+            self.record(format!("prompt_agent:{id}"));
+            Ok(())
+        }
+        fn process_info(&self, _id: &str) -> Result<Option<crate::backend::ProcessInfo>> {
+            Ok(None)
+        }
+        fn report_tokens(&self, _address: &str, _tokens: &BTreeMap<String, String>) -> Result<()> {
+            Ok(())
+        }
+        fn output(&self, _id: &str, _timeout: std::time::Duration) -> Result<String> {
+            Ok(String::new())
+        }
+        fn capabilities(&self) -> crate::backend::Capabilities {
+            crate::backend::Capabilities {
+                workspace_env: true,
+                pane_command_at_create: true,
+                metadata_tokens: true,
+                process_info: true,
+                events: true,
+                readiness_output: true,
+            }
+        }
+        fn herdr(&self) -> Option<&dyn crate::backend::HerdrExt> {
+            Some(self)
+        }
+    }
+
+    impl crate::backend::HerdrExt for RecordingHerdr {
+        fn create_tab(
+            &self,
+            workspace_id: &str,
+            label: &str,
+            _split: crate::backend::Split,
+            ratios: &[f64],
+            panes: &[PaneSpec],
+        ) -> Result<crate::backend::TabLayout> {
+            self.record(format!("create_tab:{workspace_id}:{label}"));
+            let tab_id = self.id("t");
+            let pane_ids = panes
+                .iter()
+                .map(|spec| {
+                    let pane_label = spec.label.clone().unwrap_or_default();
+                    self.record(format!("tab_pane:{tab_id}:{pane_label}"));
+                    self.id("p")
+                })
+                .collect();
+            if !ratios.is_empty() {
+                self.record(format!("set_ratio:{tab_id}"));
+            }
+            Ok(crate::backend::TabLayout { tab_id, pane_ids })
+        }
+        fn split_pane(
+            &self,
+            tab_id: &str,
+            spec: &PaneSpec,
+            _split: crate::backend::Split,
+        ) -> Result<String> {
+            let label = spec.label.clone().unwrap_or_default();
+            self.record(format!("split_pane:{tab_id}:{label}"));
+            Ok(self.id("p"))
+        }
+        fn set_ratio(&self, tab_id: &str, _ratios: &[f64]) -> Result<()> {
+            self.record(format!("set_ratio:{tab_id}"));
+            Ok(())
+        }
+        fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+            self.record(format!("rename_tab:{tab_id}:{label}"));
+            Ok(())
+        }
+        fn start_agent(
+            &self,
+            pane_id: &str,
+            name: &str,
+            _kind: &str,
+            _args: &[String],
+        ) -> Result<()> {
+            self.record(format!("start_agent:{pane_id}:{name}"));
+            Ok(())
+        }
+        fn focus_workspace(&self, id: &str) -> Result<()> {
+            self.record(format!("focus:{id}"));
+            Ok(())
+        }
+        fn ensure_session(&self, _name: &str) -> Result<SessionState> {
+            Ok(self.session.clone())
+        }
+    }
+
+    fn up_profile() -> Profile {
+        profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "editor", "serve": [["bash"]]}]}]
+            }]
+        }))
+    }
+
+    fn up_plan(kinds: &[(Action, &str)]) -> Plan {
+        use crate::planner::SyncStatus;
+        Plan {
+            profile: "default".into(),
+            desired_digest: String::new(),
+            status: SyncStatus::OutOfSync,
+            adopted: BTreeMap::new(),
+            actions: kinds
+                .iter()
+                .map(|(kind, address)| PlannedAction {
+                    kind: *kind,
+                    address: (*address).to_owned(),
+                    backend_id: None,
+                    destructive: false,
+                    reason: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn up_applies_workspace_and_pane_then_focuses_the_first_workspace() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreatePane), "editor"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c == "create_workspace:dev"),
+            "workspace must be created: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_pane:")),
+            "pane must be created: {calls:?}"
+        );
+        // The first workspace is brought to the front with the id its create
+        // returned.
+        assert_eq!(report.focused.as_deref(), Some("w1"));
+        assert!(
+            calls.iter().any(|c| c == "focus:w1"),
+            "the first workspace must be focused: {calls:?}"
+        );
+        assert_eq!(
+            report.outcome,
+            UpOutcome::Reconciled {
+                created: 2,
+                changed: 0,
+                tasks_run: 0
+            }
+        );
+        // Ownership is recorded so the next run sees the resources in sync.
+        assert!(
+            state
+                .profile("default")
+                .expect("profile recorded")
+                .resources
+                .contains_key("dev")
+        );
+    }
+
+    #[test]
+    fn up_with_no_focus_applies_but_never_focuses() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreatePane), "editor"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            false,
+        )
+        .expect("up");
+
+        assert_eq!(report.focused, None);
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("focus:")),
+            "--no-focus must not focus anything: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn up_already_in_sync_brings_the_workspace_to_the_front() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        // A previous run recorded the workspace's backend id; nothing is out
+        // of sync now.
+        state.profile_mut("default").resources.insert(
+            "dev".to_owned(),
+            ManagedResource {
+                kind: "workspace".into(),
+                backend_id: "w1".into(),
+                parent: None,
+                digest: "any".into(),
+                adopted: None,
+                last_outcome: None,
+            },
+        );
+        let plan = up_plan(&[]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        assert_eq!(report.outcome, UpOutcome::AlreadyRunning);
+        assert_eq!(report.focused.as_deref(), Some("w1"));
+        let calls = backend.calls();
+        assert_eq!(calls, vec!["focus:w1".to_owned()], "only focus, no creates");
+    }
+
+    #[test]
+    fn up_reports_the_hint_when_the_session_cannot_be_started() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[(Action::Core(CoreAction::CreateWorkspace), "dev")]);
+        let backend = RecordingHerdr::cannot_start("herdr --session dev-session");
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        assert_eq!(
+            report.outcome,
+            UpOutcome::CannotStart {
+                hint: "herdr --session dev-session".to_owned()
+            }
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "an unstartable session applies nothing and focuses nothing"
+        );
+    }
+
+    #[test]
+    fn up_builds_a_fresh_multi_pane_tab_and_records_every_pane() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "split": "right",
+                    "ratios": [0.67],
+                    "panes": [{"name": "editor"}, {"name": "tests"}],
+                }]
+            }]
+        }));
+        let ir = profile.to_ir();
+        // A fresh group plans one CreateTab and no per-pane splits.
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Herdr(HerdrAction::CreateTab), "dev/main"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        // Both declared panes are built as part of the one CreateTab, and the
+        // ratio is applied once (the executor never emits a bare set_ratio on
+        // a one-pane Herdr tab).
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_tab:")),
+            "the Herdr tab must be created: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("tab_pane:")).count(),
+            2,
+            "both panes must be built into the tab: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("set_ratio:")),
+            "the ratio must be applied: {calls:?}"
+        );
+
+        // The group and each pane are recorded, so a second run sees them
+        // owned instead of splitting them in again.
+        let managed = state.profile("default").expect("profile recorded");
+        assert!(managed.resources.contains_key("dev/main"), "group recorded");
+        assert!(
+            managed.resources.contains_key("editor"),
+            "first pane recorded"
+        );
+        assert!(
+            managed.resources.contains_key("tests"),
+            "second pane recorded"
+        );
+        assert_eq!(
+            report.outcome,
+            UpOutcome::Reconciled {
+                created: 2,
+                changed: 0,
+                tasks_run: 0
+            }
+        );
+    }
+
+    #[test]
+    fn up_splits_a_pane_into_a_converged_group_using_recorded_ids() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "editor"}, {"name": "tests"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        // A previous run recorded the workspace, the group and the first pane;
+        // only `tests` is being added now, so its parents need no action this
+        // run and their ids live only in recorded state.
+        {
+            let managed = state.profile_mut("default");
+            for (address, kind, backend, parent) in [
+                ("dev", "workspace", "w1", None),
+                ("dev/main", "placement", "t1", Some("dev")),
+                ("editor", "pane", "p1", Some("dev/main")),
+            ] {
+                managed.resources.insert(
+                    address.to_owned(),
+                    ManagedResource {
+                        kind: kind.into(),
+                        backend_id: backend.into(),
+                        parent: parent.map(ToOwned::to_owned),
+                        digest: "d".into(),
+                        adopted: None,
+                        last_outcome: None,
+                    },
+                );
+            }
+        }
+        let plan = up_plan(&[(Action::Herdr(HerdrAction::SplitPane), "tests")]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up must resolve the converged workspace from recorded state");
+
+        let calls = backend.calls();
+        // The new pane splits into the group's recorded Herdr tab, and no
+        // error is raised for the workspace that was never touched this run.
+        assert!(
+            calls.iter().any(|c| c.starts_with("split_pane:t1:")),
+            "the pane must split into the recorded tab: {calls:?}"
+        );
+        assert!(
+            state
+                .profile("default")
+                .expect("profile")
+                .resources
+                .contains_key("tests"),
+            "the new pane is recorded"
+        );
+        assert!(matches!(report.outcome, UpOutcome::Reconciled { .. }));
+    }
+
+    #[test]
+    fn set_ratio_is_applied_after_the_split_that_creates_its_gap() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "split": "right",
+                    "ratios": [0.6],
+                    "panes": [{"name": "editor"}, {"name": "tests"}]
+                }]
+            }]
+        }));
+        let ir = profile.to_ir();
+        {
+            let managed = state.profile_mut("default");
+            for (address, kind, backend, parent) in [
+                ("dev", "workspace", "w1", None),
+                ("dev/main", "placement", "t1", Some("dev")),
+                ("editor", "pane", "p1", Some("dev/main")),
+            ] {
+                managed.resources.insert(
+                    address.to_owned(),
+                    ManagedResource {
+                        kind: kind.into(),
+                        backend_id: backend.into(),
+                        parent: parent.map(ToOwned::to_owned),
+                        digest: "d".into(),
+                        adopted: None,
+                        last_outcome: None,
+                    },
+                );
+            }
+        }
+        // The planner orders every Herdr tab action ahead of the pane splits,
+        // so the ratio comes first in the plan — but applying it before the
+        // split exists would fail against a real backend.
+        let plan = up_plan(&[
+            (Action::Herdr(HerdrAction::SetRatio), "dev/main"),
+            (Action::Herdr(HerdrAction::SplitPane), "tests"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        let split_at = calls
+            .iter()
+            .position(|c| c.starts_with("split_pane:"))
+            .expect("a split happened");
+        let ratio_at = calls
+            .iter()
+            .position(|c| c.starts_with("set_ratio:"))
+            .expect("a ratio was set");
+        assert!(
+            ratio_at > split_at,
+            "the ratio must be applied after the split, whatever the plan order: {calls:?}"
+        );
     }
 
     #[test]

@@ -112,16 +112,48 @@ pub trait Backend {
     }
 }
 
-/// The Herdr flavor: tabs, splits, ratios and agent start — verbs only Herdr
-/// implements (spec §3, D28). Reached through [`Backend::herdr`].
+/// The state of a named Herdr session's server after [`HerdrExt::ensure_session`]
+/// (D44): already up, just started headlessly, or unstartable without a TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// The session's socket already answered `ping`; nothing was started.
+    Running,
+    /// The session's server was not up, and this call started it headlessly
+    /// and saw its socket come up.
+    Started,
+    /// Nothing could start the session's server without a TUI. `hint` is the
+    /// exact command for the user to run by hand (`herdr --session NAME`).
+    CannotStart { hint: String },
+}
+
+/// The result of building a fresh Herdr tab ([`HerdrExt::create_tab`]): the
+/// new Herdr tab's backend id, and the backend ids of the panes it holds in
+/// the declared order they were created. The caller records these so a later
+/// run sees the Herdr tab and its panes as owned rather than remaking them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabLayout {
+    pub tab_id: String,
+    pub pane_ids: Vec<String>,
+}
+
+/// The Herdr flavor: tabs, splits, ratios, agent start, plus the session and
+/// focus verbs `drove up` drives — verbs only Herdr implements (spec §3, D28,
+/// D44). Reached through [`Backend::herdr`].
 pub trait HerdrExt {
+    /// Builds a fresh Herdr tab holding `panes` in declared order, split in
+    /// `split`, then applies `ratios`. Herdr has no empty tab, so the first
+    /// pane opens the Herdr tab and the rest are split into it; `ratios` are
+    /// applied only after every split gap exists (a fresh group plans one
+    /// `CreateTab`, never per-pane splits). Returns the Herdr tab and pane
+    /// backend ids (D29).
     fn create_tab(
         &self,
         workspace_id: &str,
         label: &str,
         split: Split,
         ratios: &[f64],
-    ) -> Result<String>;
+        panes: &[PaneSpec],
+    ) -> Result<TabLayout>;
 
     fn split_pane(&self, tab_id: &str, spec: &PaneSpec, split: Split) -> Result<String>;
 
@@ -130,6 +162,17 @@ pub trait HerdrExt {
     fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()>;
 
     fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()>;
+
+    /// Brings workspace `id` to the front through `workspace.focus` (D43 step
+    /// 4, D44).
+    fn focus_workspace(&self, id: &str) -> Result<()>;
+
+    /// Ensures the named session's server is running (D43 step 2, D44):
+    /// [`SessionState::Running`] when its socket already answers `ping`,
+    /// otherwise starts the server headlessly by shelling out to the `herdr`
+    /// binary and returns [`SessionState::Started`] once the socket comes up,
+    /// or [`SessionState::CannotStart`] with the command to run by hand.
+    fn ensure_session(&self, name: &str) -> Result<SessionState>;
 }
 
 /// The Radiator flavor. Empty until the hub protocol for chat panes, runner

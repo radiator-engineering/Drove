@@ -2,12 +2,14 @@
 
 use std::{
     env,
+    ffi::OsString,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -16,8 +18,14 @@ use interprocess::local_socket::traits::Stream as _StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, Split};
+use super::{
+    Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, SessionState, Split, TabLayout,
+};
 use crate::model::SplitDirection;
+
+/// How long [`HerdrExt::ensure_session`] waits for a just-started session's
+/// socket to answer `ping` before giving up (D43 step 2).
+const SESSION_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -498,23 +506,43 @@ impl Backend for HerdrClient {
 }
 
 impl HerdrExt for HerdrClient {
-    /// Creates a tab holding one initial pane (Herdr has no empty tab) and
-    /// returns its tab id; `HerdrExt::split_pane` adds the rest. `split` and
-    /// `ratios` describe the finished layout, so `ratios` is applied here and
-    /// `split` is honored per split when panes are added.
+    /// Builds a fresh tab holding every pane in `panes`. Herdr has no empty
+    /// tab, so the first pane opens the tab (through `layout.apply`, which
+    /// honors the leaf's command and cwd) and each remaining pane is split in
+    /// with [`HerdrExt::split_pane`]. Ratios address split gaps, so they are
+    /// applied only after every gap exists — never against the one-pane tab,
+    /// which has no gap to address (D6, D29).
     fn create_tab(
         &self,
         workspace_id: &str,
         label: &str,
-        _split: Split,
+        split: Split,
         ratios: &[f64],
-    ) -> Result<String> {
-        let leaf = json!({"type": "pane", "label": label});
-        let layout = HerdrClient::apply_layout(self, workspace_id, None, label, leaf)?;
-        if !ratios.is_empty() {
-            HerdrClient::set_ratio(self, &layout.tab_id, ratios)?;
+        panes: &[PaneSpec],
+    ) -> Result<TabLayout> {
+        let first = panes.first();
+        let first_label = first
+            .and_then(|spec| spec.label.clone())
+            .unwrap_or_else(|| label.to_owned());
+        let mut leaf = json!({"type": "pane", "label": first_label});
+        if let Some(command) = first.and_then(|spec| spec.command.as_ref()) {
+            leaf["command"] = json!(command);
         }
-        Ok(layout.tab_id)
+        if let Some(cwd) = first.and_then(|spec| spec.cwd.as_ref()) {
+            leaf["cwd"] = json!(cwd);
+        }
+        let layout = HerdrClient::apply_layout(self, workspace_id, None, label, leaf)?;
+        let mut pane_ids = layout.pane_ids_preorder();
+        let tab_id = layout.tab_id;
+
+        for spec in panes.iter().skip(1) {
+            let pane_id = <Self as HerdrExt>::split_pane(self, &tab_id, spec, split)?;
+            pane_ids.push(pane_id);
+        }
+        if !ratios.is_empty() {
+            HerdrClient::set_ratio(self, &tab_id, ratios)?;
+        }
+        Ok(TabLayout { tab_id, pane_ids })
     }
 
     /// Splits the tab's current last pane in `split` direction, opening a new
@@ -546,6 +574,75 @@ impl HerdrExt for HerdrClient {
     fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()> {
         HerdrClient::start_agent(self, pane_id, name, kind, args)
     }
+
+    fn focus_workspace(&self, id: &str) -> Result<()> {
+        self.request("workspace.focus", json!({"workspace_id": id}))?;
+        Ok(())
+    }
+
+    /// Pings this client's socket first: an answer means the session is
+    /// already up ([`SessionState::Running`]) and nothing is started. When it
+    /// does not answer, this shells out to the `herdr` binary to run its
+    /// headless server for the named session (`herdr server --session NAME`,
+    /// verified against Herdr 0.8.2), then waits up to
+    /// `SESSION_START_TIMEOUT` for the socket to answer. If the binary is
+    /// missing, the spawn fails, or the socket never comes up, it returns
+    /// [`SessionState::CannotStart`] with the exact `herdr --session NAME`
+    /// command for the user to run in a terminal (D43 step 2, D44).
+    fn ensure_session(&self, name: &str) -> Result<SessionState> {
+        if self.ping().is_ok() {
+            return Ok(SessionState::Running);
+        }
+        let hint = format!("herdr --session {name}");
+        if start_session_server(name).is_err() {
+            return Ok(SessionState::CannotStart { hint });
+        }
+        if self.wait_for_ping(SESSION_START_TIMEOUT) {
+            Ok(SessionState::Started)
+        } else {
+            Ok(SessionState::CannotStart { hint })
+        }
+    }
+}
+
+impl HerdrClient {
+    /// Polls `ping` until the socket answers or `timeout` elapses.
+    fn wait_for_ping(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.ping().is_ok() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// The `herdr` binary to shell out to: `HERDR_BIN_PATH` when set, else `herdr`
+/// resolved on `PATH` (D44).
+fn herdr_bin_path() -> OsString {
+    env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| OsString::from("herdr"))
+}
+
+/// Starts the named session's headless server (`herdr server --session NAME`).
+/// The child is left running detached from Drove's own stdio; Drove does not
+/// wait on it. Errors only when the process cannot be spawned at all (a
+/// missing binary); a server that starts but never opens its socket is caught
+/// by the caller's `wait_for_ping`.
+fn start_session_server(name: &str) -> Result<()> {
+    Command::new(herdr_bin_path())
+        .arg("server")
+        .arg("--session")
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("cannot start the Herdr session server")?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -965,6 +1062,96 @@ mod tests {
     }
 
     #[test]
+    fn create_tab_opens_the_first_pane_splits_the_rest_then_sets_ratios_last() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-createtab.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            // layout.apply, layout.export, pane.split, pane.rename,
+            // layout.set_split_ratio.
+            for _ in 0..5 {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let result = match request["method"].as_str().expect("method") {
+                    "layout.apply" => json!({
+                        "layout": {
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t2",
+                            "root": {"type": "pane", "pane_id": "w1:p2"},
+                        }
+                    }),
+                    "layout.export" => json!({
+                        "layout": {
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t2",
+                            "root": {"type": "pane", "pane_id": "w1:p2"},
+                        }
+                    }),
+                    "pane.split" => json!({"pane": {"pane_id": "w1:p3"}}),
+                    "pane.rename" => json!({"type": "ok"}),
+                    "layout.set_split_ratio" => json!({"type": "layout_split_ratio_set"}),
+                    other => panic!("unexpected method {other}"),
+                };
+                let response = json!({"id": request["id"], "result": result});
+                serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+                stream.get_mut().write_all(b"\n").expect("newline");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let panes = [
+            PaneSpec {
+                label: Some("editor".into()),
+                ..PaneSpec::default()
+            },
+            PaneSpec {
+                label: Some("tests".into()),
+                ..PaneSpec::default()
+            },
+        ];
+        let layout = HerdrExt::create_tab(
+            &HerdrClient::new(path),
+            "w1",
+            "main",
+            SplitDirection::Right,
+            &[0.67],
+            &panes,
+        )
+        .expect("create tab");
+
+        assert_eq!(layout.tab_id, "w1:t2");
+        assert_eq!(layout.pane_ids, ["w1:p2", "w1:p3"]);
+
+        let requests = server.join().expect("server thread");
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request["method"].as_str().expect("method"))
+            .collect();
+        // The first pane opens the tab; its label is the leaf label.
+        assert_eq!(methods[0], "layout.apply");
+        assert_eq!(requests[0]["params"]["root"]["label"], "editor");
+        // The regression guard: the ratio is set only after the split that
+        // creates the gap exists, never against the one-pane tab.
+        let split_at = methods
+            .iter()
+            .position(|method| *method == "pane.split")
+            .expect("a split happened");
+        let ratio_at = methods
+            .iter()
+            .position(|method| *method == "layout.set_split_ratio")
+            .expect("a ratio was set");
+        assert!(
+            ratio_at > split_at,
+            "ratios must be applied after the split exists: {methods:?}"
+        );
+    }
+
+    #[test]
     fn report_metadata_addresses_a_pane_id_at_pane_report_metadata() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("herdr-tokens-pane.sock");
@@ -1240,6 +1427,56 @@ mod tests {
         assert_eq!(request["method"], "agent.prompt");
         assert_eq!(request["params"]["target"], "review");
         assert_eq!(request["params"]["text"], "fix the bug");
+    }
+
+    #[test]
+    fn focus_workspace_sends_the_workspace_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-focus.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({"id": request["id"], "result": {"type": "workspace_focused"}});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            request
+        });
+
+        HerdrExt::focus_workspace(&HerdrClient::new(path), "w1").expect("focus workspace");
+
+        let request = server.join().expect("server thread");
+        assert_eq!(request["method"], "workspace.focus");
+        assert_eq!(request["params"]["workspace_id"], "w1");
+    }
+
+    #[test]
+    fn ensure_session_returns_running_on_a_reachable_socket_without_starting_anything() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-ensure.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            assert_eq!(
+                request["method"], "ping",
+                "a reachable socket is detected by ping alone, never by shelling out"
+            );
+            let response = json!({"id": request["id"], "result": {"type": "pong"}});
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+        });
+
+        let state =
+            HerdrExt::ensure_session(&HerdrClient::new(path), "unused").expect("ensure session");
+        assert_eq!(state, SessionState::Running);
+        server.join().expect("server thread");
     }
 
     #[test]
