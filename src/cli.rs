@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
         ExecutionContext, HostCommandRunner, TaskOutcome, down, execute_plan_tasks, list_tasks,
         run_named_task,
     },
-    model::Profile,
+    model::{DroveConfig, Profile},
     planner::{Action, CoreAction, Plan, SyncStatus, build_plan},
     state::LocalState,
 };
@@ -31,9 +31,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     file: Option<PathBuf>,
 
-    /// Profile declared in Drovefile.
-    #[arg(long, global = true, default_value = "default")]
-    profile: String,
+    /// Profile declared in Drovefile; an alias of the positional PROFILE
+    /// (D42). Giving both and disagreeing is an error.
+    ///
+    /// Named `profile_flag` (not `profile`) so clap gives it an arg id
+    /// distinct from every subcommand's own positional `profile` field —
+    /// sharing the field name would collide the two args under one id.
+    #[arg(long = "profile", global = true)]
+    profile_flag: Option<String>,
 
     /// Backend to reconcile onto (`herdr`, `radiator`); overrides `backend(...)`
     /// in the Drovefile (D32).
@@ -58,6 +63,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Profile declared in Drovefile (D42); only consulted when no
+    /// subcommand consumes its own positional PROFILE.
+    profile_arg: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -65,9 +74,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Report drift without changing the backend.
-    Status,
+    Status { profile: Option<String> },
     /// Print the ordered reconciliation plan.
-    Plan,
+    Plan { profile: Option<String> },
     /// Reconcile the selected profile, then exit.
     Up {
         /// Not yet implemented: the planner in this PR never proposes a replace.
@@ -77,10 +86,12 @@ enum Command {
         /// Approve any task `run`/hook argv this apply needs to execute.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        profile: Option<String>,
     },
     /// Print the compiled intermediate representation (schema version 3); a
     /// v2 Drovefile also prints its deprecation warnings and v3 form (D31).
-    Render,
+    Render { profile: Option<String> },
     /// Run one task and its `after` prerequisites; with no task, list every
     /// declared task and its last recorded outcome.
     Run {
@@ -89,10 +100,12 @@ enum Command {
         /// Approve the task's (and any hook's) argv digest before running.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        profile: Option<String>,
     },
     /// Warn about a stale `was =` declaration or a task with no `check`
     /// (D26, D34). Always exits 0.
-    Lint,
+    Lint { profile: Option<String> },
     /// Run `on_stop` hooks, then detach every resource this profile owns.
     Down {
         /// Also close owned panes on the backend; without it, detach only.
@@ -102,23 +115,120 @@ enum Command {
         /// Approve any `on_stop` hook argv this teardown needs to run.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        profile: Option<String>,
     },
+    /// List every declared profile with its backend, target and reachability
+    /// (D42).
+    Ls,
 }
 
 pub fn run() -> Result<ExitCode> {
     run_with(Cli::parse())
 }
 
-fn run_with(cli: Cli) -> Result<ExitCode> {
+/// The positional PROFILE, wherever it landed: on the subcommand (`drove
+/// status monitoring`) or, with no subcommand, at the top level (`drove
+/// monitoring`).
+fn positional_profile(cli: &Cli) -> Option<&str> {
+    let from_command = match &cli.command {
+        Some(Command::Status { profile }) => profile.as_deref(),
+        Some(Command::Plan { profile }) => profile.as_deref(),
+        Some(Command::Up { profile, .. }) => profile.as_deref(),
+        Some(Command::Render { profile }) => profile.as_deref(),
+        Some(Command::Run { profile, .. }) => profile.as_deref(),
+        Some(Command::Lint { profile }) => profile.as_deref(),
+        Some(Command::Down { profile, .. }) => profile.as_deref(),
+        Some(Command::Ls) | None => None,
+    };
+    from_command.or(cli.profile_arg.as_deref())
+}
+
+/// `--profile` is a no-warning alias of the positional PROFILE (D42); giving
+/// both and disagreeing is an error.
+fn requested_profile(cli: &Cli) -> Result<Option<&str>> {
+    match (positional_profile(cli), cli.profile_flag.as_deref()) {
+        (Some(positional), Some(flag)) if positional != flag => {
+            bail!(
+                "profile given as both `{positional}` (positional) and `--profile {flag}`; they must match"
+            )
+        }
+        (Some(positional), _) => Ok(Some(positional)),
+        (None, flag) => Ok(flag),
+    }
+}
+
+/// Resolves which profile this invocation targets (D42): the requested name
+/// if declared, else `default` if declared, else the file's only profile.
+/// Anything else prints every declared profile and returns `None` so the
+/// caller exits 2.
+fn resolve_profile<'a>(requested: Option<&str>, config: &'a DroveConfig) -> Option<&'a Profile> {
+    if let Some(name) = requested {
+        let found = config.profiles.get(name);
+        if found.is_none() {
+            print_profile_list(&format!("unknown profile `{name}`"), config);
+        }
+        return found;
+    }
+    if let Some(profile) = config.profiles.get("default") {
+        return Some(profile);
+    }
+    if config.profiles.len() == 1 {
+        return config.profiles.values().next();
+    }
+    print_profile_list("no profile given", config);
+    None
+}
+
+fn print_profile_list(reason: &str, config: &DroveConfig) {
+    let names: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
+    println!("{reason}; declared profiles: {}", names.join(", "));
+}
+
+/// `drove run PROFILE` (no task) parses identically to `drove run TASK`:
+/// `Run`'s `task` positional comes before its `profile` positional, so clap
+/// binds a single bare word to `task`. If that word names a declared
+/// profile and no declared task shares the name, reinterpret it as the
+/// profile instead (D42).
+fn disambiguate_run_positional(cli: &mut Cli, config: &DroveConfig) {
+    let Some(Command::Run { task, profile, .. }) = &mut cli.command else {
+        return;
+    };
+    if profile.is_some() {
+        return;
+    }
+    let Some(name) = task.as_deref() else {
+        return;
+    };
+    let names_a_profile = config.profiles.contains_key(name);
+    let names_a_task = config
+        .profiles
+        .values()
+        .any(|declared| declared.tasks.iter().any(|t| t.name == name));
+    if names_a_profile && !names_a_task {
+        *profile = task.take();
+    }
+}
+
+fn run_with(mut cli: Cli) -> Result<ExitCode> {
     let current = std::env::current_dir().context("cannot read current directory")?;
     let drovefile = match &cli.file {
         Some(path) => path.clone(),
         None => find_drovefile(&current)?,
     };
     let compiled = compile(&drovefile)?;
-    let profile = compiled.config.profile(&cli.profile)?;
+    disambiguate_run_positional(&mut cli, &compiled.config);
 
-    if matches!(cli.command, Some(Command::Render)) {
+    if matches!(cli.command, Some(Command::Ls)) {
+        return ls_command(&cli, &compiled.config, cli.json);
+    }
+
+    let requested = requested_profile(&cli)?;
+    let Some(profile) = resolve_profile(requested, &compiled.config) else {
+        return Ok(ExitCode::from(2));
+    };
+
+    if matches!(cli.command, Some(Command::Render { .. })) {
         let ir = profile.to_ir();
         if cli.json {
             println!("{}", serde_json::to_string(&ir)?);
@@ -140,17 +250,17 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| current.clone());
 
-    if let Some(Command::Run { task, yes }) = &cli.command {
+    if let Some(Command::Run { task, yes, .. }) = &cli.command {
         return run_command(profile, &repo_root, task.as_deref(), *yes, cli.json);
     }
 
-    if matches!(cli.command, Some(Command::Lint)) {
+    if matches!(cli.command, Some(Command::Lint { .. })) {
         return lint_command(profile, &repo_root, cli.json);
     }
 
-    let (backend_id, target) = resolve_backend(&cli, &compiled.config);
+    let (backend_id, target) = resolve_backend(&cli, &compiled.config, profile);
 
-    if let Some(Command::Down { purge, yes }) = &cli.command {
+    if let Some(Command::Down { purge, yes, .. }) = &cli.command {
         return down_command(
             profile,
             &backend_id,
@@ -169,7 +279,7 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
             println!(
                 "{}",
                 serde_json::json!({
-                    "profile": cli.profile,
+                    "profile": profile.name,
                     "backend": backend_id,
                     "status": "not_running",
                     "error": error.to_string(),
@@ -190,19 +300,24 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
     // observed state comes only from local state's own record of the last
     // apply (D16's declared fallback) until live discovery lands.
     let snapshot = state
-        .profile(&cli.profile)
-        .map(|managed| managed.to_snapshot(&cli.profile, client.caller_pane_id()))
+        .profile(&profile.name)
+        .map(|managed| managed.to_snapshot(&profile.name, client.caller_pane_id()))
         .unwrap_or_default();
     let plan = build_plan(profile, &snapshot)?;
 
     match cli.command.unwrap_or(Command::Up {
         allow_replace: false,
         yes: false,
+        profile: None,
     }) {
-        Command::Render | Command::Run { .. } | Command::Down { .. } | Command::Lint => {
+        Command::Render { .. }
+        | Command::Run { .. }
+        | Command::Down { .. }
+        | Command::Lint { .. }
+        | Command::Ls => {
             unreachable!("handled above")
         }
-        Command::Status | Command::Plan => {
+        Command::Status { .. } | Command::Plan { .. } => {
             print_plan(&plan, cli.json)?;
             print_warnings(&compiled.warnings);
             Ok(if plan.status == SyncStatus::InSync {
@@ -226,13 +341,54 @@ fn run_with(cli: Cli) -> Result<ExitCode> {
 
             let ctx = ExecutionContext {
                 repo_root: &repo_root,
-                profile: &cli.profile,
+                profile: &profile.name,
                 runner: &HostCommandRunner,
             };
             let results = execute_plan_tasks(profile, &plan, &ctx, &mut state, yes)?;
             report_task_outcomes(&results, cli.json)
         }
     }
+}
+
+/// `drove ls` (D42): every declared profile with its resolved backend,
+/// target name and whether that target answers a `ping` (a `snapshot()`
+/// round trip, the same reachability probe `status`/`plan` already use).
+fn ls_command(cli: &Cli, config: &DroveConfig, json: bool) -> Result<ExitCode> {
+    #[derive(serde::Serialize)]
+    struct Row {
+        profile: String,
+        backend: String,
+        target: Option<String>,
+        reachable: bool,
+    }
+
+    let mut rows = Vec::with_capacity(config.profiles.len());
+    for profile in config.profiles.values() {
+        let (backend_id, target) = resolve_backend(cli, config, profile);
+        let client = select::open(&backend_id, &target)?;
+        let reachable = client.snapshot().is_ok();
+        rows.push(Row {
+            profile: profile.name.clone(),
+            backend: backend_id,
+            target: target.name.clone(),
+            reachable,
+        });
+    }
+
+    if json {
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        for row in &rows {
+            println!(
+                "{}: backend={} target={} reachable={}",
+                row.profile,
+                row.backend,
+                row.target.as_deref().unwrap_or("-"),
+                row.reachable
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_command(
@@ -427,7 +583,7 @@ fn describe_outcome(name: &str, outcome: TaskOutcome) -> String {
 
 /// Resolves the backend id and target per D32's four-level order, gathering
 /// the CLI/environment/Drovefile inputs the pure `select::resolve` needs.
-fn resolve_backend(cli: &Cli, config: &crate::model::DroveConfig) -> (String, select::Target) {
+fn resolve_backend(cli: &Cli, config: &DroveConfig, profile: &Profile) -> (String, select::Target) {
     let cli_inputs = select::CliInputs {
         backend: cli.backend.as_deref(),
         target: cli.target.as_deref(),
@@ -440,9 +596,14 @@ fn resolve_backend(cli: &Cli, config: &crate::model::DroveConfig) -> (String, se
         radiator_hub: std::env::var("RADIATOR_HUB").ok(),
         ambient_radiator: radiator::selected_by_environment(),
     };
+    let profile_inputs = select::ProfileInputs {
+        backend: profile.backend.as_deref(),
+        session: profile.session.as_deref(),
+    };
     select::resolve(
         cli_inputs,
         &env_inputs,
+        profile_inputs,
         config.backend.as_deref(),
         &config.target,
     )
@@ -783,7 +944,8 @@ profile("default", workspaces = [control])
     fn clap_defaults_to_up_workflow() {
         let cli = Cli::try_parse_from(["drove"]).expect("parse");
         assert!(cli.command.is_none());
-        assert_eq!(cli.profile, "default");
+        assert_eq!(cli.profile_flag, None);
+        assert_eq!(cli.profile_arg, None);
     }
 
     #[test]
@@ -796,7 +958,8 @@ profile("default", workspaces = [control])
             cli.command,
             Some(Command::Run {
                 task: Some(name),
-                yes: true
+                yes: true,
+                profile: None,
             }) if name == "scaffold"
         ));
     }
@@ -808,8 +971,112 @@ profile("default", workspaces = [control])
             cli.command,
             Some(Command::Down {
                 purge: true,
-                yes: false
+                yes: false,
+                profile: None,
             })
         ));
+    }
+
+    #[test]
+    fn clap_parses_positional_profile_with_no_subcommand() {
+        let cli = Cli::try_parse_from(["drove", "monitoring"]).expect("parse");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.profile_arg.as_deref(), Some("monitoring"));
+        assert_eq!(positional_profile(&cli), Some("monitoring"));
+    }
+
+    #[test]
+    fn run_disambiguates_a_bare_profile_name_from_a_task_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\", tasks = [task(name = \"scaffold\", run = [\"true\"])])\n\
+             profile(name = \"monitoring\")",
+        )
+        .expect("write Drovefile");
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+
+        // `drove run monitoring`: the bare word names a profile and no
+        // declared task, so it is reinterpreted as the profile.
+        let mut cli = Cli::try_parse_from(["drove", "run", "monitoring"]).expect("parse");
+        disambiguate_run_positional(&mut cli, &compiled.config);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                task: None,
+                profile: Some(ref name),
+                ..
+            }) if name == "monitoring"
+        ));
+
+        // `drove run scaffold`: the bare word names a task, so it stays put
+        // even though the file happens to also declare a `default` profile.
+        let mut cli = Cli::try_parse_from(["drove", "run", "scaffold"]).expect("parse");
+        disambiguate_run_positional(&mut cli, &compiled.config);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                task: Some(ref name),
+                profile: None,
+                ..
+            }) if name == "scaffold"
+        ));
+
+        // `drove run scaffold monitoring`: both positionals already given,
+        // so there is nothing to disambiguate.
+        let mut cli =
+            Cli::try_parse_from(["drove", "run", "scaffold", "monitoring"]).expect("parse");
+        disambiguate_run_positional(&mut cli, &compiled.config);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                task: Some(ref task),
+                profile: Some(ref profile),
+                ..
+            }) if task == "scaffold" && profile == "monitoring"
+        ));
+    }
+
+    #[test]
+    fn clap_parses_positional_profile_after_a_subcommand() {
+        let cli = Cli::try_parse_from(["drove", "status", "monitoring"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Status { profile: Some(ref name) }) if name == "monitoring"
+        ));
+        assert_eq!(positional_profile(&cli), Some("monitoring"));
+    }
+
+    #[test]
+    fn requested_profile_rejects_disagreeing_flag_and_positional() {
+        let cli = Cli::try_parse_from(["drove", "--profile", "core", "monitoring"]).expect("parse");
+        let error = requested_profile(&cli).expect_err("disagreeing profile");
+        assert!(error.to_string().contains("must match"));
+    }
+
+    #[test]
+    fn requested_profile_rejects_disagreeing_flag_and_a_subcommand_positional() {
+        // Regression: the global `--profile` flag and every subcommand's own
+        // positional field must not share a clap arg id, or the derive
+        // collides them and one silently overwrites the other.
+        let cli =
+            Cli::try_parse_from(["drove", "--profile", "default", "lint", "other"]).expect("parse");
+        assert_eq!(cli.profile_flag.as_deref(), Some("default"));
+        assert_eq!(positional_profile(&cli), Some("other"));
+        let error = requested_profile(&cli).expect_err("disagreeing profile");
+        assert!(error.to_string().contains("must match"));
+    }
+
+    #[test]
+    fn requested_profile_accepts_agreeing_flag_and_positional() {
+        let cli =
+            Cli::try_parse_from(["drove", "--profile", "monitoring", "monitoring"]).expect("parse");
+        assert_eq!(requested_profile(&cli).expect("agree"), Some("monitoring"));
+    }
+
+    #[test]
+    fn clap_parses_ls() {
+        let cli = Cli::try_parse_from(["drove", "ls"]).expect("parse");
+        assert!(matches!(cli.command, Some(Command::Ls)));
     }
 }

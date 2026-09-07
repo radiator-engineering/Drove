@@ -53,9 +53,9 @@ impl DroveConfig {
                 bail!("duplicate profile name");
             }
         }
-        if !by_name.contains_key("default") {
-            bail!("Drovefile must declare a `default` profile");
-        }
+        // A `default` profile is no longer required (D42): the CLI falls
+        // back to `default` if declared, else the file's only profile, else
+        // lists every declared profile and exits 2 (spec §5).
         let config = Self {
             schema_version: SCHEMA_VERSION,
             profiles: by_name,
@@ -83,10 +83,32 @@ pub struct Profile {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub tasks: Vec<Task>,
+    /// The Herdr session (or, for `backend = "radiator"`, the hub) this
+    /// profile targets (D41). Unset inherits the file-level
+    /// `herdr.session(...)`/`radiator.hub(...)`. `extends` copies the
+    /// parent's value unless the child sets its own.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// The backend this profile reconciles onto (D41): `herdr` or
+    /// `radiator`. Unset inherits the file-level `backend(...)`.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl Profile {
     pub fn validate(&self) -> Result<()> {
+        if let Some(backend) = &self.backend
+            && backend != crate::backend::select::HERDR_BACKEND
+            && backend != crate::backend::select::RADIATOR_BACKEND
+        {
+            bail!(
+                "profile `{}` declares backend = \"{backend}\"; known backends: {}, {}",
+                self.name,
+                crate::backend::select::HERDR_BACKEND,
+                crate::backend::select::RADIATOR_BACKEND
+            );
+        }
+
         let mut workspace_names = BTreeSet::new();
         let mut pane_names = BTreeSet::new();
         let mut agent_names = BTreeSet::new();
@@ -512,6 +534,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_known_profile_backends() {
+        for backend in ["herdr", "radiator"] {
+            let profile = profile_from(json!({
+                "name": "default",
+                "backend": backend,
+            }));
+            profile.validate().expect("known backend");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_profile_backend() {
+        let profile = profile_from(json!({
+            "name": "default",
+            "backend": "nope",
+        }));
+        let error = profile.validate().expect_err("unknown backend");
+        assert!(error.to_string().contains("known backends"));
+    }
+
+    #[test]
     fn rejects_duplicate_panes_across_profile() {
         let profile = profile_from(json!({
             "name": "default",
@@ -722,6 +765,8 @@ mod tests {
             name: "default".into(),
             workspaces: vec![],
             tasks: vec![],
+            session: None,
+            backend: None,
         };
         let error = DroveConfig::new(
             vec![profile.clone(), profile],
@@ -733,19 +778,19 @@ mod tests {
     }
 
     #[test]
-    fn requires_a_default_profile() {
+    fn a_default_profile_is_not_required() {
+        // D42: the CLI, not the model, decides what "no profile given" means
+        // when there is no `default` profile (the only profile, or exit 2).
         let profile = Profile {
             name: "other".into(),
             workspaces: vec![],
             tasks: vec![],
+            session: None,
+            backend: None,
         };
-        let error = DroveConfig::new(vec![profile], None, BackendTargets::default())
-            .expect_err("missing default profile");
-        assert!(
-            error
-                .to_string()
-                .contains("must declare a `default` profile")
-        );
+        let config = DroveConfig::new(vec![profile], None, BackendTargets::default())
+            .expect("no default profile required");
+        assert!(config.profiles.contains_key("other"));
     }
 
     #[test]

@@ -180,13 +180,16 @@ def task(name, run = [], check = None, inputs = [], after = [], auto = True,
         "on_stop": on_stop,
     })
 
-def profile(name, workspaces = [], tasks = [], extends = None, without = []):
+def profile(name, workspaces = [], tasks = [], extends = None, without = [],
+            session = None, backend = None):
     return _emit_profile(_compact({
         "name": name,
         "workspaces": workspaces,
         "tasks": tasks,
         "extends": _name(extends),
         "without": _names(without),
+        "session": session,
+        "backend": backend,
     }))
 
 def backend(id):
@@ -374,7 +377,15 @@ fn dedupe_preserving_order(warnings: Vec<String>) -> Vec<String> {
 /// after Starlark evaluation has finished (the sandbox never touches the
 /// filesystem or other profiles during evaluation itself).
 fn resolve_profiles(raw_profiles: Vec<JsonValue>, repo_root: &Path) -> Result<Vec<Profile>> {
-    let mut resolved: BTreeMap<String, (Vec<JsonValue>, Vec<JsonValue>)> = BTreeMap::new();
+    #[derive(Clone)]
+    struct Resolved {
+        workspaces: Vec<JsonValue>,
+        tasks: Vec<JsonValue>,
+        session: Option<String>,
+        backend: Option<String>,
+    }
+
+    let mut resolved: BTreeMap<String, Resolved> = BTreeMap::new();
     let mut profiles = Vec::with_capacity(raw_profiles.len());
 
     for mut raw in raw_profiles {
@@ -394,17 +405,35 @@ fn resolve_profiles(raw_profiles: Vec<JsonValue>, repo_root: &Path) -> Result<Ve
             .and_then(JsonValue::as_array)
             .cloned()
             .unwrap_or_default();
+        let mut session = raw
+            .get("session")
+            .map(|value| {
+                value.as_str().map(str::to_owned).with_context(|| {
+                    format!("profile `{name}` declares `session` that is not a string")
+                })
+            })
+            .transpose()?;
+        let mut backend = raw
+            .get("backend")
+            .map(|value| {
+                value.as_str().map(str::to_owned).with_context(|| {
+                    format!("profile `{name}` declares `backend` that is not a string")
+                })
+            })
+            .transpose()?;
 
         if let Some(extends) = raw.get("extends").and_then(JsonValue::as_str) {
-            let (base_workspaces, base_tasks) = resolved
+            let base = resolved
                 .get(extends)
                 .with_context(|| format!("profile `{name}` extends unknown profile `{extends}`"))?;
-            let mut inherited_workspaces = base_workspaces.clone();
+            let mut inherited_workspaces = base.workspaces.clone();
             inherited_workspaces.append(&mut workspaces);
             workspaces = inherited_workspaces;
-            let mut inherited_tasks = base_tasks.clone();
+            let mut inherited_tasks = base.tasks.clone();
             inherited_tasks.append(&mut tasks);
             tasks = inherited_tasks;
+            session = session.or_else(|| base.session.clone());
+            backend = backend.or_else(|| base.backend.clone());
         }
 
         if let Some(without) = raw.get("without").and_then(JsonValue::as_array) {
@@ -426,11 +455,21 @@ fn resolve_profiles(raw_profiles: Vec<JsonValue>, repo_root: &Path) -> Result<Ve
             }
         }
 
-        resolved.insert(name.clone(), (workspaces.clone(), tasks.clone()));
+        resolved.insert(
+            name.clone(),
+            Resolved {
+                workspaces: workspaces.clone(),
+                tasks: tasks.clone(),
+                session: session.clone(),
+                backend: backend.clone(),
+            },
+        );
         profiles.push(serde_json::json!({
             "name": name,
             "workspaces": workspaces,
             "tasks": tasks,
+            "session": session,
+            "backend": backend,
         }));
     }
 
@@ -1000,6 +1039,76 @@ profile(name = "core", extends = "default", workspaces = [extra_ws])
             .map(|workspace| workspace.name.as_str())
             .collect();
         assert_eq!(names, ["control", "extra"]);
+    }
+
+    #[test]
+    fn profile_session_and_backend_round_trip_into_the_model() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+profile(name = "default")
+profile(name = "monitoring", session = "drove-mon", backend = "herdr")
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        let default = compiled.config.profile("default").expect("default");
+        assert_eq!(default.session, None);
+        assert_eq!(default.backend, None);
+        let monitoring = compiled.config.profile("monitoring").expect("monitoring");
+        assert_eq!(monitoring.session.as_deref(), Some("drove-mon"));
+        assert_eq!(monitoring.backend.as_deref(), Some("herdr"));
+    }
+
+    #[test]
+    fn profile_extends_inherits_session_and_backend_unless_overridden() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            r#"
+profile(name = "default", session = "base-session", backend = "herdr")
+profile(name = "inherits", extends = "default")
+profile(name = "overrides", extends = "default", session = "own-session")
+"#,
+        )
+        .expect("write fixture");
+
+        let compiled = compile(&directory.path().join("Drovefile")).expect("compile");
+        let inherits = compiled.config.profile("inherits").expect("inherits");
+        assert_eq!(inherits.session.as_deref(), Some("base-session"));
+        assert_eq!(inherits.backend.as_deref(), Some("herdr"));
+
+        let overrides = compiled.config.profile("overrides").expect("overrides");
+        assert_eq!(overrides.session.as_deref(), Some("own-session"));
+        assert_eq!(overrides.backend.as_deref(), Some("herdr"));
+    }
+
+    #[test]
+    fn profile_rejects_a_non_string_session() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\", session = 42)",
+        )
+        .expect("write fixture");
+
+        let error = compile(&directory.path().join("Drovefile")).expect_err("non-string session");
+        assert!(error.to_string().contains("`session` that is not a string"));
+    }
+
+    #[test]
+    fn profile_rejects_a_non_string_backend() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("Drovefile"),
+            "profile(name = \"default\", backend = 42)",
+        )
+        .expect("write fixture");
+
+        let error = compile(&directory.path().join("Drovefile")).expect_err("non-string backend");
+        assert!(error.to_string().contains("`backend` that is not a string"));
     }
 
     #[test]

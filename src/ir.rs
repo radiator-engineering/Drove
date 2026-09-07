@@ -313,6 +313,8 @@ mod tests {
                 was: None,
             }],
             tasks: vec![],
+            session: None,
+            backend: None,
         }
     }
 
