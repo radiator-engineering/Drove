@@ -1,0 +1,25 @@
+docs/releasing.md
+  s_d653f929eefc31::t_e4f8c95dbf9407 1-63
+CHANGELOG.md
+  s_d653f929eefc31::t_067deb7762ef5b 1-57
+Cargo.toml
+  s_d653f929eefc31::t_5728173014dbdc 13-28
+README.md
+  s_d653f929eefc31::t_a67671630298be 47-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "9dc4bb2d957d8111c420ee8bb9e933402ef7da28",
+  "prompts": {},
+  "sessions": {
+    "s_d653f929eefc31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "76e0448a-8170-417d-9202-0a1e289ba475",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
