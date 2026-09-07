@@ -1,0 +1,56 @@
+src/backend/herdr.rs
+  s_5fb73953355951::t_e94ede2e31b64d 1165
+  s_5fb73953355951::t_1960ce08a26140 135-139,145,147-164
+  s_5fb73953355951::t_ee5060aecaad16 4,10
+  s_5fb73953355951::t_f59d56ccc8ba28 554,567,571-573
+  s_5fb73953355951::t_161b7115229db2 34,37-41,46-49
+  s_5fb73953355951::t_8c89b286479157 1196-1198,1202-1254,1259-1356
+  s_5fb73953355951::t_6b127e41d3f3b2 611-614
+  s_5fb73953355951::t_26cdf9e75c1194 1199-1201,1255-1258
+  s_5fb73953355951::t_c7a1ca5afa14e8 574
+src/executor.rs
+  s_5fb73953355951::t_aa097dba0bbff3 1824
+  s_5fb73953355951::t_929a695f3cac19 2376-2378,2380-2382
+  s_5fb73953355951::t_66191b04b8135a 1115-1118
+  s_5fb73953355951::t_1c325322c5c8bd 1827-1828,1837-1842,1845-1848,1857-1858
+  s_5fb73953355951::t_0f2bf63b458c93 1978,2302-2342,2346-2348,2352-2369,2372-2375,2379,2383-2413
+  s_5fb73953355951::t_2c4f59715f835f 1119,1126
+  s_5fb73953355951::t_5855f4124c0e65 1887-1894
+  s_5fb73953355951::t_9c9bd8031bbf8a 1953,1955-1958,1972-1973
+  s_5fb73953355951::t_ce9c78f09d05a5 2370-2371
+  s_5fb73953355951::t_26cdf9e75c1194 1974-1977,2343-2345,2349-2351
+  s_5fb73953355951::t_6dfd1b791ad8d0 1825-1826
+  s_5fb73953355951::t_6faac9de947609 1843-1844
+src/backend/mod.rs
+  s_5fb73953355951::t_1231ce243a39a7 149-150,162,171-174
+  s_5fb73953355951::t_0288160ddd3a07 151
+  s_5fb73953355951::t_b03c21ff9cfb28 165-170
+  s_5fb73953355951::t_b64c2c0e9db2bc 152-154
+  s_5bd098e0c8763c::t_cbb460ee77f4d1 175
+CHANGELOG.md
+  s_5fb73953355951::t_2a99230e635263 10-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "9f1335c9abd1f23e88dbf671a93ec6e7bceb5cb5",
+  "prompts": {},
+  "sessions": {
+    "s_5bd098e0c8763c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "70d14c4b-89f2-4efd-b5ea-2a7e0a53a29d",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_5fb73953355951": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9a844f68-23c2-4c0f-a1e5-70f97bf73292",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
