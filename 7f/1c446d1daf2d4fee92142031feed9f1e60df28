@@ -1,0 +1,46 @@
+docs/drovefile.md
+  s_e5ce3cc70cf76d::t_797e254af83ad3 209
+src/cli.rs
+  s_e5ce3cc70cf76d::t_0a7da869177356 1591-1594
+  s_e5ce3cc70cf76d::t_493d96ac4fc609 832-836
+  s_e5ce3cc70cf76d::t_a432f5773746f3 864-874
+src/executor.rs
+  s_e5ce3cc70cf76d::t_22fd249d2cc5b9 1433
+  s_e5ce3cc70cf76d::t_ba93b30466d746 675
+  s_e5ce3cc70cf76d::t_2b8c713b3c430b 640-643
+  s_e5ce3cc70cf76d::t_4c18cdd78b2a45 735,737-739
+  s_e5ce3cc70cf76d::t_8135f2831f2ee1 2765-2815
+  s_e5ce3cc70cf76d::t_0174f50f5d598f 657-659
+  s_e5ce3cc70cf76d::t_b07b3ceeedc221 742-746
+  s_e5ce3cc70cf76d::t_bc3dbd591857f0 844,846
+  s_cb2150f40e2ee6::t_b55dbf6fe747e0 2764
+src/state.rs
+  s_e5ce3cc70cf76d::t_f9eb35e00c2787 539
+  s_e5ce3cc70cf76d::t_238797e485129b 515-538,540-547
+  s_e5ce3cc70cf76d::t_3e5a120990a929 92-101
+  s_e5ce3cc70cf76d::t_ed1b7b50524f02 514
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7f1c446d1daf2d4fee92142031feed9f1e60df28",
+  "prompts": {},
+  "sessions": {
+    "s_cb2150f40e2ee6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e664b5f2-82b7-44ad-88c5-dfa8273d9611",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_e5ce3cc70cf76d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "80b69257-0fbb-4a0b-8cbf-71cff4b8eba1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
