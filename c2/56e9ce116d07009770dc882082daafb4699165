@@ -1,0 +1,20 @@
+src/backend/select.rs
+  s_641961d19ce1ba::t_bb18291226d376 404-490,492-509
+  s_641961d19ce1ba::t_ebf66a088ecd3f 491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c256e9ce116d07009770dc882082daafb4699165",
+  "prompts": {},
+  "sessions": {
+    "s_641961d19ce1ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b205b4df-6246-45c6-9bd9-144caffdc8a5",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
