@@ -1,0 +1,31 @@
+tests/cli.rs
+  s_4534414f58c9b6::t_679448d3b6f179 411-414,418-436
+  s_4534414f58c9b6::t_a5d1b1108906b8 437-438
+src/backend/herdr.rs
+  s_4534414f58c9b6::t_f5fb74848d58eb 1882-1885,1889-1906
+  s_0b4d0cb87b6e76::t_c811baf8d75812 1907-1908
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f6a395091477ed94baf1eb3e287580f10271a77c",
+  "prompts": {},
+  "sessions": {
+    "s_0b4d0cb87b6e76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7306ac45-dab6-486b-8f35-7bd45f2816a3",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_4534414f58c9b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e7c0c8c-dcec-48d1-a8cd-bec70505b648",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
