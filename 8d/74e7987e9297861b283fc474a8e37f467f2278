@@ -1,0 +1,58 @@
+docs/drovefile.md
+  s_e5ce3cc70cf76d::t_ca17a52b641a8d 207,209-211
+src/state.rs
+  s_e5ce3cc70cf76d::t_937add6972fd88 475,477-480,495-503
+  s_e5ce3cc70cf76d::t_48fa16e7853a1a 476,481-494
+  s_e5ce3cc70cf76d::t_3cfcc14aa164ea 115-134
+  s_e5ce3cc70cf76d::t_53003b188e9e61 474
+src/executor.rs
+  s_e5ce3cc70cf76d::t_90d13c5151da8b 2738
+  s_e5ce3cc70cf76d::t_58a5995269a889 2573
+  s_e5ce3cc70cf76d::t_abb38025891ffc 655-663,671
+  s_e5ce3cc70cf76d::t_b7c43ffa2f15ca 603-605,824-830,836,839-840,1037,1078-1080,2617-2621,2647
+  s_e5ce3cc70cf76d::t_dd35b993275198 514-532,538-539,547-552
+  s_e5ce3cc70cf76d::t_6ab8c23773627c 2068-2071,2082-2093
+  s_e5ce3cc70cf76d::t_d938f6bd4d220d 2218-2221
+  s_e5ce3cc70cf76d::t_cffe58fe629516 768-773
+  s_e5ce3cc70cf76d::t_3f6e10217845e0 943-957,959-960,962,976-996,998-999,1001-1002,1004-1036,1038-1049,1051-1072,1076,1081-1123,1125-1128
+  s_e5ce3cc70cf76d::t_74fc2c21e3cd10 2574-2616,2622-2646,2648-2684,2690-2737,2739-2755
+  s_e5ce3cc70cf76d::t_209e6df8a445fe 806-807,813-817,822-823,831-835,837-838,841-843
+  s_e5ce3cc70cf76d::t_bc54c36c9327e2 2114
+  s_e5ce3cc70cf76d::t_2a18fdb611d40f 3052
+  s_e5ce3cc70cf76d::t_c0885f1027b39f 2685-2689
+  s_e5ce3cc70cf76d::t_bd048ad6868cad 873-874
+  s_e5ce3cc70cf76d::t_69ce3b9a6ba825 2142-2146
+  s_e5ce3cc70cf76d::t_51f3013f0ee56e 23
+  s_e5ce3cc70cf76d::t_55dff05523826f 591-602,606-632,639-640,646-654,670,675-677,700-702,705-710,712-722,724-730,738
+src/cli.rs
+  s_e5ce3cc70cf76d::t_d19ebdd489620a 1010-1015,1018-1024,1026-1028,1036-1039
+  s_e5ce3cc70cf76d::t_532cb0512467e2 1040,1554-1581
+  s_e5ce3cc70cf76d::t_b7c43ffa2f15ca 1025
+  s_e5ce3cc70cf76d::t_ce39fc6fec8a03 698
+  s_e5ce3cc70cf76d::t_db5949b5155df4 809-818,823-824
+  s_e5ce3cc70cf76d::t_0561d89ed736a4 351-353,355-361
+  s_e5ce3cc70cf76d::t_72334ab6cffca9 766-775,778
+  s_e5ce3cc70cf76d::t_f32bb76b1a1af1 1526-1527
+  s_e5ce3cc70cf76d::t_e7a5957bf46a2c 455-460
+  s_e5ce3cc70cf76d::t_12eeef9ca513ce 1553
+tests/cli.rs
+  s_e5ce3cc70cf76d::t_391c6ffc8e5b15 944-1036
+CHANGELOG.md
+  s_e5ce3cc70cf76d::t_ac66c1557688db 12-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "8d74e7987e9297861b283fc474a8e37f467f2278",
+  "prompts": {},
+  "sessions": {
+    "s_e5ce3cc70cf76d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "80b69257-0fbb-4a0b-8cbf-71cff4b8eba1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
