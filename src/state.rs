@@ -339,7 +339,13 @@ impl PruneReason {
 /// recorded `cwd` no longer matches — Herdr reused the id for an unrelated
 /// resource. A record with no `label`/`cwd` yet (saved before this field
 /// existed) is not compared, since there is nothing to compare against; see
-/// `docs/drovefile.md` for the reasoning. A missing or reused workspace
+/// `docs/drovefile.md` for the reasoning. A label-mismatched workspace or
+/// placement is exempt from this when it is still empty on the live side —
+/// its only tab (workspace) or its only pane (placement) is idle, with
+/// nothing else — since a Herdr session that just restarted hands back a
+/// bare root workspace/tab under the same ids Drove last used, and that is
+/// still the resource for D48/D51's label rename to claim, not a stranger
+/// to prune out from under it. A missing or reused workspace
 /// also drops every placement and pane whose `backend_id` is namespaced
 /// under it (Herdr ids nest `<workspace>:t1`, `<workspace>:p1` directly off
 /// the workspace id, not off the tab); a missing or reused placement drops
@@ -375,6 +381,36 @@ pub fn prune_missing(
         })
         .collect();
 
+    // A pane counts as idle only when process info was actually collected
+    // and shows nothing running in the foreground (an unqueried/unavailable
+    // `None` is treated as "not idle" — there is nothing to prove it is).
+    let pane_is_idle = |pane: &crate::backend::herdr::PaneInfo| {
+        pane.process_info
+            .as_ref()
+            .is_some_and(|info| info.command.is_empty())
+    };
+    let tab_is_empty = |tab_id: &str| {
+        let mut panes = snapshot.panes.iter().filter(|pane| pane.tab_id == tab_id);
+        matches!((panes.next(), panes.next()), (Some(only), None) if pane_is_idle(only))
+    };
+    // D55 follow-up: right after a session restart, Herdr's id counter
+    // starts over, so the fresh root workspace/tab it hands back reuses the
+    // ids Drove last recorded — but holds none of the old content. Treating
+    // that bare `w1`/`1`-labelled tab as "id reused" would prune it, plan a
+    // brand new workspace under a fresh id, and strand the empty original
+    // unrenamed (the issue #25 shape, one level up). A workspace/tab this
+    // empty — its only tab has exactly one idle pane, nothing else — is
+    // still eligible for the rename D48/D51 already perform on a label
+    // mismatch; only a workspace/tab that actually holds something else is
+    // a reused id.
+    let workspace_is_empty = |workspace_id: &str| {
+        let mut tabs = snapshot
+            .tabs
+            .iter()
+            .filter(|tab| tab.workspace_id == workspace_id);
+        matches!((tabs.next(), tabs.next()), (Some(only), None) if tab_is_empty(&only.tab_id))
+    };
+
     let mut dropped: BTreeMap<String, PruneReason> = BTreeMap::new();
     let mut missing_workspace_backend_ids: BTreeMap<String, PruneReason> = BTreeMap::new();
     let mut missing_placement_identities: BTreeMap<String, PruneReason> = BTreeMap::new();
@@ -390,6 +426,7 @@ pub fn prune_missing(
                 Some(live_label) => {
                     if let Some(recorded_label) = &resource.label
                         && *live_label != recorded_label.as_str()
+                        && !workspace_is_empty(resource.backend_id.as_str())
                     {
                         missing_workspace_backend_ids
                             .insert(resource.backend_id.clone(), PruneReason::IdReused);
@@ -406,6 +443,7 @@ pub fn prune_missing(
                 Some(live_label) => {
                     if let Some(recorded_label) = &resource.label
                         && *live_label != recorded_label.as_str()
+                        && !tab_is_empty(resource.backend_id.as_str())
                     {
                         missing_placement_identities
                             .insert(identity.clone(), PruneReason::IdReused);
@@ -565,6 +603,7 @@ fn state_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ProcessInfo;
     use crate::backend::herdr::{PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo};
 
     fn resource(kind: &str, backend_id: &str, parent: Option<&str>) -> ManagedResource {
@@ -759,6 +798,169 @@ mod tests {
         );
         assert!(!pruned.resources.contains_key("core"));
         // The workspace's own tree is dropped with it, same as a missing id.
+        assert!(!pruned.resources.contains_key("core/main"));
+        assert!(!pruned.resources.contains_key("review"));
+    }
+
+    #[test]
+    fn prune_missing_keeps_an_empty_root_workspace_for_a_fresh_session_to_rename() {
+        // A session that just restarted hands back a bare root workspace
+        // under the same id Drove last used (Herdr's counter starts over
+        // too), still labelled Herdr's own default and holding nothing but
+        // one idle tab/pane. That is not a stranger that reused the id — it
+        // is exactly the resource D48/D51's label rename already claims.
+        let mut managed = ManagedProfile::default();
+        managed.resources.insert(
+            "core".into(),
+            ManagedResource {
+                label: Some("control".into()),
+                ..resource("workspace", "w1", None)
+            },
+        );
+        let snapshot = SessionSnapshot {
+            workspaces: vec![WorkspaceInfo {
+                workspace_id: "w1".into(),
+                label: "1".into(),
+                tokens: Default::default(),
+            }],
+            tabs: vec![TabInfo {
+                tab_id: "w1:t1".into(),
+                workspace_id: "w1".into(),
+                label: "1".into(),
+            }],
+            panes: vec![PaneInfo {
+                pane_id: "w1:p1".into(),
+                tab_id: "w1:t1".into(),
+                workspace_id: "w1".into(),
+                cwd: None,
+                tokens: Default::default(),
+                process_info: Some(ProcessInfo {
+                    command: Vec::new(),
+                    pid: Some(1),
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert!(dropped.is_empty());
+        assert!(pruned.resources.contains_key("core"));
+    }
+
+    #[test]
+    fn prune_missing_drops_a_relabelled_workspace_that_holds_real_content() {
+        // Two tabs (or any pane with a foreground process) means the live
+        // side is not the bare post-restart root — it is someone else's
+        // workspace that happened to land on the same id.
+        let mut managed = ManagedProfile::default();
+        managed.resources.insert(
+            "core".into(),
+            ManagedResource {
+                label: Some("control".into()),
+                ..resource("workspace", "w1", None)
+            },
+        );
+        let snapshot = SessionSnapshot {
+            workspaces: vec![WorkspaceInfo {
+                workspace_id: "w1".into(),
+                label: "other".into(),
+                tokens: Default::default(),
+            }],
+            tabs: vec![
+                TabInfo {
+                    tab_id: "w1:t1".into(),
+                    workspace_id: "w1".into(),
+                    label: "1".into(),
+                },
+                TabInfo {
+                    tab_id: "w1:t2".into(),
+                    workspace_id: "w1".into(),
+                    label: "2".into(),
+                },
+            ],
+            panes: vec![
+                PaneInfo {
+                    pane_id: "w1:p1".into(),
+                    tab_id: "w1:t1".into(),
+                    workspace_id: "w1".into(),
+                    cwd: None,
+                    tokens: Default::default(),
+                    process_info: Some(ProcessInfo {
+                        command: Vec::new(),
+                        pid: Some(1),
+                    }),
+                },
+                PaneInfo {
+                    pane_id: "w1:p2".into(),
+                    tab_id: "w1:t2".into(),
+                    workspace_id: "w1".into(),
+                    cwd: None,
+                    tokens: Default::default(),
+                    process_info: Some(ProcessInfo {
+                        command: Vec::new(),
+                        pid: Some(2),
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(dropped, vec![("core".to_owned(), PruneReason::IdReused)]);
+        assert!(!pruned.resources.contains_key("core"));
+    }
+
+    #[test]
+    fn prune_missing_keeps_an_empty_root_tab_for_a_fresh_session_to_rename() {
+        let mut managed = full_managed();
+        managed.resources.insert(
+            "core/main".into(),
+            ManagedResource {
+                label: Some("main".into()),
+                ..resource("placement", "w1:t1", Some("core"))
+            },
+        );
+        let mut snapshot = full_snapshot();
+        snapshot.tabs[0].label = "1".into();
+        snapshot.panes[0].process_info = Some(ProcessInfo {
+            command: Vec::new(),
+            pid: Some(1),
+        });
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert!(dropped.is_empty());
+        assert!(pruned.resources.contains_key("core/main"));
+    }
+
+    #[test]
+    fn prune_missing_drops_a_relabelled_tab_with_a_running_process() {
+        let mut managed = full_managed();
+        managed.resources.insert(
+            "core/main".into(),
+            ManagedResource {
+                label: Some("main".into()),
+                ..resource("placement", "w1:t1", Some("core"))
+            },
+        );
+        let mut snapshot = full_snapshot();
+        snapshot.tabs[0].label = "other".into();
+        snapshot.panes[0].process_info = Some(ProcessInfo {
+            command: vec!["cargo".into(), "run".into()],
+            pid: Some(1),
+        });
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(
+            dropped,
+            vec![
+                ("core/main".to_owned(), PruneReason::IdReused),
+                ("review".to_owned(), PruneReason::IdReused),
+            ]
+        );
         assert!(!pruned.resources.contains_key("core/main"));
         assert!(!pruned.resources.contains_key("review"));
     }

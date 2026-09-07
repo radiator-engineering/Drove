@@ -18,7 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cwd` no longer matches, is pruned and reported as `id reused` (instead of
   `not in session`) and planned as a fresh create — Herdr restarting its id
   counter no longer risks a rename or a close-and-recreate landing on an
-  unrelated live resource that happens to share the old id.
+  unrelated live resource that happens to share the old id. A workspace or
+  tab that is still empty on the live side (its only tab, or only pane, is
+  idle and nothing else) is exempt from this: the bare root a just-restarted
+  session hands back under the same ids is kept and renamed in place rather
+  than pruned as reused, which would otherwise strand it unrenamed while a
+  fresh workspace is created alongside it.
 - `drove up` now records ownership and saves state after each action
   succeeds, rather than only after the whole plan finishes, so a failure
   partway through no longer loses track of what already landed. A failed
