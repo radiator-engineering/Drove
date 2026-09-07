@@ -11,7 +11,6 @@ use predicates::prelude::*;
 use serde_json::{Value, json};
 use sha2::Digest;
 
-
 fn example_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
