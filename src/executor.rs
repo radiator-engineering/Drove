@@ -214,6 +214,8 @@ fn record_task_resource(
             backend_id: String::new(),
             parent: None,
             digest: observed_digest,
+            label: None,
+            cwd: None,
             adopted: None,
             last_outcome: Some(outcome.to_owned()),
         },
@@ -1030,6 +1032,9 @@ fn record_action_ownership(
                 return false;
             };
             let backend_id = resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+            let cwd = resource_fields(ir, "pane", address)
+                .ok()
+                .and_then(|fields| string_field(fields, "cwd"));
             managed.resources.insert(
                 address.to_owned(),
                 ManagedResource {
@@ -1037,6 +1042,8 @@ fn record_action_ownership(
                     backend_id,
                     parent: Some(parent),
                     digest: digest.to_owned(),
+                    label: None,
+                    cwd,
                     adopted: Some(true),
                     last_outcome: None,
                 },
@@ -1063,6 +1070,9 @@ fn record_action_ownership(
                 &applied.workspace_ids,
                 action.backend_id.as_deref(),
             );
+            let label = resource_fields(ir, "workspace", address)
+                .ok()
+                .and_then(|fields| string_field(fields, "label"));
             managed.resources.insert(
                 address.to_owned(),
                 ManagedResource {
@@ -1070,6 +1080,8 @@ fn record_action_ownership(
                     backend_id,
                     parent: None,
                     digest: digest.to_owned(),
+                    label,
+                    cwd: None,
                     adopted: None,
                     last_outcome: None,
                 },
@@ -1083,6 +1095,11 @@ fn record_action_ownership(
                 group_workspace(ir, address),
             ) {
                 let backend_id = resolve(address, &applied.group_ids, action.backend_id.as_deref());
+                let label = ir
+                    .placements
+                    .iter()
+                    .find(|group| group.id == address)
+                    .map(|group| group.label.clone());
                 managed.resources.insert(
                     address.to_owned(),
                     ManagedResource {
@@ -1090,6 +1107,8 @@ fn record_action_ownership(
                         backend_id,
                         parent: Some(workspace.to_owned()),
                         digest: digest.to_owned(),
+                        label,
+                        cwd: None,
                         adopted: None,
                         last_outcome: None,
                     },
@@ -1106,6 +1125,9 @@ fn record_action_ownership(
                 for pane in &group.panes {
                     if let Ok(digest) = digest_of(ir, "pane", pane) {
                         let backend_id = resolve(pane, &applied.pane_ids, None);
+                        let cwd = resource_fields(ir, "pane", pane)
+                            .ok()
+                            .and_then(|fields| string_field(fields, "cwd"));
                         managed.resources.insert(
                             pane.clone(),
                             ManagedResource {
@@ -1113,6 +1135,8 @@ fn record_action_ownership(
                                 backend_id,
                                 parent: Some(address.to_owned()),
                                 digest: digest.to_owned(),
+                                label: None,
+                                cwd,
                                 adopted: None,
                                 last_outcome: None,
                             },
@@ -1137,6 +1161,9 @@ fn record_action_ownership(
                 .resources
                 .get(address)
                 .and_then(|resource| resource.adopted);
+            let cwd = resource_fields(ir, "pane", address)
+                .ok()
+                .and_then(|fields| string_field(fields, "cwd"));
             managed.resources.insert(
                 address.to_owned(),
                 ManagedResource {
@@ -1144,6 +1171,8 @@ fn record_action_ownership(
                     backend_id,
                     parent: Some(parent),
                     digest: digest.to_owned(),
+                    label: None,
+                    cwd,
                     adopted,
                     last_outcome: None,
                 },
@@ -1164,6 +1193,8 @@ fn record_action_ownership(
                     backend_id,
                     parent: Some(pane),
                     digest: digest.to_owned(),
+                    label: None,
+                    cwd: None,
                     adopted: None,
                     last_outcome: None,
                 },
@@ -1911,6 +1942,8 @@ mod tests {
                     backend_id: format!("backend-{id}"),
                     parent: parent.map(str::to_owned),
                     digest: "any-digest".into(),
+                    label: None,
+                    cwd: None,
                     adopted: None,
                     last_outcome: None,
                 },
@@ -2532,6 +2565,8 @@ mod tests {
                 backend_id: "w1".into(),
                 parent: None,
                 digest: "any".into(),
+                label: None,
+                cwd: None,
                 adopted: None,
                 last_outcome: None,
             },
@@ -3039,6 +3074,8 @@ mod tests {
                     backend_id: "w1".into(),
                     parent: None,
                     digest: "d".into(),
+                    label: None,
+                    cwd: None,
                     adopted: None,
                     last_outcome: None,
                 },
@@ -3102,6 +3139,8 @@ mod tests {
                         backend_id: backend.into(),
                         parent: parent.map(ToOwned::to_owned),
                         digest: "d".into(),
+                        label: None,
+                        cwd: None,
                         adopted: None,
                         last_outcome: None,
                     },
@@ -3177,6 +3216,8 @@ mod tests {
                         backend_id: backend.into(),
                         parent: parent.map(ToOwned::to_owned),
                         digest: "d".into(),
+                        label: None,
+                        cwd: None,
                         adopted: None,
                         last_outcome: None,
                     },

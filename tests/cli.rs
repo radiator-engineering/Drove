@@ -1171,6 +1171,81 @@ fn write_state_with_stale_workspace(state_home: &Path, repo_root: &Path) {
     .expect("write state file");
 }
 
+/// A state file recording workspace `dev` at backend id `w9` with label
+/// `control` (D55 point 2): paired with a live snapshot that answers `w9`
+/// with a different label, this is Herdr reusing the id for an unrelated
+/// workspace, not the one Drove created.
+fn write_state_with_relabeled_workspace(state_home: &Path, repo_root: &Path) {
+    let state_path = state_file_path(state_home, repo_root);
+    fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
+    let state = json!({
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "profiles": {
+            "default": {
+                "desired_digest": "",
+                "resources": {
+                    "dev": {
+                        "kind": "workspace",
+                        "backend_id": "w9",
+                        "parent": null,
+                        "digest": "stale-digest",
+                        "label": "control",
+                        "cwd": null,
+                        "adopted": null,
+                        "last_outcome": null,
+                    }
+                },
+            }
+        },
+        "approvals": [],
+        "journal": [],
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state file");
+}
+
+/// A state file whose `default` profile is stamped for Herdr session
+/// `stamped_session` (D55 point 1), with one recorded workspace — used to
+/// prove a run against a different session resets it instead of trusting
+/// the recorded id.
+fn write_state_with_stamped_target(state_home: &Path, repo_root: &Path, stamped_session: &str) {
+    let state_path = state_file_path(state_home, repo_root);
+    fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
+    let state = json!({
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "profiles": {
+            "default": {
+                "desired_digest": "",
+                "target": {"backend": "herdr", "session": stamped_session},
+                "resources": {
+                    "dev": {
+                        "kind": "workspace",
+                        "backend_id": "w1",
+                        "parent": null,
+                        "digest": "stale-digest",
+                        "label": null,
+                        "cwd": null,
+                        "adopted": null,
+                        "last_outcome": null,
+                    }
+                },
+            }
+        },
+        "approvals": [],
+        "journal": [],
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state file");
+}
+
 /// A state file with one unfinished journal entry: an earlier `run` began
 /// (`begin_action`) but never recorded completion, the shape a killed
 /// process leaves behind (D52 point 4).
@@ -1378,6 +1453,193 @@ profile(
             "recreate dev: backend id no longer exists; recreating",
         ));
     server.join().expect("fake Herdr server thread");
+}
+
+// D55 point 2: Herdr reused `w9` for an unrelated workspace, so the live
+// session answers with the same backend id but a different label than the
+// one Drove recorded — the recorded resource must be pruned as reused, not
+// trusted as still being the workspace Drove created (finding audit-state.md
+// #2: reproduced here from a fake snapshot whose `w9` is labelled `other`
+// against state recording it labelled `control`).
+#[test]
+fn status_reports_id_reused_for_a_workspace_whose_live_label_changed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_relabeled_workspace(&state_home, directory.path());
+
+    let socket = directory.path().join("herdr-relabel.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({
+            "version": "0.8.2", "protocol": 1,
+            "workspaces": [{"workspace_id": "w9", "label": "other"}],
+            "tabs": [], "panes": [], "agents": [],
+        }),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    let output = command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "--json",
+            "status",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("\"pruned\""))
+        .get_output()
+        .stdout
+        .clone();
+    server.join().expect("fake Herdr server thread");
+
+    let plan: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(plan["pruned"], json!(["dev"]));
+    let creates_dev = plan["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .any(|action| action["address"] == "dev" && action["kind"]["core"] == "create_workspace");
+    assert!(
+        creates_dev,
+        "a reused id must plan a fresh create, not a rename of the stranger: {plan}"
+    );
+}
+
+#[test]
+fn status_text_reports_id_reused_for_a_workspace_whose_live_label_changed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_relabeled_workspace(&state_home, directory.path());
+
+    let socket = directory.path().join("herdr-relabel-text.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({
+            "version": "0.8.2", "protocol": 1,
+            "workspaces": [{"workspace_id": "w9", "label": "other"}],
+            "tabs": [], "panes": [], "agents": [],
+        }),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "status",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(
+            "recreate dev: id reused; recreating",
+        ));
+    server.join().expect("fake Herdr server thread");
+}
+
+// D55 point 1: local state recorded against Herdr session `a` must not be
+// trusted against session `b` — Herdr's ids are session-scoped, so `w1`
+// could mean an entirely different workspace under `b`.
+#[test]
+fn status_starts_fresh_when_state_was_recorded_for_a_different_session() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_stamped_target(&state_home, directory.path(), "a");
+
+    let socket = directory.path().join("herdr-retarget.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []}),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    let output = command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "--session",
+            "b",
+            "--json",
+            "status",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "state recorded for herdr:a; starting fresh for herdr:b",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+    server.join().expect("fake Herdr server thread");
+
+    let plan: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(plan["pruned"], json!([]));
+    let creates_dev = plan["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .any(|action| action["address"] == "dev" && action["kind"]["core"] == "create_workspace");
+    assert!(
+        creates_dev,
+        "a profile stamped for another session must plan everything as creates: {plan}"
+    );
 }
 
 #[test]
