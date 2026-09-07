@@ -1,72 +1,137 @@
 # Drove consumer repair — 2026-09-07
 
-Status: implementation and disposable verification passed; audited production
-recovery is being activated. Historical checkpoints will be preserved below.
+The native eventlog consumer is installed and active in the existing Drove
+session. History, inherited work, and the adopted controller were preserved.
+The final backend repair and this report are published through the exact-path
+controller result and native commit acknowledgment in the log.
 
-Upstream installed baseline: e685252 (eventlog 0.1.0 with setup/action/lifecycle).
-Drove baseline: 1b71bf0 (v0.1.2). All 16 cumulative recovery commit refs in
-`eventlog-cutover.md` were reverified reachable from current HEAD.
+## Installed components and ownership
 
-## Ownership and current seams
+Eventlog installed SHA-256:
+`7bc864c0654b6a2dd3f35f888dbde90b4e49a9062cd5d665eae43b967aa7baca`.
+Accepted upstream implementation refs: c582632, e14c2ec, 1647934, 3da83ed.
+Upstream passed 220 tests, zero failures, one intentional OS-protection skip,
+strict Clippy and changed-file formatting. The version string remains 0.1.0.
 
-The Drove controller exclusively owns Drove changes and log writes. The
-event-log coordinator (session event-log, w6:p6) owns the reusable commit
-command extension. Model labels alone were insufficient: configured command
-support is now installed from accepted upstream. Drove's thin Python binding supplies
-Composer 2.5 Fast / Claude Sonnet prompts; eventlog retains runtime, scope,
-index and outcome ownership.
+Drove consumes upstream setup, generated helper, lifecycle, react, and actions.
+Its small model-command.py binding invokes Composer 2.5 Fast and Claude Sonnet
+with the complete driving event. Eventlog owns scope, isolated commit creation
+and publication, index protection, timeout, lock, outcome and docs-loop logic.
+Removed local reactor/supervisor scripts are retained in Git history.
 
-Drove's pane startup hooks were never called from executor::up. Isolated
-worker drove-pane-hooks (gpt-6-astra/high, drove w7K:p1, branch
-fix/consumer-pane-hooks, .worktrees/drove-pane-hooks) owns src/executor.rs.
-Worker patch accepted after controller review and combined verification;
-worker retired and its workspace closed (events 528/529).
-No worker commit is authorized; controller integrates the reviewed patch.
+The Drove controller owns this repository and its log. The upstream controller
+owns event-log and does not write this log. Existing IDs were verified against
+the live snapshot, including ordered pane membership, before a one-time state
+import: workspaces w1/w2/w3, six tabs, seven panes. Controller w1:p1 remains
+adopted. No duplicate workspace, tab or pane was created; every apply used --no-focus.
 
-## Preserved state
+Current panes: controller w1:p1; native log viewer w1:p2; agentmon w1:p3;
+lazygit w2:p1; native committer w2:p2; native docs w2:p3; files w3:p1.
+The labels of the existing docs/files tabs and reactor panes were reconciled.
 
-Snapshot directory: `/var/folders/x9/rz97sz4s75z45ym82kdfz87r0000gn/T/drove-consumer-nit8dild`.
-It contains all inherited dirty bytes, a Git clone with full history, the
-copied log, the Herdr snapshot, and a candidate Drove state tested under an
-isolated DROVE_STATE_HOME. The history and inherited source files remain
-intact; later changes to DECISIONS.md append the new cutover decision.
+## Audited recovery and real model outcomes
 
-The verified layout map is control w1 (controller w1:p1, log w1:p2, monitor
-w1:p3); maintenance w2 (lazygit w2:p1, committer w2:p2, docs w2:p3); files
-w3 (w3:p1). Each placement's ordered panes was compared with the live
-snapshot. No Drove state existed for this repository path. The candidate
-one-time ownership import produces only existing-pane command restarts,
-with no creates, closes or controller action. No production import yet.
+- All 22 inherited dirty artifacts were preserved byte-for-byte; DECISIONS.md
+  retains its original prefix plus new decisions. The manifest below records
+  the inherited hashes. Full history and source snapshots remain in the
+  evidence directory.
+- All 16 historical commit refs were verified ancestors of HEAD. Recovered
+  committed ack531 maps result471 and restores the missed cumulative docs
+  trigger without pretending historical commands ran again.
+- Ack532 explicitly supersedes pending coordination results512/515/522 and
+  accepted hook result528 with fresh exact-path bootstrap result530. External
+  global-config result523 has no repository scope. No current-tip baseline
+  hid pending work.
+- Composer processed all 56 paths in result530. Ack535 reports
+  `7213e44ec6029764840cbc14bc9f9ae21ad302cf`,
+  `f73659f04d995c424d213d93640711ee20d0afa5`, and
+  `7170bcb247eff480cdf7d2f26ff9939d4f271a02`. Their changed-path union exactly
+  equals the authorized set; source and index were clean afterward.
+- Sonnet documented the bootstrap hook behavior in result540; ack541 reports
+  updated. Composer committed it as
+  `8022a9bf36f5168ba735122ec57ad48a57e3c7dc` in ack543. Own-doc ack545 skipped,
+  proving loop suppression with real models.
+- Historical docs attempt538 failed because the controller created an ignored
+  worktree inside the repository during the docs snapshot. The guard correctly
+  rejected those outside-root additions; Sonnet itself found no docs changes.
+  Once the active pass settled, the worktree was moved outside the repository.
+  The same verified refs were requeued at546; native docs ack548 reports
+  skipped/no documentation changes. The original failure remains visible.
 
-## Checks completed
+## Drove defects found through live verification
 
-- Native setup preview/apply/upgrade preserves the log and host Drovefile;
-  repeat setup reports no changes.
-- Drove and updated log-driven example compile; 48 CLI/example tests pass.
-- Historical v2/v3 digest equivalence remains covered by frozen fixtures.
-- Disposable lifecycle start registers cursor-committer and doc-worker claims.
-- A disposable native docs reaction to the recovered 16-ref acknowledgment
-  delivered every ref to Sonnet's prompt and appended exactly
-  `paths=docs/recovery-probe.md`. Claude login policy and LOG_DRIVEN_WORKER
-  marker verified through the stub executable. No real model ran in this probe.
-- Cursor and Claude login status verified; real model invocation still pending.
-- Changed-file whitespace and formatting checks pass.
-- Doctor installs the current Claude guard. It still reports inherited
-  historical strict-validation failures; history is preserved rather than
-  rewritten to hide them. Cursor/Codex repo config directories are absent.
+The first accepted fix runs pane on_start hooks before commands and preserves
+retryable dependency failures. Worker drove-pane-hooks owned src/executor.rs,
+was reviewed and accepted at528, retired at529, and its workspace was closed.
+Its uncommitted checkout is preserved externally at
+`/Users/jjmartin/Development/Drove-worktrees/consumer-pane-hooks`.
 
-## Recovery sequencing
+Live cutover exposed a separate backend defect: restart_command only typed
+argv into a running program. The repaired Herdr backend interrupts once,
+waits up to ten seconds for a verified shell, then atomically submits input.
+Busy jobs receive no replacement text and remain retryable. Foreground process
+inspection selects the group leader, avoiding false drift from lazygit's
+short-lived Git children.
 
-Before activation, record the complete pending backlog as a fresh result
-with exact paths, including the new adapter/config/briefs for isolated
-commit-command bootstrapping. Restore a truthful compatibility committed ack
-through result 471 with the 16 verified refs. Explicitly supersede later
-coordination-only results 512/515/522 with the fresh exact-path result before
-resuming past 528; do not advance past the new result or pending worker work.
-Bring up the committer first and verify its repair commit, then activate docs
-so the historical recovery and new commit triggers cannot race the initial
-publication. Verify real Composer/Sonnet behavior, exact commits, docs-loop
-suppression, resume and repeated layout/setup convergence.
+Herdr 0.8.2 pane run is CLI sugar for pane.send_input, not a replacement API.
+Its shell_pid field can also name a directly launched program. New Drove
+root/tab serve panes therefore retain an interactive shell, like split panes.
+An older direct-exec pane without a shell is explicitly refused for in-place
+restart; it is never treated as a shell or silently replaced. The existing
+seven production panes have shell parents and retain their IDs.
+
+The backend checkout is preserved outside the repository at
+`/Users/jjmartin/Development/Drove-worktrees/consumer-restart-command`.
+Neither retained checkout runs an agent or reactor.
+
+## Production resume and final installation
+
+Installed Drove SHA-256:
+`9246868482f2a2418369e9b411d758ee6af002cc0f0a21f0eb37896dcc63b6f6`.
+Final release build passed. While both reactors were idle, graceful interrupts
+returned their panes to shells and released their own locks. Native lifecycle
+stop retired them at552/553. Drove up executed the native on_start hooks,
+restored spawn/claims at554–557, and restarted exactly two existing panes.
+Both runtime commands were verified through process_info. Checkpoints remained
+committer540 and docs546, with no replay or open intents. A subsequent plan
+had zero actions, up reported already_running, and setup upgrade reported no
+changes. The final live snapshot still contains exactly the original three
+workspaces, six tabs, seven panes, and adopted controller.
+
+The final source/result publication follows those proofs. Its actual commit
+refs and the resulting docs outcome are recorded by native reactors in the
+append-only log; the controller does not make manual production commits.
+
+## Verification
+
+- Final combined Drove suite: 331 tests passed, zero failures. Strict
+  all-target/all-feature Clippy and changed-file formatting passed.
+- Installed eventlog configured-probe4 used the real Drove adapter with stub
+  model CLIs. Bootstrap additions/deletions, models, full stdin intent, both
+  intended docs edits in HEAD, exact committed-or-clean-skipped outcomes,
+  unrelated staged patch preservation, own-doc suppression and lock cleanup
+  passed. Valid coalescing can put two docs results into one commit.
+- No-edit docs with concurrent CLI append returned skipped, emitted no result
+  and preserved staging. No local workaround for upstream scope rules exists.
+- A live disposable hook probe confirmed initialization before the native
+  viewer, one hook on first start, and zero-action repeat.
+- The final live restart probe confirmed native viewer replacement with a new
+  PID in the same pane, exact hook counts, stable PID and zero-action repeat.
+  An INT-ignoring bash job timed out with no replacement input, unchanged root
+  PID and a retryable plan. Its disposable session was torn down.
+
+Evidence root:
+`/var/folders/x9/rz97sz4s75z45ym82kdfz87r0000gn/T/drove-consumer-nit8dild`.
+Key output: `/tmp/drove-restart-shell-tests.out`,
+`/tmp/drove-restart-shell-clippy.out`,
+`/tmp/drove-consumer-restart-final-smoke.out`,
+`/tmp/drove-consumer-direct-root-smoke.out`.
+Original log/source snapshots, manifests, recovery refs, ownership maps,
+model captures and bootstrap acknowledgment are in the evidence root.
+
+Historical strict-doctor violations remain visible; history is not rewritten
+to hide old missing claims, duplicate spawns or conflicts. No log was erased
+or manually rewritten, and no reactor lock directory was manually removed.
 
 ## Inherited artifact manifest
 
@@ -93,71 +158,3 @@ suppression, resume and repeated layout/setup convergence.
 - `.context/reports/eventlog-cutover.md` — SHA-256 `c5ede2d584d766e9cda6153c1983c95fe20827febe16eb95f7dfa81fc2d3aa28`
 - `.context/reports/eventlog-handoff.md` — SHA-256 `f206d78337b6ab6bff02a2d2f2735596d75846257f9f64f6a1659d9d28e5c8b1`
 
-## Independent configured-command probe
-
-The upstream candidate ran the real Drove model binding with stub CLIs in an
-isolated checkout, including new relative adapter/config/brief bootstrap files.
-The configured Composer model and full stdin intent were verified. The source
-index retained its unrelated staged Cargo.toml patch byte-for-byte after the
-repair commit and first docs commit. Evidence: configured-probe under the
-snapshot directory, /tmp/drove-consumer-configured-probe.py.
-
-The full loop exposed two upstream blockers and was stopped cleanly:
-1. Concurrent committer log append during the second docs pass caused a false
-   out-of-scope .context/events.jsonl failure (probe ack537).
-2. A no-edit docs pass attempted an empty paths result and failed validation
-   (noop-docs.out). Both were sent to the upstream coordinator for product
-   fixes; no consumer runtime workaround was introduced.
-
-Thin binding tests also prove propagation of exit7, configured model, event
-JSON, commit refs, Claude login selection and worker identity.
-
-Combined Drove all-target/all-feature tests passed: 324 passed, zero failures. Strict Clippy passed. Pane-hook regression tests cover new tabs, creates, splits, restarts, approval/failure gating, retry state, dependencies and adopted caller preservation.
-
-## Live disposable Drove hook verification
-
-The combined debug binary was exercised in a new disposable Herdr session
-with an on_start hook that initializes/appends an event before starting
-`eventlog view --follow`. The viewer displayed that event; a second plan
-had zero actions, a second up was converged, and the hook count remained
-one. The disposable session was torn down through Drove. Test script:
-/tmp/drove-consumer-hook-smoke.py.
-
-An earlier smoke variant using the Python interpreter as the long-running
-serve executable exposed executable-name drift in process inspection; using
-the actual native eventlog serve command passed. The production consumer
-uses native eventlog serve commands.
-
-Because the accepted pane-hook result is now event528, the pending recovery
-batch must explicitly include src/executor.rs and supersede that result too:
-use the audited replacement boundary528, not a blanket current-tip baseline.
-The fresh exact-path bootstrap result must be above that boundary.
-
-## Accepted consumer verification and activation
-
-Installed eventlog SHA-256:
-`7bc864c0654b6a2dd3f35f888dbde90b4e49a9062cd5d665eae43b967aa7baca`.
-Accepted upstream refs: c582632, e14c2ec, 1647934, 3da83ed. Upstream reports
-220 tests passed, zero failures, one intentional OS-protection skip, plus
-strict Clippy and changed-file formatting. Drove release build passed.
-
-Fresh installed-binary configured-probe4 passed actual Drove adapter binding
-with stub Composer/Sonnet CLIs, isolated bootstrap additions/deletions, full
-stdin intent, both intended documentation updates present in HEAD, exact
-committed-or-clean-skipped result accounting, untouched unrelated staging,
-and own-doc commit loop suppression. Both native reactors exited and released
-their own locks. The initial probe2 deadline was an overly strict expectation
-of two commits: both updates had correctly coalesced into one commit.
-
-Installed-binary no-edit docs plus concurrent CLI log append returned skipped
-and emitted no result; unrelated staging was preserved. Initial no-edit stub
-used an invalid note field; corrected to msg and reran successfully. No local
-runtime workaround was added. Evidence: configured-probe4, noop-docs4.out,
-configured-probe-events4.json under the snapshot directory.
-
-One-time recovery imports only verified existing IDs: workspaces w1/w2/w3,
-six existing tabs, and seven existing panes. Ordered pane membership was
-checked against the live snapshot. Initial plan contains four existing-pane
-restarts and no creates/closes; controller w1:p1 remains adopted. The first
-activation runs the native committer in w2:p2, then full Drove reconciliation
-starts docs and the native log viewer after bootstrap commit verification.

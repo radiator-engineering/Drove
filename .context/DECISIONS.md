@@ -120,3 +120,10 @@ No new per-project reactor framework should be landed here.
 ## D56 — Upstream consumer cutover (2026-09-07)
 
 Use eventlog setup and its generated helper, native react, and lifecycle commands. Preserve Composer 2.5 Fast for commit authorship and Claude Sonnet for documentation; model labels alone do not select an invocation. Retire removed shell-helper references and local reactor machinery. Preserve log history and inherited dirty artifacts; recover the audited commit prefix only with reachable Git evidence and exact-path backlog results. Validate recovery on disposable copies before the authorized live cutover. The Drove controller exclusively owns this log; upstream changes belong to the event-log coordinator.
+
+## D57 — Verified native lifecycle and command replacement (2026-09-07)
+
+- commit-agent = eventlog-action-commit+composer-2.5-fast: upstream native action owns isolated commit publication and scope; the project adapter selects Composer.
+- doc-agent = eventlog-action-docs+sonnet: native action owns docs scope and result/loop handling; the project adapter selects Claude Sonnet.
+- reactor-integration-interface = eventlog-setup-generated-helper+native-lifecycle: generated argv hooks use eventlog lifecycle start/stop; no local supervisor or action runtime.
+- Herdr command replacement interrupts the foreground job once and waits for a verified shell before atomically submitting argv. A busy pane times out without receiving replacement text, preserving retry state. Process inspection selects the foreground group leader to avoid treating transient child jobs as command drift.
