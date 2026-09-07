@@ -166,6 +166,35 @@ fn ls_lists_every_profile_with_backend_target_and_reachability() {
 }
 
 #[test]
+fn ls_targets_the_profiles_own_session_over_the_ambient_herdr_session() {
+    // D46: `HERDR_SESSION` says where the caller happens to be running, not
+    // where the profile wants to go. `monitoring` declares
+    // `session = "drove-mon"`, so it must resolve to `drove-mon` even when
+    // the ambient host env says `HERDR_SESSION=drove`.
+    let drovefile = example_path("log-driven/Drovefile");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("HERDR_SESSION", "drove")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            "/nonexistent/drove-ls-test.sock",
+            "ls",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "monitoring: backend=herdr target=drove-mon reachable=false",
+        ));
+}
+
+#[test]
 fn ls_json_reports_one_row_per_profile() {
     let drovefile = example_path("log-driven/Drovefile");
 

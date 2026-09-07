@@ -35,10 +35,9 @@ pub struct Cli {
 
     /// Profile declared in Drovefile; an alias of the positional PROFILE
     /// (D42). Giving both and disagreeing is an error.
-    ///
-    /// Named `profile_flag` (not `profile`) so clap gives it an arg id
-    /// distinct from every subcommand's own positional `profile` field —
-    /// sharing the field name would collide the two args under one id.
+    // Named `profile_flag` (not `profile`) so clap gives it an arg id
+    // distinct from every subcommand's own positional `profile` field —
+    // sharing the field name would collide the two args under one id.
     #[arg(long = "profile", global = true)]
     profile_flag: Option<String>,
 
@@ -817,7 +816,7 @@ fn describe_outcome(name: &str, outcome: TaskOutcome) -> String {
     }
 }
 
-/// Resolves the backend id and target per D32's four-level order, gathering
+/// Resolves the backend id and target per D46's six-level order, gathering
 /// the CLI/environment/Drovefile inputs the pure `select::resolve` needs.
 fn resolve_backend(cli: &Cli, config: &DroveConfig, profile: &Profile) -> (String, select::Target) {
     let cli_inputs = select::CliInputs {
@@ -826,8 +825,12 @@ fn resolve_backend(cli: &Cli, config: &DroveConfig, profile: &Profile) -> (Strin
         session: cli.session.as_deref(),
         socket: cli.socket.as_deref(),
     };
-    let env_inputs = select::EnvInputs {
+    let explicit_env_inputs = select::ExplicitEnvInputs {
         drove_backend: std::env::var("DROVE_BACKEND").ok(),
+        drove_session: std::env::var("DROVE_SESSION").ok(),
+        drove_target: std::env::var("DROVE_TARGET").ok(),
+    };
+    let ambient_env_inputs = select::AmbientEnvInputs {
         herdr_session: std::env::var("HERDR_SESSION").ok(),
         radiator_hub: std::env::var("RADIATOR_HUB").ok(),
         ambient_radiator: radiator::selected_by_environment(),
@@ -838,7 +841,8 @@ fn resolve_backend(cli: &Cli, config: &DroveConfig, profile: &Profile) -> (Strin
     };
     select::resolve(
         cli_inputs,
-        &env_inputs,
+        &explicit_env_inputs,
+        &ambient_env_inputs,
         profile_inputs,
         config.backend.as_deref(),
         &config.target,

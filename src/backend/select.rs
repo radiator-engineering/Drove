@@ -14,7 +14,7 @@ const KNOWN_BACKENDS: &[&str] = &[HERDR_BACKEND, RADIATOR_BACKEND];
 
 /// The resolved instance a backend connects to: an explicit socket override
 /// (`--socket`, always wins over everything else) and an optional named
-/// target (Herdr session or Radiator hub) resolved per D32's four-level
+/// target (Herdr session or Radiator hub) resolved per D46's six-level
 /// order. `name: None` defers entirely to the backend's own built-in
 /// default, including any env fallback it already implements
 /// (`HerdrClient`/`RadiatorClient::discover`).
@@ -36,10 +36,25 @@ pub struct CliInputs<'a> {
     pub socket: Option<&'a Path>,
 }
 
-/// The environment inputs D32 resolves against, read once by the caller.
+/// Explicit environment inputs (D46): variables the caller (or a script
+/// wrapping `drove`) sets on purpose to say where it wants to go —
+/// `DROVE_BACKEND`, and `DROVE_SESSION`/`DROVE_TARGET` mirroring
+/// `--session`/`--target`. Ranks above the profile, like the flags they
+/// mirror.
 #[derive(Debug, Clone, Default)]
-pub struct EnvInputs {
+pub struct ExplicitEnvInputs {
     pub drove_backend: Option<String>,
+    pub drove_session: Option<String>,
+    pub drove_target: Option<String>,
+}
+
+/// Ambient host environment inputs (D46): variables Herdr/Radiator export
+/// into every pane they host, saying where the caller *is*, not where it
+/// wants to go — `HERDR_SESSION`, `RADIATOR_HUB`, and the ambient Radiator
+/// detection tie-break. Ranks below the file, just above the built-in
+/// default.
+#[derive(Debug, Clone, Default)]
+pub struct AmbientEnvInputs {
     pub herdr_session: Option<String>,
     pub radiator_hub: Option<String>,
     /// Whether an ambient Radiator hub socket is present with no Herdr pane
@@ -59,26 +74,31 @@ pub struct ProfileInputs<'a> {
     pub session: Option<&'a str>,
 }
 
-/// Resolves the backend id and its target instance per D32/D41's five-level
-/// order (CLI > environment > profile > Drovefile > built-in), purely from
-/// already-gathered inputs. `--session` (the Herdr alias of `--target`)
-/// names a Herdr session, so it is ignored once Radiator is selected —
-/// `--target`, `RADIATOR_HUB`, `radiator.hub(...)` and the `main` built-in
-/// still apply in that case.
+/// Resolves the backend id and its target instance per D46's six-level
+/// order (flag > explicit env > profile > Drovefile > ambient host env >
+/// built-in), purely from already-gathered inputs. `--session`/
+/// `DROVE_SESSION` (the Herdr alias of `--target`/`DROVE_TARGET`) name a
+/// Herdr session, so they are ignored once Radiator is selected —
+/// `--target`/`DROVE_TARGET`, `RADIATOR_HUB`, `radiator.hub(...)` and the
+/// `main` built-in still apply in that case. Ambient host env variables
+/// (`HERDR_SESSION`, `RADIATOR_HUB`) say where the caller is, not where it
+/// wants to go, so they rank below the profile and the file, only above the
+/// built-in default.
 pub fn resolve(
     cli: CliInputs<'_>,
-    env: &EnvInputs,
+    explicit_env: &ExplicitEnvInputs,
+    ambient_env: &AmbientEnvInputs,
     profile: ProfileInputs<'_>,
     file_backend: Option<&str>,
     file_target: &BackendTargets,
 ) -> (String, Target) {
     let backend = non_empty(cli.backend)
-        .or_else(|| non_empty(env.drove_backend.as_deref()))
+        .or_else(|| non_empty(explicit_env.drove_backend.as_deref()))
         .or_else(|| non_empty(profile.backend))
         .or_else(|| non_empty(file_backend))
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            if env.ambient_radiator {
+            if ambient_env.ambient_radiator {
                 RADIATOR_BACKEND.to_owned()
             } else {
                 HERDR_BACKEND.to_owned()
@@ -87,14 +107,23 @@ pub fn resolve(
 
     let name = match backend.as_str() {
         RADIATOR_BACKEND => non_empty(cli.target)
-            .or_else(|| non_empty(env.radiator_hub.as_deref()))
+            .or_else(|| non_empty(explicit_env.drove_target.as_deref()))
             .or_else(|| non_empty(profile.session))
             .or_else(|| non_empty(file_target.radiator_hub.as_deref()))
+            .or_else(|| non_empty(ambient_env.radiator_hub.as_deref()))
             .map(str::to_owned),
         _ => non_empty(cli.target.or(cli.session))
-            .or_else(|| non_empty(env.herdr_session.as_deref()))
+            .or_else(|| {
+                non_empty(
+                    explicit_env
+                        .drove_target
+                        .as_deref()
+                        .or(explicit_env.drove_session.as_deref()),
+                )
+            })
             .or_else(|| non_empty(profile.session))
             .or_else(|| non_empty(file_target.herdr_session.as_deref()))
+            .or_else(|| non_empty(ambient_env.herdr_session.as_deref()))
             .map(str::to_owned),
     };
 
@@ -172,24 +201,25 @@ mod tests {
             backend: Some("radiator"),
             ..Default::default()
         };
-        let mut env = EnvInputs {
+        let mut explicit_env = ExplicitEnvInputs {
             drove_backend: Some("herdr".to_owned()),
-            ambient_radiator: false,
             ..Default::default()
         };
         let (backend, _) = resolve(
             cli,
-            &env,
+            &explicit_env,
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             Some("herdr"),
             &BackendTargets::default(),
         );
         assert_eq!(backend, "radiator");
 
-        env.drove_backend = None;
+        explicit_env.drove_backend = None;
         let (backend, _) = resolve(
             cli,
-            &env,
+            &explicit_env,
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             Some("herdr"),
             &BackendTargets::default(),
@@ -198,16 +228,20 @@ mod tests {
     }
 
     #[test]
-    fn env_backend_wins_over_file_and_built_in() {
-        let cli = CliInputs::default();
-        let env = EnvInputs {
+    fn explicit_env_backend_wins_over_profile_file_and_built_in() {
+        let explicit_env = ExplicitEnvInputs {
             drove_backend: Some("radiator".to_owned()),
             ..Default::default()
         };
+        let profile = ProfileInputs {
+            backend: Some("herdr"),
+            ..Default::default()
+        };
         let (backend, _) = resolve(
-            cli,
-            &env,
-            ProfileInputs::default(),
+            CliInputs::default(),
+            &explicit_env,
+            &AmbientEnvInputs::default(),
+            profile,
             Some("herdr"),
             &BackendTargets::default(),
         );
@@ -216,11 +250,10 @@ mod tests {
 
     #[test]
     fn file_backend_wins_over_the_built_in_default() {
-        let cli = CliInputs::default();
-        let env = EnvInputs::default();
         let (backend, _) = resolve(
-            cli,
-            &env,
+            CliInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             Some("radiator"),
             &BackendTargets::default(),
@@ -233,19 +266,21 @@ mod tests {
         let cli = CliInputs::default();
         let (backend, _) = resolve(
             cli,
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             None,
             &BackendTargets::default(),
         );
         assert_eq!(backend, "herdr");
 
-        let ambient = EnvInputs {
+        let ambient = AmbientEnvInputs {
             ambient_radiator: true,
             ..Default::default()
         };
         let (backend, _) = resolve(
             cli,
+            &ExplicitEnvInputs::default(),
             &ambient,
             ProfileInputs::default(),
             None,
@@ -255,18 +290,28 @@ mod tests {
     }
 
     #[test]
-    fn herdr_target_name_follows_the_same_four_levels() {
+    fn herdr_target_name_follows_the_full_precedence_order() {
+        // flag > explicit env (DROVE_TARGET/DROVE_SESSION) > profile > file
+        // > ambient host env (HERDR_SESSION) > built-in (D46).
         let file = targets(Some("file-session"), None);
+        let profile = ProfileInputs {
+            session: Some("profile-session"),
+            ..Default::default()
+        };
+        let ambient = AmbientEnvInputs {
+            herdr_session: Some("ambient-session".to_owned()),
+            ..Default::default()
+        };
 
         let cli = CliInputs {
             target: Some("cli-target"),
             ..Default::default()
         };
-        let env = EnvInputs {
-            herdr_session: Some("env-session".to_owned()),
+        let explicit_env = ExplicitEnvInputs {
+            drove_target: Some("explicit-target".to_owned()),
             ..Default::default()
         };
-        let (_, target) = resolve(cli, &env, ProfileInputs::default(), Some("herdr"), &file);
+        let (_, target) = resolve(cli, &explicit_env, &ambient, profile, Some("herdr"), &file);
         assert_eq!(target.name.as_deref(), Some("cli-target"));
 
         let cli_session_alias = CliInputs {
@@ -275,8 +320,9 @@ mod tests {
         };
         let (_, target) = resolve(
             cli_session_alias,
-            &env,
-            ProfileInputs::default(),
+            &explicit_env,
+            &ambient,
+            profile,
             Some("herdr"),
             &file,
         );
@@ -284,16 +330,42 @@ mod tests {
 
         let (_, target) = resolve(
             CliInputs::default(),
-            &env,
-            ProfileInputs::default(),
+            &explicit_env,
+            &ambient,
+            profile,
             Some("herdr"),
             &file,
         );
-        assert_eq!(target.name.as_deref(), Some("env-session"));
+        assert_eq!(target.name.as_deref(), Some("explicit-target"));
+
+        let explicit_session = ExplicitEnvInputs {
+            drove_session: Some("explicit-session".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &explicit_session,
+            &ambient,
+            profile,
+            Some("herdr"),
+            &file,
+        );
+        assert_eq!(target.name.as_deref(), Some("explicit-session"));
 
         let (_, target) = resolve(
             CliInputs::default(),
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
+            profile,
+            Some("herdr"),
+            &file,
+        );
+        assert_eq!(target.name.as_deref(), Some("profile-session"));
+
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
             ProfileInputs::default(),
             Some("herdr"),
             &file,
@@ -302,7 +374,18 @@ mod tests {
 
         let (_, target) = resolve(
             CliInputs::default(),
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
+            ProfileInputs::default(),
+            Some("herdr"),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name.as_deref(), Some("ambient-session"));
+
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             Some("herdr"),
             &BackendTargets::default(),
@@ -311,30 +394,49 @@ mod tests {
     }
 
     #[test]
-    fn radiator_target_name_follows_the_same_four_levels() {
+    fn radiator_target_name_follows_the_full_precedence_order() {
         let file = targets(None, Some("file-hub"));
+        let ambient = AmbientEnvInputs {
+            radiator_hub: Some("ambient-hub".to_owned()),
+            ..Default::default()
+        };
         let cli = CliInputs {
             backend: Some("radiator"),
             target: Some("cli-hub"),
             ..Default::default()
         };
-        let env = EnvInputs {
-            radiator_hub: Some("env-hub".to_owned()),
+        let explicit_env = ExplicitEnvInputs {
+            drove_target: Some("explicit-hub".to_owned()),
             ..Default::default()
         };
-        let (_, target) = resolve(cli, &env, ProfileInputs::default(), None, &file);
+        let (_, target) = resolve(
+            cli,
+            &explicit_env,
+            &ambient,
+            ProfileInputs::default(),
+            None,
+            &file,
+        );
         assert_eq!(target.name.as_deref(), Some("cli-hub"));
 
         let cli_no_target = CliInputs {
             backend: Some("radiator"),
             ..Default::default()
         };
-        let (_, target) = resolve(cli_no_target, &env, ProfileInputs::default(), None, &file);
-        assert_eq!(target.name.as_deref(), Some("env-hub"));
+        let (_, target) = resolve(
+            cli_no_target,
+            &explicit_env,
+            &ambient,
+            ProfileInputs::default(),
+            None,
+            &file,
+        );
+        assert_eq!(target.name.as_deref(), Some("explicit-hub"));
 
         let (_, target) = resolve(
             cli_no_target,
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
             ProfileInputs::default(),
             None,
             &file,
@@ -343,7 +445,18 @@ mod tests {
 
         let (_, target) = resolve(
             cli_no_target,
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
+            ProfileInputs::default(),
+            None,
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name.as_deref(), Some("ambient-hub"));
+
+        let (_, target) = resolve(
+            cli_no_target,
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             None,
             &BackendTargets::default(),
@@ -352,19 +465,25 @@ mod tests {
     }
 
     #[test]
-    fn session_flag_is_ignored_for_the_radiator_backend() {
-        // `--session` is a Herdr alias of `--target` (spec §5); it must not
-        // leak into the Radiator hub name. `RADIATOR_HUB`/`radiator.hub()`/
-        // the `main` built-in still apply, and `--target` still works.
+    fn session_flag_and_env_are_ignored_for_the_radiator_backend() {
+        // `--session`/`DROVE_SESSION` are the Herdr alias of `--target`/
+        // `DROVE_TARGET` (spec §5, D46); they must not leak into the
+        // Radiator hub name. `--target`/`DROVE_TARGET`, `RADIATOR_HUB`,
+        // `radiator.hub()` and the `main` built-in still apply.
         let file = targets(None, Some("file-hub"));
         let cli = CliInputs {
             backend: Some("radiator"),
             session: Some("some-herdr-session"),
             ..Default::default()
         };
+        let explicit_env = ExplicitEnvInputs {
+            drove_session: Some("some-herdr-session".to_owned()),
+            ..Default::default()
+        };
         let (backend, target) = resolve(
             cli,
-            &EnvInputs::default(),
+            &explicit_env,
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             None,
             &file,
@@ -372,18 +491,19 @@ mod tests {
         assert_eq!(backend, "radiator");
         assert_eq!(target.name.as_deref(), Some("file-hub"));
 
-        let env = EnvInputs {
-            radiator_hub: Some("env-hub".to_owned()),
+        let ambient = AmbientEnvInputs {
+            radiator_hub: Some("ambient-hub".to_owned()),
             ..Default::default()
         };
         let (_, target) = resolve(
             cli,
-            &env,
+            &explicit_env,
+            &ambient,
             ProfileInputs::default(),
             None,
             &BackendTargets::default(),
         );
-        assert_eq!(target.name.as_deref(), Some("env-hub"));
+        assert_eq!(target.name.as_deref(), Some("ambient-hub"));
 
         let cli_with_target = CliInputs {
             backend: Some("radiator"),
@@ -393,7 +513,8 @@ mod tests {
         };
         let (_, target) = resolve(
             cli_with_target,
-            &env,
+            &explicit_env,
+            &ambient,
             ProfileInputs::default(),
             None,
             &BackendTargets::default(),
@@ -402,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_backend_wins_over_file_but_loses_to_env_and_cli() {
+    fn profile_backend_wins_over_file_but_loses_to_explicit_env_and_cli() {
         let profile = ProfileInputs {
             backend: Some("radiator"),
             ..Default::default()
@@ -410,20 +531,22 @@ mod tests {
 
         let (backend, _) = resolve(
             CliInputs::default(),
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             profile,
             Some("herdr"),
             &BackendTargets::default(),
         );
         assert_eq!(backend, "radiator");
 
-        let env = EnvInputs {
+        let explicit_env = ExplicitEnvInputs {
             drove_backend: Some("herdr".to_owned()),
             ..Default::default()
         };
         let (backend, _) = resolve(
             CliInputs::default(),
-            &env,
+            &explicit_env,
+            &AmbientEnvInputs::default(),
             profile,
             Some("herdr"),
             &BackendTargets::default(),
@@ -436,7 +559,8 @@ mod tests {
         };
         let (backend, _) = resolve(
             cli,
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             profile,
             Some("herdr"),
             &BackendTargets::default(),
@@ -445,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_session_wins_over_file_but_loses_to_env_and_cli_for_herdr() {
+    fn profile_session_wins_over_file_but_loses_to_explicit_env_and_cli_for_herdr() {
         let file = targets(Some("file-session"), None);
         let profile = ProfileInputs {
             session: Some("profile-session"),
@@ -454,30 +578,45 @@ mod tests {
 
         let (_, target) = resolve(
             CliInputs::default(),
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             profile,
             Some("herdr"),
             &file,
         );
         assert_eq!(target.name.as_deref(), Some("profile-session"));
 
-        let env = EnvInputs {
-            herdr_session: Some("env-session".to_owned()),
+        let explicit_env = ExplicitEnvInputs {
+            drove_session: Some("explicit-session".to_owned()),
             ..Default::default()
         };
-        let (_, target) = resolve(CliInputs::default(), &env, profile, Some("herdr"), &file);
-        assert_eq!(target.name.as_deref(), Some("env-session"));
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &explicit_env,
+            &AmbientEnvInputs::default(),
+            profile,
+            Some("herdr"),
+            &file,
+        );
+        assert_eq!(target.name.as_deref(), Some("explicit-session"));
 
         let cli = CliInputs {
             target: Some("cli-target"),
             ..Default::default()
         };
-        let (_, target) = resolve(cli, &EnvInputs::default(), profile, Some("herdr"), &file);
+        let (_, target) = resolve(
+            cli,
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
+            profile,
+            Some("herdr"),
+            &file,
+        );
         assert_eq!(target.name.as_deref(), Some("cli-target"));
     }
 
     #[test]
-    fn profile_session_wins_over_file_but_loses_to_env_and_cli_for_radiator() {
+    fn profile_session_wins_over_file_but_loses_to_explicit_env_and_cli_for_radiator() {
         let file = targets(None, Some("file-hub"));
         let profile = ProfileInputs {
             session: Some("profile-hub"),
@@ -488,23 +627,82 @@ mod tests {
             ..Default::default()
         };
 
-        let (_, target) = resolve(cli_radiator, &EnvInputs::default(), profile, None, &file);
+        let (_, target) = resolve(
+            cli_radiator,
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
+            profile,
+            None,
+            &file,
+        );
         assert_eq!(target.name.as_deref(), Some("profile-hub"));
 
-        let env = EnvInputs {
-            radiator_hub: Some("env-hub".to_owned()),
+        let explicit_env = ExplicitEnvInputs {
+            drove_target: Some("explicit-hub".to_owned()),
             ..Default::default()
         };
-        let (_, target) = resolve(cli_radiator, &env, profile, None, &file);
-        assert_eq!(target.name.as_deref(), Some("env-hub"));
+        let (_, target) = resolve(
+            cli_radiator,
+            &explicit_env,
+            &AmbientEnvInputs::default(),
+            profile,
+            None,
+            &file,
+        );
+        assert_eq!(target.name.as_deref(), Some("explicit-hub"));
 
         let cli_with_target = CliInputs {
             backend: Some("radiator"),
             target: Some("cli-hub"),
             ..Default::default()
         };
-        let (_, target) = resolve(cli_with_target, &EnvInputs::default(), profile, None, &file);
+        let (_, target) = resolve(
+            cli_with_target,
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
+            profile,
+            None,
+            &file,
+        );
         assert_eq!(target.name.as_deref(), Some("cli-hub"));
+    }
+
+    #[test]
+    fn profile_session_wins_over_ambient_herdr_session_d46() {
+        // The regression D46 fixes: `drove monitoring` run from inside
+        // Herdr session `drove` must target the profile's own session, not
+        // the ambient one it happens to be running in.
+        let profile = ProfileInputs {
+            session: Some("drove-mon"),
+            ..Default::default()
+        };
+        let ambient = AmbientEnvInputs {
+            herdr_session: Some("drove".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &ambient,
+            profile,
+            Some("herdr"),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name.as_deref(), Some("drove-mon"));
+
+        let explicit_env = ExplicitEnvInputs {
+            drove_session: Some("x".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &explicit_env,
+            &ambient,
+            profile,
+            Some("herdr"),
+            &BackendTargets::default(),
+        );
+        assert_eq!(target.name.as_deref(), Some("x"));
     }
 
     #[test]
@@ -515,7 +713,8 @@ mod tests {
         };
         let (_, target) = resolve(
             cli,
-            &EnvInputs::default(),
+            &ExplicitEnvInputs::default(),
+            &AmbientEnvInputs::default(),
             ProfileInputs::default(),
             None,
             &BackendTargets::default(),
