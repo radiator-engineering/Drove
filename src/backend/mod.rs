@@ -203,7 +203,7 @@ pub trait HerdrExt {
     fn ensure_session(&self, name: &str) -> Result<SessionState>;
 
     /// Stops then deletes the named session (D47), the teardown mirror of
-    /// [`ensure_session`]: shells out to `herdr session stop NAME`, then
+    /// [`Self::ensure_session`]: shells out to `herdr session stop NAME`, then
     /// `herdr session delete NAME`. A stop that fails because the session was
     /// not running is not an error — delete still runs and the returned
     /// [`SessionStop::stopped`] is `false`. A missing `herdr` binary or a
