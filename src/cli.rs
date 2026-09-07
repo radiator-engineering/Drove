@@ -351,7 +351,7 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
     // Only `status` annotates what the prune dropped (D48); `plan` renders
     // the plan alone, unchanged.
     let is_status = matches!(cli.command, Some(Command::Status { .. }));
-    print_plan(&plan, cli.json, if is_status { &dropped } else { &[] })?;
+    print_plan(&plan, cli.json, is_status.then_some(dropped.as_slice()))?;
     print_warnings(&compiled.warnings);
     Ok(if plan.status == SyncStatus::InSync {
         ExitCode::SUCCESS
@@ -634,7 +634,7 @@ fn up_command(
         .iter()
         .any(|action| action.kind == Action::Core(CoreAction::Conflict))
     {
-        print_plan(&plan, json, &[])?;
+        print_plan(&plan, json, None)?;
         return Ok(ExitCode::from(2));
     }
 
@@ -921,17 +921,20 @@ fn backend_socket_display(backend_id: &str, target: &select::Target) -> PathBuf 
 /// Prints a plan, or (from `status`) a plan plus the identities D48 pruned
 /// from local state before it was built — dropped because their recorded
 /// backend id no longer exists in the live snapshot, so the plan below now
-/// recreates them.
-fn print_plan(plan: &Plan, json: bool, pruned: &[String]) -> Result<()> {
+/// recreates them. `pruned` is `None` for every caller but `status`, so
+/// `plan`'s JSON output carries no `"pruned"` key and is unchanged.
+fn print_plan(plan: &Plan, json: bool, pruned: Option<&[String]>) -> Result<()> {
     if json {
         let mut value = serde_json::to_value(plan)?;
-        if let Some(object) = value.as_object_mut() {
+        if let Some(pruned) = pruned
+            && let Some(object) = value.as_object_mut()
+        {
             object.insert("pruned".into(), serde_json::json!(pruned));
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
-    for identity in pruned {
+    for identity in pruned.unwrap_or_default() {
         println!("recreate {identity}: backend id no longer exists; recreating");
     }
     print!("{}", plan.render());
