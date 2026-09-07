@@ -215,6 +215,7 @@ fn record_task_resource(
             label: None,
             cwd: None,
             adopted: None,
+            command_started: None,
             last_outcome: Some(outcome.to_owned()),
         },
     );
@@ -597,6 +598,10 @@ struct ApplyState {
     workspace_ids: BTreeMap<String, String>,
     group_ids: BTreeMap<String, String>,
     pane_ids: BTreeMap<String, String>,
+    created_workspaces: BTreeSet<String>,
+    created_groups: BTreeSet<String>,
+    created_panes: BTreeSet<String>,
+    command_started: BTreeMap<String, bool>,
     blocked: BTreeSet<String>,
 }
 
@@ -1165,6 +1170,7 @@ fn record_action_ownership(
                     label: None,
                     cwd,
                     adopted: Some(true),
+                    command_started: None,
                     last_outcome: None,
                 },
             );
@@ -1176,7 +1182,16 @@ fn record_action_ownership(
         _ => {}
     }
 
-    if *outcome != Outcome::Applied {
+    let recorded_physical_create = match action.kind {
+        Action::Core(CoreAction::CreateWorkspace) => applied.created_workspaces.contains(address),
+        Action::Core(CoreAction::CreatePane) | Action::Herdr(HerdrAction::SplitPane) => {
+            applied.created_panes.contains(address)
+        }
+        Action::Herdr(HerdrAction::CreateTab) => applied.created_groups.contains(address),
+        _ => false,
+    };
+
+    if *outcome != Outcome::Applied && !recorded_physical_create {
         return false;
     }
 
@@ -1203,6 +1218,7 @@ fn record_action_ownership(
                     label,
                     cwd: None,
                     adopted: None,
+                    command_started: None,
                     last_outcome: None,
                 },
             );
@@ -1230,6 +1246,7 @@ fn record_action_ownership(
                         label,
                         cwd: None,
                         adopted: None,
+                        command_started: None,
                         last_outcome: None,
                     },
                 );
@@ -1258,6 +1275,7 @@ fn record_action_ownership(
                                 label: None,
                                 cwd,
                                 adopted: None,
+                                command_started: command_started(ir, pane, applied),
                                 last_outcome: None,
                             },
                         );
@@ -1294,6 +1312,7 @@ fn record_action_ownership(
                     label: None,
                     cwd,
                     adopted,
+                    command_started: command_started(ir, address, applied),
                     last_outcome: None,
                 },
             );
@@ -1316,6 +1335,7 @@ fn record_action_ownership(
                     label: None,
                     cwd: None,
                     adopted: None,
+                    command_started: None,
                     last_outcome: None,
                 },
             );
@@ -1333,6 +1353,11 @@ fn group_topology_digest<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
         .iter()
         .find(|group| group.id == id)
         .map(|group| group.topology_digest.as_str())
+}
+
+fn command_started(ir: &Ir, pane: &str, applied: &ApplyState) -> Option<bool> {
+    (!pane_command(ir, pane).is_empty())
+        .then(|| applied.command_started.get(pane).copied().unwrap_or(true))
 }
 
 fn group_workspace<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
@@ -1360,7 +1385,7 @@ fn apply_action(
                     action: action.kind,
                 });
             };
-            apply_herdr(ext, ir, state, herdr, action)
+            apply_herdr(backend, ext, ir, state, herdr, action)
         }
         // `RadiatorAction` is empty (spec §8, D37); this arm keeps the match
         // exhaustive so adding a variant forces every backend to answer it.
@@ -1382,6 +1407,7 @@ fn apply_core(
             let cwd = string_field(fields, "cwd").unwrap_or_else(|| ".".to_owned());
             let id = backend.create_workspace(&label, Path::new(&cwd))?;
             state.workspace_ids.insert(action.address.clone(), id);
+            state.created_workspaces.insert(action.address.clone());
             Ok(Outcome::Applied)
         }
         CoreAction::RenameWorkspace => {
@@ -1392,9 +1418,22 @@ fn apply_core(
             Ok(Outcome::Applied)
         }
         CoreAction::CreatePane => {
-            let (workspace_id, spec) = pane_create_inputs(ir, state, &action.address)?;
+            let (workspace_id, mut spec) = pane_create_inputs(ir, state, &action.address)?;
+            let command = backend
+                .herdr()
+                .is_some()
+                .then(|| spec.command.take())
+                .flatten();
             let pane_id = backend.create_pane(&workspace_id, &spec)?;
-            state.pane_ids.insert(action.address.clone(), pane_id);
+            state
+                .pane_ids
+                .insert(action.address.clone(), pane_id.clone());
+            state.created_panes.insert(action.address.clone());
+            if let Some(argv) = command {
+                state.command_started.insert(action.address.clone(), false);
+                backend.start_command(&pane_id, &argv)?;
+                state.command_started.insert(action.address.clone(), true);
+            }
             Ok(Outcome::Applied)
         }
         CoreAction::ClosePane => {
@@ -1413,6 +1452,9 @@ fn apply_core(
             let id = backend_id(action.backend_id.as_ref(), action)?;
             let argv = pane_command(ir, &action.address);
             backend.restart_command(&id, &argv)?;
+            if !argv.is_empty() {
+                state.command_started.insert(action.address.clone(), true);
+            }
             Ok(Outcome::Applied)
         }
         CoreAction::PromptAgent => {
@@ -1433,6 +1475,7 @@ fn apply_core(
 }
 
 fn apply_herdr(
+    backend: &dyn Backend,
     ext: &dyn crate::backend::HerdrExt,
     ir: &Ir,
     state: &mut ApplyState,
@@ -1445,10 +1488,17 @@ fn apply_herdr(
             let workspace_id = backend_id(state.workspace_ids.get(&group.workspace), action)?;
             // A fresh group plans one `CreateTab` and no per-pane splits, so
             // this builds the whole tab: every declared pane, then the ratios.
+            let mut commands = BTreeMap::new();
             let specs = group
                 .panes
                 .iter()
-                .map(|pane| pane_spec(ir, pane))
+                .map(|pane| {
+                    let mut spec = pane_spec(ir, pane)?;
+                    if let Some(command) = spec.command.take() {
+                        commands.insert(pane.clone(), command);
+                    }
+                    Ok(spec)
+                })
                 .collect::<Result<Vec<_>>>()?;
             // The root Herdr tab id is only ever present for a workspace
             // this same apply created, and only until the first `CreateTab`
@@ -1466,8 +1516,23 @@ fn apply_herdr(
             state
                 .group_ids
                 .insert(action.address.clone(), layout.tab_id);
+            state.created_groups.insert(action.address.clone());
             for (pane, pane_id) in group.panes.iter().zip(layout.pane_ids) {
                 state.pane_ids.insert(pane.clone(), pane_id);
+                state.created_panes.insert(pane.clone());
+                if commands.contains_key(pane) {
+                    state.command_started.insert(pane.clone(), false);
+                }
+            }
+            for pane in &group.panes {
+                if let Some(argv) = commands.get(pane) {
+                    let pane_id = state
+                        .pane_ids
+                        .get(pane)
+                        .ok_or_else(|| anyhow::anyhow!("pane `{pane}` has no backend id yet"))?;
+                    backend.start_command(pane_id, argv)?;
+                    state.command_started.insert(pane.clone(), true);
+                }
             }
             Ok(Outcome::Applied)
         }
@@ -1484,12 +1549,21 @@ fn apply_herdr(
             Ok(Outcome::Applied)
         }
         HerdrAction::SplitPane => {
-            let (_workspace_id, spec) = pane_create_inputs(ir, state, &action.address)?;
+            let (_workspace_id, mut spec) = pane_create_inputs(ir, state, &action.address)?;
+            let command = spec.command.take();
             let group_id = pane_group_id(ir, &action.address)?;
             let tab_id = backend_id(state.group_ids.get(&group_id), action)?;
             let group = placement_group(ir, &group_id)?;
             let pane_id = ext.split_pane(&tab_id, &spec, group.split)?;
-            state.pane_ids.insert(action.address.clone(), pane_id);
+            state
+                .pane_ids
+                .insert(action.address.clone(), pane_id.clone());
+            state.created_panes.insert(action.address.clone());
+            if let Some(argv) = command {
+                state.command_started.insert(action.address.clone(), false);
+                backend.start_command(&pane_id, &argv)?;
+                state.command_started.insert(action.address.clone(), true);
+            }
             Ok(Outcome::Applied)
         }
         HerdrAction::StartAgent => {
@@ -2065,6 +2139,7 @@ mod tests {
                     label: None,
                     cwd: None,
                     adopted: None,
+                    command_started: None,
                     last_outcome: None,
                 },
             );
@@ -2160,6 +2235,8 @@ mod tests {
     #[derive(Default)]
     struct FlavorlessBackend {
         created_panes: Mutex<Vec<String>>,
+        created_commands: Mutex<Vec<Option<Vec<String>>>>,
+        start_commands: Mutex<Vec<Vec<String>>>,
     }
 
     impl Backend for FlavorlessBackend {
@@ -2178,12 +2255,23 @@ mod tests {
         fn create_pane(&self, _workspace_id: &str, spec: &PaneSpec) -> Result<String> {
             let name = spec.label.clone().unwrap_or_default();
             self.created_panes.lock().expect("mutex").push(name);
+            self.created_commands
+                .lock()
+                .expect("mutex")
+                .push(spec.command.clone());
             Ok("p1".into())
         }
         fn close_pane(&self, _id: &str) -> Result<()> {
             Ok(())
         }
         fn rename_pane(&self, _id: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        fn start_command(&self, _id: &str, argv: &[String]) -> Result<()> {
+            self.start_commands
+                .lock()
+                .expect("mutex")
+                .push(argv.to_vec());
             Ok(())
         }
         fn restart_command(&self, _id: &str, _argv: &[String]) -> Result<()> {
@@ -2313,6 +2401,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn core_create_pane_preserves_direct_command_create_for_non_herdr_backends() {
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreatePane), "editor"),
+        ]);
+        let backend = FlavorlessBackend::default();
+        let outcomes = apply_plan(&backend, &ir, &plan);
+
+        assert_eq!(outcomes[1].1, Outcome::Applied);
+        assert_eq!(
+            *backend.created_commands.lock().expect("mutex"),
+            vec![Some(vec!["bash".to_owned()])],
+            "non-Herdr backends keep structured create-time argv"
+        );
+        assert!(
+            backend.start_commands.lock().expect("mutex").is_empty(),
+            "non-Herdr first launch must not fall through to typed restart"
+        );
+    }
+
     /// A fake Herdr for the `up` flow (D43): it hands out backend ids for
     /// every workspace, Herdr tab and pane it is asked to create, records the
     /// verbs it receives, and answers `ensure_session` with a state the test
@@ -2429,6 +2540,14 @@ mod tests {
         }
         fn rename_pane(&self, id: &str, label: &str) -> Result<()> {
             self.record(format!("rename_pane:{id}:{label}"));
+            Ok(())
+        }
+        fn start_command(&self, id: &str, _argv: &[String]) -> Result<()> {
+            let call = format!("start_command:{id}");
+            self.record(call.clone());
+            if self.fail_calls.contains(call.as_str()) {
+                bail!("boom: {call}");
+            }
             Ok(())
         }
         fn restart_command(&self, id: &str, _argv: &[String]) -> Result<()> {
@@ -2728,6 +2847,7 @@ mod tests {
                 "create_workspace:dev",
                 "hook:editor",
                 "create_pane:w1:editor",
+                "start_command:p2",
                 "restart_command:p2"
             ]
         );
@@ -2847,6 +2967,197 @@ mod tests {
             assert!(state.journal.iter().all(|entry| entry.completed));
             assert!(pane_hook_plan(&profile, &state).actions.is_empty());
         }
+    }
+
+    #[test]
+    fn post_create_command_failure_records_core_pane_id_before_reporting_failure() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        seed_managed(
+            &mut state,
+            &[
+                ("dev", "workspace", None),
+                ("dev/main", "placement", Some("dev")),
+            ],
+        );
+        state
+            .profile_mut("default")
+            .resources
+            .get_mut("dev")
+            .expect("workspace")
+            .backend_id = "w1".into();
+        state
+            .profile_mut("default")
+            .resources
+            .get_mut("dev/main")
+            .expect("group")
+            .backend_id = "t1".into();
+        let backend = RecordingHerdr::running_failing(&["start_command:p1"]);
+        let report = pane_hook_up(
+            &profile,
+            &up_plan(&[(Action::Core(CoreAction::CreatePane), "editor")]),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].address, "editor");
+        let managed = state.profile("default").expect("managed");
+        assert_eq!(managed.resources["editor"].backend_id, "p1");
+        assert_eq!(managed.resources["editor"].command_started, Some(false));
+        assert_eq!(
+            backend.calls(),
+            ["create_pane:w1:editor", "start_command:p1"]
+        );
+        let retry = pane_hook_plan(&profile, &state);
+        assert_eq!(retry.actions.len(), 1);
+        assert_eq!(
+            retry.actions[0].kind,
+            Action::Core(CoreAction::RestartCommand)
+        );
+        assert_eq!(retry.actions[0].backend_id.as_deref(), Some("p1"));
+        let backend = RecordingHerdr::running();
+        let report = pane_hook_up(
+            &profile,
+            &retry,
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        assert!(report.failed.is_empty());
+        assert_eq!(backend.calls(), ["restart_command:p1"]);
+        assert_eq!(
+            state.profile("default").expect("managed").resources["editor"].command_started,
+            Some(true)
+        );
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn post_create_command_failure_records_fresh_tab_ids_before_reporting_failure() {
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default", "workspaces": [{"name": "dev", "tabs": [{
+                "name": "main", "panes": [
+                    {"name": "editor", "serve": [["serve-editor"]]},
+                    {"name": "tests", "serve": [["serve-tests"]]}
+                ]
+            }]}]
+        }));
+        let backend = RecordingHerdr::running_failing(&["start_command:p3"]);
+        let report = pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].address, "dev/main");
+        let managed = state.profile("default").expect("managed");
+        assert_eq!(managed.resources["dev/main"].backend_id, "t2");
+        assert_eq!(managed.resources["editor"].backend_id, "p3");
+        assert_eq!(managed.resources["tests"].backend_id, "p4");
+        assert_eq!(managed.resources["editor"].command_started, Some(false));
+        assert_eq!(managed.resources["tests"].command_started, Some(false));
+        let retry = pane_hook_plan(&profile, &state);
+        assert_eq!(retry.actions.len(), 2);
+        assert!(
+            retry
+                .actions
+                .iter()
+                .all(|action| action.kind == Action::Core(CoreAction::RestartCommand))
+        );
+        assert_eq!(retry.actions[0].backend_id.as_deref(), Some("p3"));
+        assert_eq!(retry.actions[1].backend_id.as_deref(), Some("p4"));
+        let backend = RecordingHerdr::running();
+        let report = pane_hook_up(
+            &profile,
+            &retry,
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            backend.calls(),
+            ["restart_command:p3", "restart_command:p4"]
+        );
+        let managed = state.profile("default").expect("managed");
+        assert_eq!(managed.resources["editor"].command_started, Some(true));
+        assert_eq!(managed.resources["tests"].command_started, Some(true));
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn post_split_command_failure_records_split_pane_id_before_reporting_failure() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = up_profile();
+        let backend = RecordingHerdr::running();
+        pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        let mut pane = profile.workspaces[0].tabs[0].panes[0].clone();
+        pane.name = "tests".into();
+        pane.serve = vec![vec!["serve-tests".into()]];
+        profile.workspaces[0].tabs[0].panes.push(pane);
+        let backend = RecordingHerdr {
+            fail_calls: ["start_command:p4"].into_iter().collect(),
+            ..backend
+        };
+        let report = pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].address, "tests");
+        assert_eq!(
+            state.profile("default").expect("managed").resources["tests"].backend_id,
+            "p4"
+        );
+        assert_eq!(
+            state.profile("default").expect("managed").resources["tests"].command_started,
+            Some(false)
+        );
+        let retry = pane_hook_plan(&profile, &state);
+        assert_eq!(retry.actions.len(), 1);
+        assert_eq!(
+            retry.actions[0].kind,
+            Action::Core(CoreAction::RestartCommand)
+        );
+        assert_eq!(retry.actions[0].backend_id.as_deref(), Some("p4"));
+        let backend = RecordingHerdr::running();
+        let report = pane_hook_up(
+            &profile,
+            &retry,
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        assert!(report.failed.is_empty());
+        assert_eq!(backend.calls(), ["restart_command:p4"]);
+        assert_eq!(
+            state.profile("default").expect("managed").resources["tests"].command_started,
+            Some(true)
+        );
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
     }
 
     #[test]
@@ -3204,6 +3515,7 @@ mod tests {
                 label: None,
                 cwd: None,
                 adopted: None,
+                command_started: None,
                 last_outcome: None,
             },
         );
@@ -3713,6 +4025,7 @@ mod tests {
                     label: None,
                     cwd: None,
                     adopted: None,
+                    command_started: None,
                     last_outcome: None,
                 },
             );
@@ -3778,6 +4091,7 @@ mod tests {
                         label: None,
                         cwd: None,
                         adopted: None,
+                        command_started: None,
                         last_outcome: None,
                     },
                 );
@@ -3855,6 +4169,7 @@ mod tests {
                         label: None,
                         cwd: None,
                         adopted: None,
+                        command_started: None,
                         last_outcome: None,
                     },
                 );

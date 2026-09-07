@@ -9,8 +9,13 @@ How a maintainer cuts a Drove release.
    `## [X.Y.Z] - YYYY-MM-DD` heading, and add fresh compare/tag links at the
    bottom of the file. cargo-dist uses this section's body as the GitHub
    release notes.
-3. Commit both files on `main`.
-4. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Open a release PR with the version, changelog and documentation updates,
+   wait for review and green CI, then merge it.
+4. For releases that document native log-driven reactors, verify the public
+   eventlog release that supplies the required native capability is published.
+   Drove 0.1.3's native log-driven reactor layout requires eventlog 0.2.0 or
+   newer.
+5. Tag the accepted `main` commit and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 ## 2. What the tag triggers
 

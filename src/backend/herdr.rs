@@ -335,9 +335,22 @@ impl HerdrClient {
         if command.is_empty() {
             return Ok(());
         }
+        let result = self.request("pane.process_info", json!({"pane_id": pane_id}))?;
+        let info: RawPaneProcessInfo = serde_json::from_value(
+            result
+                .get("process_info")
+                .cloned()
+                .context("missing pane process info")?,
+        )?;
+        let shell = verified_idle_shell_name(pane_id, &info)?;
+        self.run_command_in_shell(pane_id, &shell, command)
+    }
+
+    fn run_command_in_shell(&self, pane_id: &str, shell: &str, command: &[String]) -> Result<()> {
+        let text = shell_command_text(shell, command)?;
         self.request(
             "pane.send_input",
-            json!({"pane_id": pane_id, "text": shell_join(command), "keys": ["Enter"]}),
+            json!({"pane_id": pane_id, "text": text, "keys": ["Enter"]}),
         )?;
         Ok(())
     }
@@ -384,44 +397,8 @@ impl HerdrClient {
                     .iter()
                     .all(|process| process.pid == shell)
             {
-                let root = info
-                    .foreground_processes
-                    .iter()
-                    .find(|process| process.pid == shell)
-                    .context("cannot verify pane shell executable; command not sent")?;
-                let name = Path::new(&root.name)
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or(&root.name)
-                    .trim_start_matches('-');
-                let configured_shell = env::var("SHELL").ok().and_then(|shell| {
-                    Path::new(&shell)
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .map(str::to_owned)
-                });
-                if !matches!(
-                    name,
-                    "sh" | "bash"
-                        | "zsh"
-                        | "fish"
-                        | "dash"
-                        | "ksh"
-                        | "nu"
-                        | "elvish"
-                        | "pwsh"
-                        | "powershell"
-                        | "cmd"
-                        | "pwsh.exe"
-                        | "powershell.exe"
-                        | "cmd.exe"
-                ) && configured_shell.as_deref() != Some(name)
-                {
-                    bail!(
-                        "pane {pane_id} directly runs {name}, not a shell; cannot restart in place; command not sent"
-                    );
-                }
-                return self.run_command(pane_id, argv);
+                let shell = verified_idle_shell_name(pane_id, &info)?;
+                return self.run_command_in_shell(pane_id, &shell, argv);
             }
             if !interrupted {
                 self.request_with_timeout(
@@ -520,9 +497,144 @@ fn is_pane_id(address: &str) -> bool {
 
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', r"'\''")))
+        .map(|arg| posix_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn shell_command_text(shell: &str, argv: &[String]) -> Result<String> {
+    match shell_syntax(shell)? {
+        ShellSyntax::Posix => Ok(shell_join(argv)),
+        ShellSyntax::PowerShell => Ok(powershell_command_text(argv)),
+        ShellSyntax::Cmd => Ok(format!(
+            "powershell.exe -NoProfile -EncodedCommand {}",
+            encoded_powershell_command(argv)
+        )),
+    }
+}
+
+fn posix_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+fn powershell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "''"))
+}
+
+fn powershell_command_text(argv: &[String]) -> String {
+    format!(
+        "& {}",
+        argv.iter()
+            .map(|arg| powershell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn encoded_powershell_command(argv: &[String]) -> String {
+    let script = powershell_command_text(argv);
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for code_unit in script.encode_utf16() {
+        bytes.extend_from_slice(&code_unit.to_le_bytes());
+    }
+    base64_encode(&bytes)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn verified_idle_shell_name(pane_id: &str, info: &RawPaneProcessInfo) -> Result<String> {
+    let shell = info
+        .shell_pid
+        .context("cannot restart pane without a known shell pid")?;
+    if info
+        .foreground_process_group_id
+        .is_some_and(|pid| pid != shell)
+        || !info
+            .foreground_processes
+            .iter()
+            .all(|process| process.pid == shell)
+    {
+        bail!("pane {pane_id} is busy; command not sent");
+    }
+    let root = info
+        .foreground_processes
+        .iter()
+        .find(|process| process.pid == shell)
+        .context("cannot verify pane shell executable; command not sent")?;
+    let name = Path::new(&root.name)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(&root.name)
+        .trim_start_matches('-')
+        .to_owned();
+    let configured_shell = env::var("SHELL").ok().and_then(|shell| {
+        Path::new(&shell)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(str::to_owned)
+    });
+    if !is_known_shell(&name) && configured_shell.as_deref() != Some(name.as_str()) {
+        bail!(
+            "pane {pane_id} directly runs {name}, not a shell; cannot restart in place; command not sent"
+        );
+    }
+    Ok(name)
+}
+
+fn is_known_shell(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ksh"
+            | "nu"
+            | "elvish"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "pwsh.exe"
+            | "powershell.exe"
+            | "cmd.exe"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellSyntax {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+fn shell_syntax(shell: &str) -> Result<ShellSyntax> {
+    match shell.to_ascii_lowercase().as_str() {
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" => Ok(ShellSyntax::Posix),
+        "pwsh" | "powershell" | "pwsh.exe" | "powershell.exe" => Ok(ShellSyntax::PowerShell),
+        "cmd" | "cmd.exe" => Ok(ShellSyntax::Cmd),
+        other => bail!("shell {other} command launch is not supported yet; command not sent"),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -632,6 +744,10 @@ impl Backend for HerdrClient {
 
     fn rename_pane(&self, pane_id: &str, label: &str) -> Result<()> {
         HerdrClient::rename_pane(self, pane_id, label)
+    }
+
+    fn start_command(&self, pane_id: &str, argv: &[String]) -> Result<()> {
+        self.run_command(pane_id, argv)
     }
 
     fn restart_command(&self, pane_id: &str, argv: &[String]) -> Result<()> {
@@ -1188,6 +1304,89 @@ mod tests {
     }
 
     #[test]
+    fn powershell_command_text_uses_call_operator_and_doubled_quotes() {
+        let command = shell_command_text(
+            "pwsh.exe",
+            &[
+                "Write-Output".into(),
+                "it's ready".into(),
+                "$(Get-ChildItem)".into(),
+            ],
+        )
+        .expect("powershell command");
+        assert_eq!(command, "& 'Write-Output' 'it''s ready' '$(Get-ChildItem)'");
+    }
+
+    #[test]
+    fn fish_keeps_the_existing_single_quoted_command_path() {
+        let command = shell_command_text("fish", &["echo".into(), "it's ready".into()])
+            .expect("fish command");
+        assert_eq!(command, r"'echo' 'it'\''s ready'");
+    }
+
+    #[test]
+    fn cmd_command_text_wraps_an_encoded_powershell_command() {
+        let command = shell_command_text(
+            "cmd.exe",
+            &["echo".into(), "50% ready!".into(), "a&b".into()],
+        )
+        .expect("cmd command");
+        assert!(command.starts_with("powershell.exe -NoProfile -EncodedCommand "));
+        assert!(!command.contains("50% ready!"));
+        assert!(!command.contains("a&b"));
+        assert_eq!(
+            command,
+            format!(
+                "powershell.exe -NoProfile -EncodedCommand {}",
+                encoded_powershell_command(&["echo".into(), "50% ready!".into(), "a&b".into()])
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_encoded_command_preserves_argv_through_a_real_subprocess() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("capture.ps1");
+        let output = directory.path().join("argv.json");
+        fs::write(
+            &script,
+            r#"
+$out = $args[0]
+$captured = @($args | Select-Object -Skip 1)
+$captured | ConvertTo-Json -Compress | Set-Content -LiteralPath $out -NoNewline -Encoding utf8
+"#,
+        )
+        .expect("write script");
+        let expected = vec![
+            "space value".to_owned(),
+            "it's ready".to_owned(),
+            "%PATH%".to_owned(),
+            "!bang!".to_owned(),
+            "^caret&pipe|redir<>".to_owned(),
+            "`backtick".to_owned(),
+        ];
+        let mut argv = vec![
+            "powershell.exe".to_owned(),
+            "-NoProfile".to_owned(),
+            "-File".to_owned(),
+            script.display().to_string(),
+            output.display().to_string(),
+        ];
+        argv.extend(expected.clone());
+        let command = shell_command_text("cmd.exe", &argv).expect("cmd command");
+        let status = Command::new("cmd.exe")
+            .args(["/D", "/C", &command])
+            .status()
+            .expect("run cmd");
+        assert!(status.success());
+        let output = fs::read_to_string(output).expect("read captured argv");
+        let output = output.strip_prefix('\u{feff}').unwrap_or(&output);
+        let captured: Vec<String> = serde_json::from_str(output).expect("captured argv JSON");
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
     fn exchanges_one_ndjson_request_with_fake_server() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("herdr.sock");
@@ -1246,7 +1445,7 @@ mod tests {
         let listener = bind(&path).expect("bind fake Herdr");
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let stream = listener.accept().expect("accept");
                 let mut stream = BufReader::new(stream);
                 let mut line = String::new();
@@ -1254,6 +1453,10 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).expect("request JSON");
                 let result = match request["method"].as_str().expect("method") {
                     "pane.split" => json!({"pane": {"pane_id": "w1:p3"}}),
+                    "pane.process_info" => json!({
+                        "process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+                            "foreground_processes": [{"pid": 100, "name": "zsh"}]}
+                    }),
                     "pane.send_input" => json!({"type": "ok"}),
                     other => panic!("unexpected method {other}"),
                 };
@@ -1280,10 +1483,12 @@ mod tests {
         assert_eq!(requests[0]["method"], "pane.split");
         assert_eq!(requests[0]["params"]["target_pane_id"], "w1:p1");
         assert_eq!(requests[0]["params"]["direction"], "down");
-        assert_eq!(requests[1]["method"], "pane.send_input");
+        assert_eq!(requests[1]["method"], "pane.process_info");
         assert_eq!(requests[1]["params"]["pane_id"], "w1:p3");
-        assert_eq!(requests[1]["params"]["text"], "'echo' 'hi there'");
-        assert_eq!(requests[1]["params"]["keys"], json!(["Enter"]));
+        assert_eq!(requests[2]["method"], "pane.send_input");
+        assert_eq!(requests[2]["params"]["pane_id"], "w1:p3");
+        assert_eq!(requests[2]["params"]["text"], "'echo' 'hi there'");
+        assert_eq!(requests[2]["params"]["keys"], json!(["Enter"]));
     }
 
     #[test]
@@ -1330,7 +1535,7 @@ mod tests {
             let mut requests = Vec::new();
             // layout.apply, layout.export, pane.split, pane.rename,
             // layout.set_split_ratio.
-            for _ in 0..6 {
+            for _ in 0..7 {
                 let stream = listener.accept().expect("accept");
                 let mut stream = BufReader::new(stream);
                 let mut line = String::new();
@@ -1350,6 +1555,10 @@ mod tests {
                             "tab_id": "w1:t2",
                             "root": {"type": "pane", "pane_id": "w1:p2"},
                         }
+                    }),
+                    "pane.process_info" => json!({
+                        "process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+                            "foreground_processes": [{"pid": 100, "name": "zsh"}]}
                     }),
                     "pane.split" => json!({"pane": {"pane_id": "w1:p3"}}),
                     "pane.send_input" | "pane.rename" => json!({"type": "ok"}),
@@ -1398,8 +1607,9 @@ mod tests {
         assert_eq!(methods[0], "layout.apply");
         assert_eq!(requests[0]["params"]["root"]["label"], "editor");
         assert!(requests[0]["params"]["root"].get("command").is_none());
-        assert_eq!(methods[1], "pane.send_input");
-        assert_eq!(requests[1]["params"]["text"], "'eventlog' 'view'");
+        assert_eq!(methods[1], "pane.process_info");
+        assert_eq!(methods[2], "pane.send_input");
+        assert_eq!(requests[2]["params"]["text"], "'eventlog' 'view'");
         // The regression guard: the ratio is set only after the split that
         // creates the gap exists, never against the one-pane tab.
         let split_at = methods
@@ -1796,6 +2006,11 @@ mod tests {
                 json!({"layout": {"workspace_id": "w1", "tab_id": "w1:t1",
                 "root": {"type": "pane", "pane_id": "w1:p2"}}}),
             ),
+            (
+                "pane.process_info",
+                json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+                    "foreground_processes": [{"pid": 100, "name": "pwsh.exe"}]}}),
+            ),
             ("pane.send_input", json!({})),
         ]);
         let pane = Backend::create_pane(
@@ -1810,7 +2025,7 @@ mod tests {
         assert_eq!(pane, "w1:p2");
         let requests = server.join().expect("server");
         assert!(requests[0]["params"]["root"].get("command").is_none());
-        assert_eq!(requests[1]["params"]["text"], "'eventlog' 'view'");
+        assert_eq!(requests[2]["params"]["text"], "& 'eventlog' 'view'");
     }
 
     #[test]

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-07
+
+### Fixed
+
+- Log-driven Herdr workspaces now run pane `on_start` hooks before starting
+  pane commands, preserve retryable hook and restart failures, and use the
+  upstream native eventlog reactor setup instead of repository-local shell
+  reactors. Direct-exec Herdr panes that do not have a real shell are refused
+  for in-place restart instead of receiving typed replacement text.
+- Herdr command restarts now interrupt a foreground job once, wait for the
+  original shell to return, and only then submit the replacement command. If
+  the pane stays busy until timeout, Drove sends no replacement input and the
+  restart remains retryable; idle shells are reused without an interrupt.
+- First-pane and split-pane command launch now formats argv for the pane's
+  actual shell. POSIX shells keep POSIX single-quoted argv text; PowerShell
+  uses the `&` call operator and doubles embedded apostrophes inside
+  single-quoted arguments; `cmd.exe` uses a PowerShell `EncodedCommand`
+  wrapper so spaces, apostrophes and command-shell metacharacters survive
+  without direct `cmd.exe` quoting.
+
 ## [0.1.2] - 2026-09-07
 
 ### Fixed
@@ -160,7 +180,8 @@ the live state of a backend, and reconciles the difference.
 
 - Windows CI leg and working-directory digest portability.
 
-[Unreleased]: https://github.com/radiator-engineering/Drove/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/radiator-engineering/Drove/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/radiator-engineering/Drove/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/radiator-engineering/Drove/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/radiator-engineering/Drove/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/radiator-engineering/Drove/releases/tag/v0.1.0

@@ -6,8 +6,11 @@ Keep the log and existing work when replacing an older shell-based setup.
 
 ## Install and configure eventlog
 
-Install an eventlog build with `setup`, `action` and `lifecycle` support.
-From the repository root, run:
+For the native log-driven reactor layout, install eventlog 0.2.0 or newer;
+it supplies the `setup`, `action` and `lifecycle` support this layout uses.
+The public upstream release target is
+https://github.com/radiator-engineering/eventlog/releases/tag/v0.2.0. From
+the repository root, run:
 
 ```sh
 eventlog setup preview
@@ -29,8 +32,9 @@ The small Python command supplies the project briefs and returns the model's
 exit status. It requires Python 3.11 or newer, `cursor-agent` and `claude`,
 with their normal login credentials. The docs command uses the Claude login
 unless `DOC_USE_API_KEY=1` explicitly selects the environment's API key.
-Configured commit commands require an eventlog build that supports them;
-the older direct-Git action does not preserve Composer behavior.
+Configured commit commands for this native reactor layout require eventlog
+0.2.0 or newer; the older direct-Git action does not preserve Composer
+behavior.
 
 ## Declare the layout
 

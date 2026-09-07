@@ -72,6 +72,11 @@ pub struct Observed {
     /// `Some(info)` for a running command, `None` for an idle shell or a
     /// pane the backend lost.
     pub process_info: Option<Option<ProcessInfo>>,
+    /// Whether Drove successfully started this pane's declared command after
+    /// creating the physical pane. `Some(false)` means a previous apply saved
+    /// the pane id after a post-create launch failure, so matching content
+    /// digest alone is not enough to consider it converged.
+    pub command_started: Option<bool>,
 }
 
 /// The ownership tokens `drove_name` (the map key), `drove_profile` and
@@ -108,6 +113,7 @@ impl Snapshot {
                     digest: digest.to_owned(),
                 }),
                 process_info: None,
+                command_started: None,
             },
         );
         self
@@ -128,6 +134,7 @@ impl Snapshot {
                 parent: parent.map(str::to_owned),
                 owner: None,
                 process_info: None,
+                command_started: None,
             },
         );
         self
@@ -140,6 +147,13 @@ impl Snapshot {
     pub fn with_process_info(mut self, identity: &str, process_info: Option<ProcessInfo>) -> Self {
         if let Some(observed) = self.resources.get_mut(identity) {
             observed.process_info = Some(process_info);
+        }
+        self
+    }
+
+    pub fn with_command_started(mut self, identity: &str, started: bool) -> Self {
+        if let Some(observed) = self.resources.get_mut(identity) {
+            observed.command_started = Some(started);
         }
         self
     }
@@ -755,6 +769,18 @@ fn plan_pane(
                 let converged_by_digest =
                     owner.digest == resource.digest || is_legacy_digest(&owner.digest);
                 if converged_by_digest {
+                    if serves
+                        && let Some(observed) = observed
+                        && observed.command_started == Some(false)
+                    {
+                        push_restart_command(
+                            &id,
+                            Some(observed.backend_id.clone()),
+                            "command start pending".to_owned(),
+                            ranked,
+                        );
+                        return;
+                    }
                     // Converged by digest: still worth a look at what's
                     // actually running, for a serve pane (D54) — same as
                     // the non-adopted path in `plan_normal_pane`, which an
@@ -864,6 +890,15 @@ fn plan_normal_pane(
 
     let converged_by_digest = owner.digest == resource.digest || is_legacy_digest(&owner.digest);
     if converged_by_digest && observed.parent.as_deref() == resource.parent.as_deref() {
+        if serves && observed.command_started == Some(false) {
+            push_restart_command(
+                id,
+                Some(observed.backend_id.clone()),
+                "command start pending".to_owned(),
+                ranked,
+            );
+            return;
+        }
         // Converged by digest (or recorded under a pre-D53 digest this
         // planner can't diff by category, so it's given the benefit of the
         // doubt — see `is_legacy_digest`): still worth a look at what's
