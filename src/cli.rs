@@ -508,6 +508,13 @@ fn lint_command(profile: &Profile, repo_root: &Path, json: bool) -> Result<ExitC
     Ok(ExitCode::SUCCESS)
 }
 
+/// `drove down` (D19, D47): runs every `on_stop` hook and detaches every
+/// owned resource, then — on the Herdr backend, when the resolved target
+/// names a session other than `default` (D46 precedence) — stops and
+/// deletes that session. The detach is saved to local state before the
+/// session is touched, so a `stop_session` failure (a missing `herdr`
+/// binary, or a failed delete) still leaves the resources detached and a
+/// retry of `down` idempotent.
 fn down_command(
     profile: &Profile,
     backend_id: &str,
@@ -526,17 +533,8 @@ fn down_command(
     };
     let backend: Option<&dyn Backend> = if purge { Some(client.as_ref()) } else { None };
     let report = down(profile, &ctx, &mut state, yes, purge, backend)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "detached": report.detached,
-                "hooks_run": report.hooks_run.iter().map(|(name, success)| {
-                    serde_json::json!({"resource": name, "success": success})
-                }).collect::<Vec<_>>(),
-            })
-        );
-    } else {
+
+    if !json {
         for id in &report.detached {
             println!("detached {id}");
         }
@@ -544,6 +542,40 @@ fn down_command(
             println!("nothing owned by profile `{}`", profile.name);
         }
     }
+
+    let named_session = target
+        .name
+        .as_deref()
+        .filter(|name| *name != "default")
+        .zip(client.herdr());
+    let session = match named_session {
+        Some((name, herdr)) => Some((name.to_owned(), herdr.stop_session(name)?)),
+        None => None,
+    };
+
+    if json {
+        let mut body = serde_json::json!({
+            "detached": report.detached,
+            "hooks_run": report.hooks_run.iter().map(|(name, success)| {
+                serde_json::json!({"resource": name, "success": success})
+            }).collect::<Vec<_>>(),
+        });
+        if let Some((name, stop)) = &session {
+            body["session"] = serde_json::json!({
+                "name": name,
+                "stopped": stop.stopped,
+                "deleted": stop.deleted,
+            });
+        }
+        println!("{body}");
+    } else if let Some((name, stop)) = &session {
+        if stop.stopped {
+            println!("stopped session {name}");
+        } else {
+            println!("deleted session {name}");
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 

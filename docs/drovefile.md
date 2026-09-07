@@ -189,7 +189,7 @@ drove plan   [PROFILE] [--profile NAME] [--json]
 drove up     [PROFILE] [--profile NAME] [--yes] [--allow-replace] [--workspace NAME] [--no-focus] [--json]
 drove render [PROFILE] [--profile NAME] [--json]
 drove run    [PROFILE] [NAME] [--yes]
-drove down   [PROFILE] [--profile NAME] [--purge] [--yes]
+drove down   [PROFILE] [--profile NAME] [--purge] [--yes] [--json]
 drove lint   [PROFILE] [--profile NAME] [--json]
 drove ls     [--json]
 ```
@@ -208,6 +208,6 @@ drove ls     [--json]
 4. Focus the profile's first declared workspace (or the one named by `--workspace NAME`). If your terminal is outside Herdr (`HERDR_ENV` unset) and stdout is a TTY, `up` then execs `herdr session attach NAME` so you land in the session. `--no-focus` skips both steps; `--json` implies `--no-focus`.
 5. Print one summary line: `profile NAME: N created, M changed, K tasks run, in sync`, or, when nothing needed applying, `profile NAME: already running, brought to front`.
 
-`drove run NAME` runs one task and its `after` prerequisites, and nothing else declared in the profile; with no `NAME`, it lists every declared task and its last recorded outcome. `drove down` selects the resources local state records as owned by this profile, runs each one's `on_stop` hook, then stops tracking it (`--purge` also passes each resource's stored backend id to the backend's `close_pane`); it never touches a pane local state doesn't record as owned by this profile.
+`drove run NAME` runs one task and its `after` prerequisites, and nothing else declared in the profile; with no `NAME`, it lists every declared task and its last recorded outcome. `drove down` selects the resources local state records as owned by this profile, runs each one's `on_stop` hook, then stops tracking it (`--purge` also passes each resource's stored backend id to the backend's `close_pane`); it never touches a pane local state doesn't record as owned by this profile. On the Herdr backend, once the detach is saved, `down` also stops and deletes the resolved target session, but only when it's a named one — `--session`/`--target`, `DROVE_SESSION`/`DROVE_TARGET`, the profile's own `session = ...`, or `HERDR_SESSION` — and not `default`, which stays untouched as your persistent session. It prints `stopped session NAME` (or `deleted session NAME` if the session was already stopped), and `--json` adds `"session": {"name", "stopped", "deleted"}` to the report.
 
 Use `--backend ID`, `--target NAME`, `--file PATH`, `--socket PATH`, or `--session NAME` when discovery defaults are not appropriate.

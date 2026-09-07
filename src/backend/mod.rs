@@ -126,6 +126,16 @@ pub enum SessionState {
     CannotStart { hint: String },
 }
 
+/// The result of [`HerdrExt::stop_session`] (D47): whether the stop itself
+/// found the session running (`stopped`) versus already stopped, and whether
+/// the delete that always follows it succeeded (`deleted`; a failed delete
+/// is an error, so a returned `Ok` always carries `deleted: true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionStop {
+    pub stopped: bool,
+    pub deleted: bool,
+}
+
 /// The result of building a fresh Herdr tab ([`HerdrExt::create_tab`]): the
 /// new Herdr tab's backend id, and the backend ids of the panes it holds in
 /// the declared order they were created. The caller records these so a later
@@ -191,6 +201,14 @@ pub trait HerdrExt {
     /// binary and returns [`SessionState::Started`] once the socket comes up,
     /// or [`SessionState::CannotStart`] with the command to run by hand.
     fn ensure_session(&self, name: &str) -> Result<SessionState>;
+
+    /// Stops then deletes the named session (D47), the teardown mirror of
+    /// [`Self::ensure_session`]: shells out to `herdr session stop NAME`, then
+    /// `herdr session delete NAME`. A stop that fails because the session was
+    /// not running is not an error — delete still runs and the returned
+    /// [`SessionStop::stopped`] is `false`. A missing `herdr` binary or a
+    /// failed delete is an error.
+    fn stop_session(&self, name: &str) -> Result<SessionStop>;
 }
 
 /// The Radiator flavor. Empty until the hub protocol for chat panes, runner

@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, SessionState, Split, TabLayout,
+    Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, SessionState, SessionStop, Split,
+    TabLayout,
 };
 use crate::model::SplitDirection;
 
@@ -644,6 +645,10 @@ impl HerdrExt for HerdrClient {
             Ok(SessionState::CannotStart { hint })
         }
     }
+
+    fn stop_session(&self, name: &str) -> Result<SessionStop> {
+        run_stop_session(&herdr_bin_path(), name)
+    }
 }
 
 impl HerdrClient {
@@ -684,6 +689,75 @@ fn start_session_server(name: &str) -> Result<()> {
         .spawn()
         .context("cannot start the Herdr session server")?;
     Ok(())
+}
+
+/// Stops then deletes the named session by shelling out to `bin` (D47):
+/// `herdr session stop NAME --json`, then `herdr session delete NAME
+/// --json`. Herdr reports a stop against a session that is not running as a
+/// failed `session.stop` call carrying the `session_stop_failed` code
+/// (checked by [`stop_failed_because_not_running`]); only that documented
+/// failure is read as "already stopped" rather than an error, so delete
+/// still runs for it. Any other stop failure, spawning either command
+/// failing (a missing binary), or the delete exiting non-zero is an error —
+/// a stop failure for an undocumented reason never reaches delete. Takes
+/// `bin` explicitly, rather than reading `HERDR_BIN_PATH` itself, so tests
+/// can point it at a fake script without mutating process-global
+/// environment.
+fn run_stop_session(bin: &OsStr, name: &str) -> Result<SessionStop> {
+    let stop = Command::new(bin)
+        .args(["session", "stop", name, "--json"])
+        .output()
+        .context("cannot run the herdr binary")?;
+    let stopped = if stop.status.success() {
+        true
+    } else if stop_failed_because_not_running(&stop.stdout, &stop.stderr) {
+        false
+    } else {
+        bail!(
+            "herdr session stop {name} failed: {}",
+            String::from_utf8_lossy(&stop.stderr).trim()
+        );
+    };
+
+    let delete = Command::new(bin)
+        .args(["session", "delete", name, "--json"])
+        .output()
+        .context("cannot run the herdr binary")?;
+    if !delete.status.success() {
+        bail!(
+            "herdr session delete {name} failed: {}",
+            String::from_utf8_lossy(&delete.stderr).trim()
+        );
+    }
+
+    Ok(SessionStop {
+        stopped,
+        deleted: true,
+    })
+}
+
+/// Whether a failed `herdr session stop --json` reports the documented
+/// `session_stop_failed` code (D47) — the only stop failure read as
+/// "already stopped" rather than propagated as an error. Herdr's exact wire
+/// shape for a `--json` CLI failure isn't pinned by the spec, so this checks
+/// both stdout and stderr for a JSON object naming that code either at the
+/// top level (`{"code": "session_stop_failed", ...}`) or nested under
+/// `error` (Herdr's socket API error shape, `{"error": {"code": ...}}`);
+/// text that fails to parse as JSON, or names any other code, does not
+/// count.
+fn stop_failed_because_not_running(stdout: &[u8], stderr: &[u8]) -> bool {
+    [stdout, stderr].into_iter().any(|bytes| {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            return false;
+        };
+        let code = value
+            .get("code")
+            .or_else(|| value.get("error").and_then(|error| error.get("code")));
+        code.and_then(Value::as_str) == Some("session_stop_failed")
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -924,7 +998,7 @@ fn connect(path: &Path) -> std::io::Result<Stream> {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
+    use std::{fs, thread};
 
     use interprocess::local_socket::{Listener, ListenerOptions, traits::Listener as _};
 
@@ -1680,6 +1754,156 @@ mod tests {
             HerdrExt::ensure_session(&HerdrClient::new(path), "unused").expect("ensure session");
         assert_eq!(state, SessionState::Running);
         server.join().expect("server thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_stops_then_deletes_in_order() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(&directory, &log, "exit 0");
+
+        let stop = run_stop_session(bin.as_os_str(), "x").expect("stop session");
+        assert_eq!(
+            stop,
+            SessionStop {
+                stopped: true,
+                deleted: true
+            }
+        );
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(lines.next(), Some("session delete x --json"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_still_deletes_a_session_that_was_already_stopped() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(
+            &directory,
+            &log,
+            r#"if [ "$2" = "stop" ]; then echo '{"code":"session_stop_failed","message":"not running"}' >&2; exit 1; fi
+exit 0"#,
+        );
+
+        let stop = run_stop_session(bin.as_os_str(), "x").expect("stop session");
+        assert_eq!(
+            stop,
+            SessionStop {
+                stopped: false,
+                deleted: true
+            }
+        );
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(lines.next(), Some("session delete x --json"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_with_an_undocumented_stop_failure_is_an_error_and_never_deletes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(
+            &directory,
+            &log,
+            r#"if [ "$2" = "stop" ]; then echo '{"code":"internal_error","message":"disk full"}' >&2; exit 1; fi
+exit 0"#,
+        );
+
+        let error = run_stop_session(bin.as_os_str(), "x").expect_err("undocumented stop failure");
+        assert!(error.to_string().contains("disk full"));
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(
+            lines.next(),
+            None,
+            "a stop failure for an undocumented reason must never reach delete"
+        );
+    }
+
+    #[test]
+    fn stop_session_with_a_missing_binary_is_an_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bin = directory.path().join("no-such-herdr-binary");
+
+        let error = run_stop_session(bin.as_os_str(), "x").expect_err("missing binary");
+        assert!(error.to_string().contains("cannot run the herdr binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_with_a_failed_delete_is_an_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(
+            &directory,
+            &log,
+            r#"if [ "$2" = "delete" ]; then echo "boom" >&2; exit 1; fi
+exit 0"#,
+        );
+
+        let error = run_stop_session(bin.as_os_str(), "x").expect_err("delete failure");
+        assert!(error.to_string().contains("boom"));
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(lines.next(), Some("session delete x --json"));
+        assert_eq!(lines.next(), None);
+    }
+
+    /// Writes an executable shell script at `<directory>/herdr` that appends
+    /// its arguments (space-joined) to `log` before running `body`, so a
+    /// test can assert both the recorded argv and the simulated exit
+    /// behavior of `stop_session`'s two shelled-out calls.
+    #[cfg(unix)]
+    fn write_fake_herdr(directory: &tempfile::TempDir, log: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = directory.path().join("herdr");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
+        )
+        .expect("write fake herdr script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make fake herdr script executable");
+        warm_up(&script);
+        // The warm-up run above may have appended to `log`; the caller's
+        // assertions expect it to start empty.
+        let _ = fs::write(log, "");
+        script
+    }
+
+    /// A parallel `cargo test` run occasionally hits Linux's `ETXTBSY`
+    /// ("text file busy", os error 26) execing a script immediately after
+    /// writing and chmod'ing it — a known kernel race between another
+    /// thread's fork() and this file's write-fd closing. Retrying a
+    /// throwaway invocation until it succeeds settles the race before the
+    /// real test calls into `run_stop_session`.
+    #[cfg(unix)]
+    fn warm_up(script: &Path) {
+        for _ in 0..50 {
+            match Command::new(script).arg("--warmup").output() {
+                Ok(_) => return,
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("warm up fake herdr script: {error}"),
+            }
+        }
+        panic!("fake herdr script stayed text-busy after 50 retries");
     }
 
     #[test]

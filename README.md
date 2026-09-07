@@ -95,7 +95,7 @@ drove status   # same comparison as plan, read-only
 drove render   # print the compiled model: a flat, ordered list of resources with content digests, no backend I/O
 drove lint     # catch a stale was = "..." rename or a task with no check
 drove run      # run one declared task and its prerequisites
-drove down     # stop tracking this profile's resources, running each one's on_stop hook first
+drove down     # stop tracking this profile's resources, running each one's on_stop hook first; on Herdr, also stops and deletes a named session (never `default`)
 ```
 
 Use `--profile NAME` (an alias of the positional profile), `--backend ID` / `--target NAME` (or `--session NAME` on Herdr) to override the declared backend and instance, and `--file PATH` when Drove cannot find the `Drovefile` by searching parent directories.
