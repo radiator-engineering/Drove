@@ -694,18 +694,30 @@ fn start_session_server(name: &str) -> Result<()> {
 /// Stops then deletes the named session by shelling out to `bin` (D47):
 /// `herdr session stop NAME --json`, then `herdr session delete NAME
 /// --json`. Herdr reports a stop against a session that is not running as a
-/// failed `session.stop` call, so any non-success exit from the stop is read
-/// as "already stopped" rather than an error, and delete always runs.
-/// Spawning either command failing (a missing binary) or the delete exiting
-/// non-zero is an error. Takes `bin` explicitly, rather than reading
-/// `HERDR_BIN_PATH` itself, so tests can point it at a fake script without
-/// mutating process-global environment.
+/// failed `session.stop` call carrying the `session_stop_failed` code
+/// (checked by [`stop_failed_because_not_running`]); only that documented
+/// failure is read as "already stopped" rather than an error, so delete
+/// still runs for it. Any other stop failure, spawning either command
+/// failing (a missing binary), or the delete exiting non-zero is an error —
+/// a stop failure for an undocumented reason never reaches delete. Takes
+/// `bin` explicitly, rather than reading `HERDR_BIN_PATH` itself, so tests
+/// can point it at a fake script without mutating process-global
+/// environment.
 fn run_stop_session(bin: &OsStr, name: &str) -> Result<SessionStop> {
     let stop = Command::new(bin)
         .args(["session", "stop", name, "--json"])
         .output()
         .context("cannot run the herdr binary")?;
-    let stopped = stop.status.success();
+    let stopped = if stop.status.success() {
+        true
+    } else if stop_failed_because_not_running(&stop.stdout, &stop.stderr) {
+        false
+    } else {
+        bail!(
+            "herdr session stop {name} failed: {}",
+            String::from_utf8_lossy(&stop.stderr).trim()
+        );
+    };
 
     let delete = Command::new(bin)
         .args(["session", "delete", name, "--json"])
@@ -721,6 +733,30 @@ fn run_stop_session(bin: &OsStr, name: &str) -> Result<SessionStop> {
     Ok(SessionStop {
         stopped,
         deleted: true,
+    })
+}
+
+/// Whether a failed `herdr session stop --json` reports the documented
+/// `session_stop_failed` code (D47) — the only stop failure read as
+/// "already stopped" rather than propagated as an error. Herdr's exact wire
+/// shape for a `--json` CLI failure isn't pinned by the spec, so this checks
+/// both stdout and stderr for a JSON object naming that code either at the
+/// top level (`{"code": "session_stop_failed", ...}`) or nested under
+/// `error` (Herdr's socket API error shape, `{"error": {"code": ...}}`);
+/// text that fails to parse as JSON, or names any other code, does not
+/// count.
+fn stop_failed_because_not_running(stdout: &[u8], stderr: &[u8]) -> bool {
+    [stdout, stderr].into_iter().any(|bytes| {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            return false;
+        };
+        let code = value
+            .get("code")
+            .or_else(|| value.get("error").and_then(|error| error.get("code")));
+        code.and_then(Value::as_str) == Some("session_stop_failed")
     })
 }
 
@@ -1751,7 +1787,7 @@ mod tests {
         let bin = write_fake_herdr(
             &directory,
             &log,
-            r#"if [ "$2" = "stop" ]; then echo "session_stop_failed" >&2; exit 1; fi
+            r#"if [ "$2" = "stop" ]; then echo '{"code":"session_stop_failed","message":"not running"}' >&2; exit 1; fi
 exit 0"#,
         );
 
@@ -1769,6 +1805,31 @@ exit 0"#,
         assert_eq!(lines.next(), Some("session stop x --json"));
         assert_eq!(lines.next(), Some("session delete x --json"));
         assert_eq!(lines.next(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_with_an_undocumented_stop_failure_is_an_error_and_never_deletes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(
+            &directory,
+            &log,
+            r#"if [ "$2" = "stop" ]; then echo '{"code":"internal_error","message":"disk full"}' >&2; exit 1; fi
+exit 0"#,
+        );
+
+        let error = run_stop_session(bin.as_os_str(), "x").expect_err("undocumented stop failure");
+        assert!(error.to_string().contains("disk full"));
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(
+            lines.next(),
+            None,
+            "a stop failure for an undocumented reason must never reach delete"
+        );
     }
 
     #[test]

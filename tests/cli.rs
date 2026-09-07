@@ -551,7 +551,7 @@ fn down_still_deletes_a_session_that_was_already_stopped() {
     let herdr = write_fake_herdr(
         directory.path(),
         &log,
-        "if [ \"$2\" = \"stop\" ]; then echo session_stop_failed >&2; exit 1; fi\nexit 0",
+        "if [ \"$2\" = \"stop\" ]; then echo '{\"code\":\"session_stop_failed\",\"message\":\"not running\"}' >&2; exit 1; fi\nexit 0",
     );
 
     let mut command = Command::cargo_bin("drove").expect("binary");
