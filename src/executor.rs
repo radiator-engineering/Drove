@@ -2,10 +2,8 @@
 //! approval-gated on content digest, recorded in the local state journal
 //! (spec §5, D11-D13, D19).
 //!
-//! Reconciling workspaces, tabs, panes and agents against a live backend is
-//! out of scope here (PRs 3 and 5 fill in the `Backend` methods this module
-//! does not call); this module only runs the argv a `task()` or an
-//! `on_start`/`on_stop` hook declares, on the host, in the repo root.
+//! Reconciles backend resources and runs task and lifecycle hook argv on
+//! the host, in the repo root. Pane startup hooks gate command launch.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -599,6 +597,7 @@ struct ApplyState {
     workspace_ids: BTreeMap<String, String>,
     group_ids: BTreeMap<String, String>,
     pane_ids: BTreeMap<String, String>,
+    blocked: BTreeSet<String>,
 }
 
 impl ApplyState {
@@ -628,13 +627,26 @@ impl ApplyState {
     }
 }
 
+/// A fresh Herdr tab launches every pane in one backend call. Its hooks must all
+/// succeed before that call; new panes have no backend id at this point.
+fn starting_panes(ir: &Ir, action: &PlannedAction) -> Vec<String> {
+    match action.kind {
+        Action::Core(CoreAction::CreatePane | CoreAction::RestartCommand)
+        | Action::Herdr(HerdrAction::SplitPane) => vec![action.address.clone()],
+        Action::Herdr(HerdrAction::CreateTab) => placement_group(ir, &action.address)
+            .map(|group| group.panes.clone())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Every id this action's target structurally depends on, nearest first: a
 /// pane's placement group and that group's workspace, a group's workspace, an
-/// agent's pane and that pane's group and workspace. Reuses the same
-/// parent relations [`record_action_ownership`] already reads off the IR
-/// (D52 point 2) instead of building a new graph.
+/// agent's pane and that pane's group and workspace, followed by transitive
+/// declared `after` prerequisites. A fresh group also depends on the external
+/// prerequisites of the panes it starts.
 fn action_dependencies(ir: &Ir, action: &PlannedAction) -> Vec<String> {
-    match action.kind {
+    let mut dependencies = match action.kind {
         Action::Herdr(HerdrAction::CreateTab | HerdrAction::RenameTab | HerdrAction::SetRatio) => {
             group_workspace(ir, &action.address)
                 .map(|workspace| vec![workspace.to_owned()])
@@ -667,7 +679,24 @@ fn action_dependencies(ir: &Ir, action: &PlannedAction) -> Vec<String> {
             chain
         }
         _ => Vec::new(),
+    };
+    let edges = dependency_edges(ir);
+    let mut pending = starting_panes(ir, action);
+    pending.push(action.address.clone());
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if visited.insert(id.clone())
+            && let Some(deps) = edges.get(&id)
+        {
+            dependencies.extend(deps.iter().cloned());
+            pending.extend(deps.iter().cloned());
+        }
     }
+    // A fresh group's panes are created together, so they cannot gate their
+    // own containing action. External prerequisites still gate the group.
+    let internal = starting_panes(ir, action);
+    dependencies.retain(|id| id != &action.address && !internal.contains(id));
+    dependencies
 }
 
 /// Applies every action in `plan` against `backend`, resolving each verb's
@@ -678,7 +707,7 @@ fn action_dependencies(ir: &Ir, action: &PlannedAction) -> Vec<String> {
 /// [`up`] uses `apply_plan_gated` instead to hold them behind `--yes`.
 pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Vec<(String, Outcome)> {
     apply_plan_gated(backend, ir, plan, true, ApplyState::default(), |_, _, _| {
-        true
+        Ok(())
     })
     .0
 }
@@ -691,12 +720,11 @@ pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Vec<(String, O
 /// instead of aborting the loop (D52 point 2): every other independent
 /// action still applies. An action that depends on one that failed, or was
 /// itself skipped this run, is reported as [`Outcome::DependencySkipped`] and
-/// collected into `skipped` rather than attempted. `on_action` runs with each
-/// action's outcome and the backend ids accumulated so far, right before the
-/// next action starts — a caller that saves state there (`up` does) leaves a
-/// killed process describing exactly what succeeded (D52 point 1). If
-/// `on_action` returns `false` (its own save failed), the loop stops before
-/// the next action so nothing more is applied without a record of it.
+/// collected into `skipped` rather than attempted. `on_action` runs before
+/// an attempted action with `None` (an error gates the backend call), then
+/// with `Some(outcome)` to record ownership before the next action. An error
+/// from that second call stops the loop so nothing more applies without a
+/// record of it (D52 point 1).
 /// Every action's outcome, the backend ids created along the way, and what
 /// failed or was skipped — [`apply_plan_gated`]'s result.
 type ApplyPlanResult = (
@@ -712,14 +740,14 @@ fn apply_plan_gated(
     plan: &Plan,
     approve: bool,
     seed: ApplyState,
-    mut on_action: impl FnMut(&PlannedAction, &Outcome, &ApplyState) -> bool,
+    mut on_action: impl FnMut(&PlannedAction, Option<&Outcome>, &ApplyState) -> Result<()>,
 ) -> ApplyPlanResult {
     let mut state = seed;
     let mut outcomes: Vec<Option<(String, Outcome)>> =
         (0..plan.actions.len()).map(|_| None).collect();
     let mut failed = Vec::new();
     let mut skipped = Vec::new();
-    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    let mut blocked = std::mem::take(&mut state.blocked);
 
     // A `SetRatio` addresses a split gap, so it must run after the panes that
     // create the group's gaps. The plan orders every Herdr tab action ahead of
@@ -729,7 +757,7 @@ fn apply_plan_gated(
     // each action's outcome in its original plan position.
     let is_deferred =
         |action: &PlannedAction| matches!(action.kind, Action::Herdr(HerdrAction::SetRatio));
-    let order = plan
+    let mut pending: Vec<_> = plan
         .actions
         .iter()
         .enumerate()
@@ -739,13 +767,36 @@ fn apply_plan_gated(
                 .iter()
                 .enumerate()
                 .filter(|(_, action)| is_deferred(action)),
-        );
+        )
+        .collect();
+    let dependencies: Vec<_> = plan
+        .actions
+        .iter()
+        .map(|action| action_dependencies(ir, action))
+        .collect();
 
-    for (index, action) in order {
-        let blocking_dependency = action_dependencies(ir, action)
-            .into_iter()
+    while !pending.is_empty() {
+        // Preserve plan order wherever possible, but wait for declared
+        // prerequisites even when their names sort after their dependents.
+        // SetRatio is an end-of-apply adjustment, never a startup prerequisite.
+        let ready = pending.iter().position(|(index, action)| {
+            !pending.iter().any(|(other_index, other)| {
+                other_index != index
+                    && other.address != action.address
+                    && !is_deferred(other)
+                    && (dependencies[*index].contains(&other.address)
+                        || starting_panes(ir, other)
+                            .iter()
+                            .any(|pane| dependencies[*index].contains(pane)))
+            })
+        });
+        let (index, action) = pending.remove(ready.unwrap_or(0));
+        let blocking_dependency = std::iter::once(action.address.clone())
+            .chain(dependencies[index].iter().cloned())
             .find(|id| blocked.contains(id));
-        let outcome = if action.destructive && !approve {
+        let outcome = if action.kind == Action::Core(CoreAction::RunTask)
+            || (action.destructive && !approve)
+        {
             Outcome::Skipped
         } else if let Some(depends_on) = blocking_dependency {
             skipped.push(SkippedAction {
@@ -754,7 +805,14 @@ fn apply_plan_gated(
             });
             Outcome::DependencySkipped { depends_on }
         } else {
-            match apply_action(backend, ir, &mut state, action) {
+            let before = if ready.is_none() {
+                Err(anyhow::anyhow!(
+                    "cyclic startup dependencies between placement groups"
+                ))
+            } else {
+                on_action(action, None, &state)
+            };
+            match before.and_then(|()| apply_action(backend, ir, &mut state, action)) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     let message = error.to_string();
@@ -769,18 +827,20 @@ fn apply_plan_gated(
         if matches!(
             outcome,
             Outcome::Failed(_) | Outcome::DependencySkipped { .. }
-        ) {
+        ) || (action.destructive && !approve)
+        {
             blocked.insert(action.address.clone());
+            blocked.extend(starting_panes(ir, action));
         }
-        let keep_going = on_action(action, &outcome, &state);
+        let keep_going = on_action(action, Some(&outcome), &state).is_ok();
         outcomes[index] = Some((action.address.clone(), outcome));
         if !keep_going {
             break;
         }
     }
 
-    // Ordinarily every slot is filled (`order` visits every action), but
-    // `on_action` returning `false` stops the loop before the rest run, so
+    // Ordinarily every slot is filled, but an ownership save error
+    // stops the loop before the rest run, so
     // trailing entries stay `None` rather than lying about an outcome they
     // never got.
     let outcomes = outcomes.into_iter().flatten().collect();
@@ -814,8 +874,8 @@ pub struct UpReport {
     pub focused: Option<String>,
     /// A destructive action was left unapplied for want of `--yes` (D22).
     pub blocked_destructive: bool,
-    /// Backend actions whose call failed (D52 point 2); `up` exits 1 when
-    /// this is non-empty.
+    /// Backend actions whose call or startup hook failed (including hooks
+    /// awaiting approval); `up` exits 1 when this is non-empty.
     pub failed: Vec<FailedAction>,
     /// Actions left unattempted because an action they depend on failed or
     /// was itself skipped this run (D52 point 2).
@@ -867,7 +927,17 @@ pub fn up(
     let (tasks, task_skipped) = execute_plan_tasks(profile, plan, ctx, state, approve)?;
     // Seed the resolver with what a previous run recorded, so an action
     // against a parent that already converged still finds its backend id.
-    let seed = ApplyState::seeded_from(state.profile(ctx.profile));
+    let mut seed = ApplyState::seeded_from(state.profile(ctx.profile));
+    seed.blocked
+        .extend(tasks.iter().filter_map(|(name, outcome)| {
+            matches!(
+                outcome,
+                TaskOutcome::Ran(false) | TaskOutcome::Blocked | TaskOutcome::DependencySkipped
+            )
+            .then_some(name.clone())
+        }));
+    let hooks = collect_hooks(profile, HookEvent::Start);
+    let mut started = BTreeSet::new();
     let existing = state.profile(ctx.profile).cloned().unwrap_or_default();
     let mut save_error: Option<anyhow::Error> = None;
     let (outcomes, applied, failed, backend_skipped) = apply_plan_gated(
@@ -877,13 +947,63 @@ pub fn up(
         approve,
         seed,
         |action, outcome, applied| {
+            let Some(outcome) = outcome else {
+                // Flavorless backends must still report Unsupported without
+                // running hooks for a verb they cannot apply.
+                if matches!(action.kind, Action::Herdr(_)) && backend.herdr().is_none() {
+                    return Ok(());
+                }
+                for pane in starting_panes(ir, action) {
+                    if started.contains(&pane) {
+                        continue;
+                    }
+                    if let Some(argv) = hooks.get(pane.as_str()) {
+                        let backend_id = if action.kind == Action::Core(CoreAction::RestartCommand)
+                        {
+                            action
+                                .backend_id
+                                .as_deref()
+                                .or_else(|| applied.pane_ids.get(&pane).map(String::as_str))
+                        } else {
+                            None
+                        };
+                        let outcome = run_hook(
+                            argv,
+                            &pane,
+                            backend_id,
+                            HookEvent::Start,
+                            ctx,
+                            state,
+                            approve,
+                        )
+                        .map_err(|error| anyhow::anyhow!("pane `{pane}` on_start: {error}"))?;
+                        match outcome {
+                            TaskOutcome::Skipped | TaskOutcome::Ran(true) => {}
+                            TaskOutcome::Blocked => {
+                                anyhow::bail!("pane `{pane}` on_start requires approval")
+                            }
+                            _ => anyhow::bail!("pane `{pane}` on_start failed"),
+                        }
+                    }
+                    started.insert(pane);
+                }
+                return Ok(());
+            };
             let managed = state.profile_mut(ctx.profile);
-            let changed = record_action_ownership(managed, &existing, ir, action, outcome, applied);
+            // A rename before a restart cannot record the desired command
+            // digest yet: a blocked startup must remain out of sync on retry.
+            let pending_restart = action.kind == Action::Core(CoreAction::RenamePane)
+                && plan.actions.iter().any(|candidate| {
+                    candidate.address == action.address
+                        && candidate.kind == Action::Core(CoreAction::RestartCommand)
+                });
+            let changed = !pending_restart
+                && record_action_ownership(managed, &existing, ir, action, outcome, applied);
             if changed && let Err(error) = state.save() {
                 save_error = Some(error);
-                return false;
+                anyhow::bail!("cannot save action ownership");
             }
-            true
+            Ok(())
         },
     );
     if let Some(error) = save_error {
@@ -1201,9 +1321,9 @@ fn record_action_ownership(
             );
             true
         }
-        // A topology-change `ClosePane` is immediately followed by a
-        // `SplitPane` in the same plan that re-records the pane under its new
-        // group, so there is nothing to remove here.
+        // The following split may be blocked by its startup hook. Persist
+        // that the old pane is gone even when its replacement never starts.
+        Action::Core(CoreAction::ClosePane) => managed.resources.remove(address).is_some(),
         _ => false,
     }
 }
@@ -2453,6 +2573,522 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Shares the backend trace so assertions prove ordering across the host
+    /// runner and the backend calls that can launch pane commands.
+    struct PaneHookRunner<'a> {
+        backend: &'a RecordingHerdr,
+        runner: FakeRunner,
+        error: bool,
+    }
+
+    impl CommandRunner for PaneHookRunner<'_> {
+        fn run(&self, argv: &[String], cwd: &Path, env: &BTreeMap<String, String>) -> Result<bool> {
+            if let Some(pane) = env.get("DROVE_RESOURCE") {
+                self.backend.record(format!("hook:{pane}"));
+            }
+            if self.error {
+                bail!("hook executable missing");
+            }
+            self.runner.run(argv, cwd, env)
+        }
+    }
+
+    fn pane_hook_up(
+        profile: &Profile,
+        plan: &Plan,
+        backend: &RecordingHerdr,
+        runner: &dyn CommandRunner,
+        state: &mut LocalState,
+        approve: bool,
+    ) -> UpReport {
+        up(
+            backend,
+            profile,
+            &profile.to_ir(),
+            plan,
+            &ctx(Path::new("/repo"), runner),
+            state,
+            approve,
+            "test",
+            None,
+            false,
+        )
+        .expect("up")
+    }
+
+    fn pane_hook_plan(profile: &Profile, state: &LocalState) -> Plan {
+        let snapshot = state
+            .profile("default")
+            .map(|managed| managed.to_snapshot("default", None))
+            .unwrap_or_default();
+        build_plan(profile, &snapshot).expect("plan")
+    }
+
+    #[test]
+    fn pane_hooks_gate_fresh_tab_once_then_converged_up_and_hook_edit_do_not_run_them() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = profile_from(json!({
+            "name": "default", "workspaces": [{"name": "dev", "tabs": [{
+                "name": "main", "panes": [
+                    {"name": "editor", "serve": [["serve-editor"]], "on_start": ["register"]},
+                    {"name": "tests", "serve": [["serve-tests"]], "on_start": ["register"]}
+                ]
+            }]}]
+        }));
+        let backend = RecordingHerdr::running();
+        let runner = PaneHookRunner {
+            backend: &backend,
+            runner: FakeRunner::default(),
+            error: false,
+        };
+        let report = pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &runner,
+            &mut state,
+            true,
+        );
+        assert!(report.failed.is_empty());
+        let calls = backend.calls();
+        assert_eq!(
+            &calls[..4],
+            [
+                "create_workspace:dev",
+                "hook:editor",
+                "hook:tests",
+                "create_tab:w1:main:existing=None"
+            ]
+        );
+        assert_eq!(
+            runner.runner.calls().len(),
+            2,
+            "same argv still runs for each pane identity"
+        );
+        for (_, env) in runner.runner.calls.lock().expect("calls").iter() {
+            assert!(
+                !env.contains_key("DROVE_BACKEND_ID"),
+                "new pane has no id yet"
+            );
+        }
+        assert_eq!(state.journal.len(), 2);
+        assert!(
+            state
+                .journal
+                .iter()
+                .all(|entry| entry.completed && entry.success == Some(true))
+        );
+        let plan = pane_hook_plan(&profile, &state);
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            pane_hook_up(&profile, &plan, &backend, &runner, &mut state, false).outcome,
+            UpOutcome::AlreadyRunning
+        );
+        assert_eq!(backend.calls(), calls);
+
+        profile.workspaces[0].tabs[0].panes[0].on_start = Some(vec!["unapproved-new-hook".into()]);
+        let plan = pane_hook_plan(&profile, &state);
+        assert_eq!(plan.actions[0].kind, Action::Core(CoreAction::RenamePane));
+        assert!(
+            pane_hook_up(&profile, &plan, &backend, &runner, &mut state, false)
+                .failed
+                .is_empty()
+        );
+        assert_eq!(runner.runner.calls().len(), 2);
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn pane_hooks_gate_core_create_and_split_and_do_not_duplicate_within_apply() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = up_profile();
+        profile.workspaces[0].tabs[0].panes[0].on_start = Some(vec!["register".into()]);
+        let backend = RecordingHerdr::running();
+        let runner = PaneHookRunner {
+            backend: &backend,
+            runner: FakeRunner::default(),
+            error: false,
+        };
+        let mut plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreatePane), "editor"),
+            (Action::Core(CoreAction::RestartCommand), "editor"),
+        ]);
+        plan.actions[2].backend_id = Some("p2".into());
+        assert!(
+            pane_hook_up(&profile, &plan, &backend, &runner, &mut state, true)
+                .failed
+                .is_empty()
+        );
+        assert_eq!(
+            backend.calls(),
+            [
+                "create_workspace:dev",
+                "hook:editor",
+                "create_pane:w1:editor",
+                "restart_command:p2"
+            ]
+        );
+        assert_eq!(runner.runner.calls().len(), 1);
+
+        // A separate fresh group makes a recorded group to exercise an actual
+        // planner-generated SplitPane when a pane is added on a later up.
+        let (mut state, _dir) = temp_state();
+        pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &runner,
+            &mut state,
+            true,
+        );
+        let mut pane = profile.workspaces[0].tabs[0].panes[0].clone();
+        pane.name = "tests".into();
+        profile.workspaces[0].tabs[0].panes.push(pane);
+        let plan = pane_hook_plan(&profile, &state);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Herdr(HerdrAction::SplitPane))
+        );
+        let report = pane_hook_up(&profile, &plan, &backend, &runner, &mut state, false);
+        assert!(
+            report.failed.is_empty(),
+            "recorded approval permits unattended hook"
+        );
+        let calls = backend.calls();
+        let hook = calls
+            .iter()
+            .position(|call| call == "hook:tests")
+            .expect("hook");
+        assert!(calls[hook + 1].starts_with("split_pane:"));
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn pane_hook_restart_failures_preserve_digest_and_id_and_retry_before_command() {
+        for mode in ["blocked", "failed", "error"] {
+            let (mut state, _dir) = temp_state();
+            let mut profile = up_profile();
+            let backend = RecordingHerdr::running();
+            pane_hook_up(
+                &profile,
+                &pane_hook_plan(&profile, &state),
+                &backend,
+                &FakeRunner::default(),
+                &mut state,
+                true,
+            );
+            let original = state.profile("default").expect("managed").resources["editor"].clone();
+            profile.workspaces[0].tabs[0].panes[0].serve = vec![vec!["new-serve".into()]];
+            profile.workspaces[0].tabs[0].panes[0].on_start = Some(vec!["register".into()]);
+            let runner = PaneHookRunner {
+                backend: &backend,
+                runner: FakeRunner::default().fail(&["register"]),
+                error: mode == "error",
+            };
+            let plan = pane_hook_plan(&profile, &state);
+            assert_eq!(
+                plan.actions[0].kind,
+                Action::Core(CoreAction::RestartCommand)
+            );
+            let report = pane_hook_up(
+                &profile,
+                &plan,
+                &backend,
+                &runner,
+                &mut state,
+                mode != "blocked",
+            );
+            assert_eq!(report.failed.len(), 1, "{mode}");
+            assert!(report.failed[0].error.contains("on_start"));
+            assert!(
+                !backend
+                    .calls()
+                    .iter()
+                    .any(|call| call.starts_with("restart_command:"))
+            );
+            let managed = &state.profile("default").expect("managed").resources["editor"];
+            assert_eq!(managed.digest, original.digest);
+            assert_eq!(managed.backend_id, original.backend_id);
+            match mode {
+                "blocked" => assert!(state.journal.is_empty()),
+                "failed" => assert_eq!(state.journal[0].success, Some(false)),
+                _ => assert!(!state.journal[0].completed),
+            }
+            let retry = pane_hook_plan(&profile, &state);
+            assert_eq!(
+                retry.actions[0].kind,
+                Action::Core(CoreAction::RestartCommand)
+            );
+            let runner = PaneHookRunner {
+                backend: &backend,
+                runner: FakeRunner::default(),
+                error: false,
+            };
+            assert!(
+                pane_hook_up(&profile, &retry, &backend, &runner, &mut state, true)
+                    .failed
+                    .is_empty()
+            );
+            let calls = backend.calls();
+            assert_eq!(
+                &calls[calls.len() - 2..],
+                [
+                    "hook:editor",
+                    &format!("restart_command:{}", original.backend_id)
+                ]
+            );
+            let env = runner.runner.envs_for(&["register"]).expect("env");
+            assert_eq!(env["DROVE_RESOURCE"], "editor");
+            assert_eq!(env["DROVE_BACKEND_ID"], original.backend_id);
+            assert!(state.journal.iter().all(|entry| entry.completed));
+            assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+        }
+    }
+
+    #[test]
+    fn pane_hook_failure_gates_earlier_named_dependent_tab_and_agent_but_keeps_independent_work() {
+        for approve in [false, true] {
+            let (mut state, _dir) = temp_state();
+            let profile = profile_from(json!({
+                "name": "default", "workspaces": [{"name": "dev", "tabs": [
+                    {"name": "a-dependent", "panes": [{"name": "dependent", "after": ["prerequisite"], "on_start": ["dependent-hook"], "serve": [["dependent-serve"]]}]},
+                    {"name": "z-prerequisite", "panes": [{"name": "prerequisite", "on_start": ["register"], "serve": [["serve"]], "agent": {"kind": "claude", "name": "worker"}}]},
+                    {"name": "independent", "panes": [{"name": "independent", "serve": [["independent-serve"]]}]}
+                ]}]
+            }));
+            let backend = RecordingHerdr::running();
+            let runner = PaneHookRunner {
+                backend: &backend,
+                runner: FakeRunner::default().fail(&["register"]),
+                error: false,
+            };
+            let report = pane_hook_up(
+                &profile,
+                &pane_hook_plan(&profile, &state),
+                &backend,
+                &runner,
+                &mut state,
+                approve,
+            );
+            assert_eq!(report.failed.len(), 1);
+            assert_eq!(report.failed[0].address, "dev/z-prerequisite");
+            assert!(
+                report
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.address == "dev/a-dependent")
+            );
+            assert!(report.skipped.iter().any(|skip| skip.address == "worker"));
+            let managed = state.profile("default").expect("managed");
+            assert!(managed.resources.contains_key("dev"));
+            assert!(managed.resources.contains_key("independent"));
+            assert!(!managed.resources.contains_key("prerequisite"));
+            assert!(!managed.resources.contains_key("dev/z-prerequisite"));
+            assert!(!managed.resources.contains_key("dependent"));
+            assert!(
+                !backend
+                    .calls()
+                    .iter()
+                    .any(|call| call == "hook:dependent" || call.starts_with("start_agent:"))
+            );
+            let runner = PaneHookRunner {
+                backend: &backend,
+                runner: FakeRunner::default(),
+                error: false,
+            };
+            let retry = pane_hook_plan(&profile, &state);
+            assert!(
+                pane_hook_up(&profile, &retry, &backend, &runner, &mut state, true)
+                    .failed
+                    .is_empty()
+            );
+            assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+        }
+    }
+
+    #[test]
+    fn pane_hook_recreate_failure_removes_closed_ownership_and_retries_only_the_split() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = up_profile();
+        let backend = RecordingHerdr::running();
+        pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        let original_id = state.profile("default").expect("managed").resources["editor"]
+            .backend_id
+            .clone();
+        profile.workspaces[0].tabs[0].panes[0].cwd = Some("/new-cwd".into());
+        profile.workspaces[0].tabs[0].panes[0].on_start = Some(vec!["register".into()]);
+        let runner = PaneHookRunner {
+            backend: &backend,
+            runner: FakeRunner::default().fail(&["register"]),
+            error: false,
+        };
+        let plan = pane_hook_plan(&profile, &state);
+        assert!(plan.has_destructive_actions());
+        let before = backend.calls();
+        let report = pane_hook_up(&profile, &plan, &backend, &runner, &mut state, false);
+        assert!(report.blocked_destructive);
+        assert_eq!(
+            backend.calls(),
+            before,
+            "unapproved close also gates the replacement"
+        );
+        let report = pane_hook_up(&profile, &plan, &backend, &runner, &mut state, true);
+        assert_eq!(report.failed.len(), 1);
+        assert!(
+            !state
+                .profile("default")
+                .expect("managed")
+                .resources
+                .contains_key("editor")
+        );
+        let calls = backend.calls();
+        assert_eq!(
+            &calls[calls.len() - 2..],
+            [format!("close_pane:{original_id}"), "hook:editor".into()]
+        );
+        let retry = pane_hook_plan(&profile, &state);
+        assert_eq!(retry.actions.len(), 1);
+        assert_eq!(retry.actions[0].kind, Action::Herdr(HerdrAction::SplitPane));
+        assert!(
+            pane_hook_up(
+                &profile,
+                &retry,
+                &backend,
+                &FakeRunner::default(),
+                &mut state,
+                false
+            )
+            .failed
+            .is_empty()
+        );
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn pane_hooks_gate_imported_idle_pane_restarts_and_keep_successful_ownership() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = profile_from(json!({
+            "name": "default", "workspaces": [{"name": "dev", "tabs": [{"name": "main", "panes": [
+                {"name": "commit", "serve": [["idle"]]},
+                {"name": "docs", "serve": [["idle"]], "after": ["commit"]}
+            ]}]}]
+        }));
+        let backend = RecordingHerdr::running();
+        pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        for (pane, id) in [("commit", "w2:p2"), ("docs", "w2:p3")] {
+            state
+                .profile_mut("default")
+                .resources
+                .get_mut(pane)
+                .expect("pane")
+                .backend_id = id.into();
+        }
+        state.save().expect("import ownership");
+        for pane in &mut profile.workspaces[0].tabs[0].panes {
+            pane.serve = vec![vec![format!("serve-{}", pane.name)]];
+            pane.on_start = Some(vec![format!("register-{}", pane.name)]);
+        }
+        let runner = PaneHookRunner {
+            backend: &backend,
+            runner: FakeRunner::default().fail(&["register-docs"]),
+            error: false,
+        };
+        let plan = pane_hook_plan(&profile, &state);
+        assert_eq!(plan.actions.len(), 2);
+        assert!(
+            plan.actions
+                .iter()
+                .all(|action| action.kind == Action::Core(CoreAction::RestartCommand))
+        );
+        let report = pane_hook_up(&profile, &plan, &backend, &runner, &mut state, true);
+        assert_eq!(report.failed[0].address, "docs");
+        let calls = backend.calls();
+        assert_eq!(
+            &calls[calls.len() - 3..],
+            ["hook:commit", "restart_command:w2:p2", "hook:docs"]
+        );
+        let retry = pane_hook_plan(&profile, &state);
+        assert_eq!(
+            retry.actions.len(),
+            1,
+            "successful first restart is already persisted"
+        );
+        assert_eq!(retry.actions[0].address, "docs");
+        let runner = PaneHookRunner {
+            backend: &backend,
+            runner: FakeRunner::default(),
+            error: false,
+        };
+        assert!(
+            pane_hook_up(&profile, &retry, &backend, &runner, &mut state, false)
+                .failed
+                .is_empty()
+        );
+        let calls = backend.calls();
+        assert_eq!(
+            &calls[calls.len() - 2..],
+            ["hook:docs", "restart_command:w2:p3"]
+        );
+        assert_eq!(
+            runner.runner.envs_for(&["register-docs"]).expect("env")["DROVE_BACKEND_ID"],
+            "w2:p3"
+        );
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn pane_hooks_preserve_adopted_caller_and_unrelated_manual_resources() {
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default", "workspaces": [{"name": "dev", "tabs": [{
+                "name": "main", "panes": [{"name": "controller", "adopt": "caller", "on_start": ["must-not-run"], "serve": [["must-not-start"]]}]
+            }]}]
+        }));
+        let snapshot = Snapshot::default()
+            .with_caller("w2:p1")
+            .unmanaged("workspace", "manual-workspace", "w9", None)
+            .unmanaged(
+                "placement",
+                "manual-group",
+                "w9:t1",
+                Some("manual-workspace"),
+            )
+            .unmanaged("pane", "manual-pane", "w9:p1", Some("manual-group"));
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        let backend = RecordingHerdr::running();
+        let runner = PaneHookRunner {
+            backend: &backend,
+            runner: FakeRunner::default(),
+            error: false,
+        };
+        let report = pane_hook_up(&profile, &plan, &backend, &runner, &mut state, false);
+        assert!(report.failed.is_empty());
+        let caller = &state.profile("default").expect("managed").resources["controller"];
+        assert_eq!(caller.backend_id, "w2:p1");
+        assert_eq!(caller.adopted, Some(true));
+        assert!(runner.runner.calls().is_empty());
+        assert!(backend.calls().iter().all(|call| !call.contains("w2:p1")
+            && !call.contains("w9")
+            && !call.contains("manual")
+            && !call.contains("pane:")));
     }
 
     #[test]
