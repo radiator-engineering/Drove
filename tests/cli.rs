@@ -288,8 +288,16 @@ fn ls_json_reports_one_row_per_profile() {
     assert_eq!(monitoring["reachable"], false);
 }
 
+fn empty_snapshot() -> Value {
+    json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []})
+}
+
 #[test]
 fn no_profile_given_resolves_to_the_declared_default() {
+    // D51 point 4: `lint` now reaches the backend, so a reachable fake
+    // socket is required for it to report `no lint warnings` rather than
+    // `cannot reach herdr` (which would still contain the profile name
+    // nowhere, since the two messages are mutually exclusive).
     let directory = tempfile::tempdir().expect("tempdir");
     let drovefile = directory.path().join("Drovefile");
     fs::write(
@@ -298,13 +306,23 @@ fn no_profile_given_resolves_to_the_declared_default() {
     )
     .expect("Drovefile");
 
+    let socket = directory.path().join("herdr.sock");
+    let server = serve_one_snapshot(socket.clone(), empty_snapshot());
+
     let mut command = Command::cargo_bin("drove").expect("binary");
     command
         .env("DROVE_STATE_HOME", directory.path().join("state"))
-        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "lint"])
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "lint",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("profile `default`"));
+    server.join().expect("fake Herdr server thread");
 }
 
 #[test]
@@ -313,13 +331,23 @@ fn no_profile_given_falls_back_to_the_only_declared_profile() {
     let drovefile = directory.path().join("Drovefile");
     fs::write(&drovefile, "profile(name = \"solo\")").expect("Drovefile");
 
+    let socket = directory.path().join("herdr.sock");
+    let server = serve_one_snapshot(socket.clone(), empty_snapshot());
+
     let mut command = Command::cargo_bin("drove").expect("binary");
     command
         .env("DROVE_STATE_HOME", directory.path().join("state"))
-        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "lint"])
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "lint",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("profile `solo`"));
+    server.join().expect("fake Herdr server thread");
 }
 
 #[test]
@@ -378,12 +406,26 @@ fn positional_and_flag_profile_forms_resolve_the_same_profile() {
     )
     .expect("Drovefile");
 
+    // D51 point 4: `lint` now reaches the backend once per invocation; this
+    // test runs `lint` twice, so the fake socket must answer two
+    // `session.snapshot` requests in a row.
+    let socket = directory.path().join("herdr.sock");
+    let server = serve_scripted(
+        socket.clone(),
+        vec![
+            FakeAnswer::Result(json!({"snapshot": empty_snapshot()})),
+            FakeAnswer::Result(json!({"snapshot": empty_snapshot()})),
+        ],
+    );
+
     let mut positional = Command::cargo_bin("drove").expect("binary");
     positional
         .env("DROVE_STATE_HOME", directory.path().join("state"))
         .args([
             "--file",
             drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
             "lint",
             "other",
         ])
@@ -397,6 +439,8 @@ fn positional_and_flag_profile_forms_resolve_the_same_profile() {
         .args([
             "--file",
             drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
             "--profile",
             "other",
             "lint",
@@ -404,6 +448,7 @@ fn positional_and_flag_profile_forms_resolve_the_same_profile() {
         .assert()
         .success()
         .stdout(predicate::str::contains("profile `other`"));
+    server.join().expect("fake Herdr server thread");
 }
 
 #[test]
