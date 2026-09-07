@@ -30,6 +30,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state instead of aborting on `pane_not_found`, and a `close_pane` failure
   for a resource that's still there no longer stops the teardown either
   (#29).
+- `drove up` against a target that wasn't reachable yet no longer applies a
+  plan built from local state as recorded before the session was started:
+  once `ensure_session` reports it just started the session, `up` re-fetches
+  the now-live snapshot, re-prunes local state, and re-plans before applying
+  anything or reporting `focused`. The report gains `"session_started"` so
+  callers can tell a fresh start from an already-running session.
+- `HerdrClient::snapshot`: a failing `pane.process_info` call for one pane no
+  longer fails the whole snapshot. That pane's `process_info` is left `None`
+  and its id is listed under the new `"process_info_unavailable"` field of
+  `status --json`; only the `session.snapshot` call itself decides
+  reachability.
+- The caller's pane id (`HERDR_PANE_ID`) is only trusted when the live
+  snapshot actually lists it. A stale or leaked value — a closed pane whose
+  id was reused, or the variable escaping into an unrelated shell — no
+  longer makes a pane declaring `adopt = "caller"` silently adopt a phantom
+  pane; it plans as a normal create instead.
+- `drove lint` now fetches the live backend snapshot and prunes recorded
+  state against it, exactly as `plan`/`status` do, before deciding whether a
+  `was =` reference is still live. A recorded resource whose backend id the
+  session no longer has is no longer reported as live just because local
+  state still remembers it. When the backend is unreachable, `lint` says so
+  and treats nothing as live.
+- `LocalState::load`: a state file that exists but fails to deserialize is
+  moved aside to `<path>.json.corrupt-<timestamp>` with a printed warning,
+  and loading continues from empty, instead of failing the command outright.
+  A file missing `schema_version` still loads.
+- A Herdr target name of exactly `default` — from a flag, an env var, or the
+  Drovefile — now resolves the same as leaving it unset, to Herdr's bare
+  default socket, instead of a per-session socket path that could never
+  exist.
+- `stop_failed_because_not_running` now scans a stopped session's output
+  line by line for the first line that parses as the documented
+  `session_stop_failed` error, instead of requiring the whole trimmed output
+  to parse as one JSON value; a leading non-JSON warning line no longer
+  makes `drove down` treat an already-stopped session as a real failure.
 
 ## [0.1.1] - 2026-09-07
 

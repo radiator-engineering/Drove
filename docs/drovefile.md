@@ -25,6 +25,8 @@ A Drovefile may declare both flavor instances; only the active backend's declara
 
 A Drovefile's declaration is a default that an explicit flag, `DROVE_BACKEND`/`DROVE_SESSION`/`DROVE_TARGET`, or a profile's own `session`/`backend` overrides (D46). Ambient host environment (`HERDR_SESSION`, `RADIATOR_HUB`) ranks below the file: Herdr and Radiator export these into every pane they host, so without this ranking a profile's own `session` would be silently overridden by whichever session the calling terminal happens to sit in. It only takes over when the Drovefile leaves the target unset.
 
+For the Herdr backend, a target name of exactly `default` — from any of levels 1 to 5 above, not only the built-in — resolves the same as leaving it unset: Herdr's own unnamed session lives at `~/.config/herdr/herdr.sock`, not `~/.config/herdr/sessions/default/herdr.sock`, so `--session default`, `DROVE_SESSION=default`, `herdr.session("default")`, and an ambient `HERDR_SESSION=default` all resolve to that bare socket (D51 point 6).
+
 ## `profile`
 
 ```python
