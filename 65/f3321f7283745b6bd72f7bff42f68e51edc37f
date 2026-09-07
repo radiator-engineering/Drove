@@ -1,0 +1,49 @@
+src/planner.rs
+  s_9778c84667724c::t_cb77d6ff1010eb 1581-1594,1596-1599
+  s_9778c84667724c::t_c0ac53fb587a0d 1091-1094
+  s_9778c84667724c::t_c7d4fdd00cfcb7 1595
+.claude/settings.json
+  s_9778c84667724c::t_d06a09b462441d 7
+.context/reports/drove-consumer-repair.md
+  s_9778c84667724c::t_dc1901622fc735 132-140
+src/backend/herdr.rs
+  s_9778c84667724c::t_f8913023da13be 601
+  s_9778c84667724c::t_5e734d1a2909a2 32-33,337-345,349,373-382,388-398,411-423
+  s_9778c84667724c::t_cb1277830bcafd 579-590,603,627
+  s_9778c84667724c::t_5e8b30992100b9 1930-2013
+tests/examples.rs
+  s_9778c84667724c::t_5355a789c85713 305-342,348-385,390-391
+  s_9778c84667724c::t_60cae443a4b196 343-347,386-389
+docs/migration.md
+  s_9778c84667724c::t_a28f717f1ac47d 11
+src/executor.rs
+  s_9778c84667724c::t_5edacd29c22bd6 3315-3318
+  s_9778c84667724c::t_74f17e25d3baaa 998
+  s_9778c84667724c::t_be87498e19ec9f 2454,2475-2482,2534,2566
+  s_9778c84667724c::t_caf9655302d1cf 1270,1307,1350-1371
+  s_9778c84667724c::t_ff5a0a1f76473a 3138
+  s_9778c84667724c::t_89c3fe0180af9c 3187-3205,3209-3212,3214,3219-3228,3244-3245,3264,3278,3309-3314,3319-3320
+  s_9778c84667724c::t_3ccf7b7f4f98ec 3185-3186,3213,3215-3218,3229-3243,3246-3263,3265-3277,3279-3308
+  s_9778c84667724c::t_b268550190fc3c 2572-2576
+  s_9778c84667724c::t_70585bf32d18b8 3206-3208
+examples/log-driven/.context/bin/model-command.py
+  s_9778c84667724c::t_f57feb6b1c9e68 15-28,51
+.context/bin/model-command.py
+  s_9778c84667724c::t_4a9f4c0d33d084 15-28,51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "65f3321f7283745b6bd72f7bff42f68e51edc37f",
+  "prompts": {},
+  "sessions": {
+    "s_9778c84667724c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07d31-d833-7512-b6e6-a9d27c603168",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
