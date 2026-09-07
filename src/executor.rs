@@ -2011,6 +2011,13 @@ mod tests {
         fn ensure_session(&self, _name: &str) -> Result<SessionState> {
             Ok(self.session.clone())
         }
+        fn stop_session(&self, name: &str) -> Result<crate::backend::SessionStop> {
+            self.record(format!("stop_session:{name}"));
+            Ok(crate::backend::SessionStop {
+                stopped: true,
+                deleted: true,
+            })
+        }
     }
 
     fn up_profile() -> Profile {

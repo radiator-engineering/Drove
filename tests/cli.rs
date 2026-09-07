@@ -389,3 +389,217 @@ fn invalid_drovefile_fails_before_contacting_herdr() {
         .failure()
         .stderr(predicate::str::contains("duplicate profile"));
 }
+
+/// Writes an executable fake `herdr` at `<directory>/herdr` (Unix only:
+/// `HERDR_BIN_PATH` shells out, and there is no portable stand-in for a
+/// shell script on Windows) that appends its arguments, space-joined, to
+/// `log` before running `body`, so a `down` test can assert both the
+/// recorded argv (D47's "stop, then delete, in that order") and the
+/// simulated exit behavior of `stop_session`'s two shelled-out calls.
+#[cfg(unix)]
+fn write_fake_herdr(directory: &std::path::Path, log: &std::path::Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = directory.join("herdr");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
+    )
+    .expect("write fake herdr script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("make fake herdr script executable");
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn down_stops_then_deletes_the_declared_session_after_hooks_and_detach() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        "herdr.session(\"x\")\nprofile(name = \"default\")",
+    )
+    .expect("Drovefile");
+    let log = directory.path().join("argv.log");
+    let herdr = write_fake_herdr(directory.path(), &log, "exit 0");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "down"])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "nothing owned by profile `default`",
+        ))
+        .stdout(predicate::str::contains("stopped session x"));
+
+    let calls = fs::read_to_string(&log).expect("argv log");
+    let mut lines = calls.lines();
+    assert_eq!(lines.next(), Some("session stop x --json"));
+    assert_eq!(lines.next(), Some("session delete x --json"));
+    assert_eq!(lines.next(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn down_json_reports_the_stopped_session() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        "herdr.session(\"x\")\nprofile(name = \"default\")",
+    )
+    .expect("Drovefile");
+    let log = directory.path().join("argv.log");
+    let herdr = write_fake_herdr(directory.path(), &log, "exit 0");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--json",
+            "down",
+        ])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"session\":{\"deleted\":true,\"name\":\"x\",\"stopped\":true}",
+        ));
+}
+
+#[test]
+fn down_with_no_declared_session_never_touches_herdr() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(&drovefile, "profile(name = \"default\")").expect("Drovefile");
+    let herdr = directory.path().join("no-such-herdr-binary");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "down"])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "nothing owned by profile `default`",
+        ))
+        .stdout(predicate::str::contains("session").not());
+}
+
+#[test]
+fn down_never_touches_the_default_session() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        "herdr.session(\"default\")\nprofile(name = \"default\")",
+    )
+    .expect("Drovefile");
+    let herdr = directory.path().join("no-such-herdr-binary");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "down"])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "nothing owned by profile `default`",
+        ))
+        .stdout(predicate::str::contains("session").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn down_still_deletes_a_session_that_was_already_stopped() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        "herdr.session(\"x\")\nprofile(name = \"default\")",
+    )
+    .expect("Drovefile");
+    let log = directory.path().join("argv.log");
+    let herdr = write_fake_herdr(
+        directory.path(),
+        &log,
+        "if [ \"$2\" = \"stop\" ]; then echo session_stop_failed >&2; exit 1; fi\nexit 0",
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "down"])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted session x"));
+
+    let calls = fs::read_to_string(&log).expect("argv log");
+    let mut lines = calls.lines();
+    assert_eq!(lines.next(), Some("session stop x --json"));
+    assert_eq!(lines.next(), Some("session delete x --json"));
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn down_with_a_missing_herdr_binary_still_reports_the_detach_then_fails() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        "herdr.session(\"x\")\nprofile(name = \"default\")",
+    )
+    .expect("Drovefile");
+    let herdr = directory.path().join("no-such-herdr-binary");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "down"])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "nothing owned by profile `default`",
+        ))
+        .stderr(predicate::str::contains("cannot run the herdr binary"));
+}

@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, SessionState, Split, TabLayout,
+    Backend, Capabilities, HerdrExt, PaneSpec, ProcessInfo, SessionState, SessionStop, Split,
+    TabLayout,
 };
 use crate::model::SplitDirection;
 
@@ -644,6 +645,10 @@ impl HerdrExt for HerdrClient {
             Ok(SessionState::CannotStart { hint })
         }
     }
+
+    fn stop_session(&self, name: &str) -> Result<SessionStop> {
+        run_stop_session(&herdr_bin_path(), name)
+    }
 }
 
 impl HerdrClient {
@@ -684,6 +689,39 @@ fn start_session_server(name: &str) -> Result<()> {
         .spawn()
         .context("cannot start the Herdr session server")?;
     Ok(())
+}
+
+/// Stops then deletes the named session by shelling out to `bin` (D47):
+/// `herdr session stop NAME --json`, then `herdr session delete NAME
+/// --json`. Herdr reports a stop against a session that is not running as a
+/// failed `session.stop` call, so any non-success exit from the stop is read
+/// as "already stopped" rather than an error, and delete always runs.
+/// Spawning either command failing (a missing binary) or the delete exiting
+/// non-zero is an error. Takes `bin` explicitly, rather than reading
+/// `HERDR_BIN_PATH` itself, so tests can point it at a fake script without
+/// mutating process-global environment.
+fn run_stop_session(bin: &OsStr, name: &str) -> Result<SessionStop> {
+    let stop = Command::new(bin)
+        .args(["session", "stop", name, "--json"])
+        .output()
+        .context("cannot run the herdr binary")?;
+    let stopped = stop.status.success();
+
+    let delete = Command::new(bin)
+        .args(["session", "delete", name, "--json"])
+        .output()
+        .context("cannot run the herdr binary")?;
+    if !delete.status.success() {
+        bail!(
+            "herdr session delete {name} failed: {}",
+            String::from_utf8_lossy(&delete.stderr).trim()
+        );
+    }
+
+    Ok(SessionStop {
+        stopped,
+        deleted: true,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -924,7 +962,7 @@ fn connect(path: &Path) -> std::io::Result<Stream> {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
+    use std::{fs, thread};
 
     use interprocess::local_socket::{Listener, ListenerOptions, traits::Listener as _};
 
@@ -1680,6 +1718,107 @@ mod tests {
             HerdrExt::ensure_session(&HerdrClient::new(path), "unused").expect("ensure session");
         assert_eq!(state, SessionState::Running);
         server.join().expect("server thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_stops_then_deletes_in_order() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(&directory, &log, "exit 0");
+
+        let stop = run_stop_session(bin.as_os_str(), "x").expect("stop session");
+        assert_eq!(
+            stop,
+            SessionStop {
+                stopped: true,
+                deleted: true
+            }
+        );
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(lines.next(), Some("session delete x --json"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_still_deletes_a_session_that_was_already_stopped() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(
+            &directory,
+            &log,
+            r#"if [ "$2" = "stop" ]; then echo "session_stop_failed" >&2; exit 1; fi
+exit 0"#,
+        );
+
+        let stop = run_stop_session(bin.as_os_str(), "x").expect("stop session");
+        assert_eq!(
+            stop,
+            SessionStop {
+                stopped: false,
+                deleted: true
+            }
+        );
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(lines.next(), Some("session delete x --json"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn stop_session_with_a_missing_binary_is_an_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bin = directory.path().join("no-such-herdr-binary");
+
+        let error = run_stop_session(bin.as_os_str(), "x").expect_err("missing binary");
+        assert!(error.to_string().contains("cannot run the herdr binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_session_with_a_failed_delete_is_an_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let log = directory.path().join("argv.log");
+        let bin = write_fake_herdr(
+            &directory,
+            &log,
+            r#"if [ "$2" = "delete" ]; then echo "boom" >&2; exit 1; fi
+exit 0"#,
+        );
+
+        let error = run_stop_session(bin.as_os_str(), "x").expect_err("delete failure");
+        assert!(error.to_string().contains("boom"));
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(lines.next(), Some("session stop x --json"));
+        assert_eq!(lines.next(), Some("session delete x --json"));
+        assert_eq!(lines.next(), None);
+    }
+
+    /// Writes an executable shell script at `<directory>/herdr` that appends
+    /// its arguments (space-joined) to `log` before running `body`, so a
+    /// test can assert both the recorded argv and the simulated exit
+    /// behavior of `stop_session`'s two shelled-out calls.
+    #[cfg(unix)]
+    fn write_fake_herdr(directory: &tempfile::TempDir, log: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = directory.path().join("herdr");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
+        )
+        .expect("write fake herdr script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make fake herdr script executable");
+        script
     }
 
     #[test]

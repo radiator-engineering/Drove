@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `drove down` stops and deletes the Herdr session it targets, once the
+  detach is saved, when that session is a named one (not `default`).
+
 ### Fixed
 
 - Herdr backend: the first declared tab of a workspace Drove creates now
