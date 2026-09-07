@@ -1,0 +1,41 @@
+docs/drovefile.md
+  s_e5ce3cc70cf76d::t_0541a5315f3725 207
+src/cli.rs
+  s_e5ce3cc70cf76d::t_9c7844afa1b145 779-784
+  s_e5ce3cc70cf76d::t_c9c774cb63caf5 929
+  s_e5ce3cc70cf76d::t_8dbb04d770d8ed 959,971-972
+  s_e5ce3cc70cf76d::t_38ccbc3c9e96c3 973
+tests/cli.rs
+  s_e5ce3cc70cf76d::t_875a2245e729a0 1331-1373,1377-1395
+  s_e5ce3cc70cf76d::t_9c7844afa1b145 1374-1376
+  s_e5ce3cc70cf76d::t_4d313977c66ebb 913-963
+src/executor.rs
+  s_e5ce3cc70cf76d::t_1030d11c4d2831 865,871
+  s_e5ce3cc70cf76d::t_86e56c7294013a 890-891
+  s_e5ce3cc70cf76d::t_4cefbb758f5150 2917-2962
+  s_e5ce3cc70cf76d::t_01c8da264ec96a 60-62
+  s_e5ce3cc70cf76d::t_f58507820f84bf 314-315,322
+  s_e5ce3cc70cf76d::t_2e81629a282463 1793,1849-1851,1856-1861,1863-1888,2916
+  s_e5ce3cc70cf76d::t_3934f1299a93de 284,287-294,297-299
+  s_e5ce3cc70cf76d::t_c47eaa0309f744 1862
+  s_e5ce3cc70cf76d::t_f7189e8b8c46ec 308-313,330-331,339-348,351-353,356
+  s_e5ce3cc70cf76d::t_6761b6c22e13a3 1794-1818
+CHANGELOG.md
+  s_e5ce3cc70cf76d::t_4a5a3a8f48913c 19-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "69663a7ebfb679bc0d62c2b8489ec03856b37733",
+  "prompts": {},
+  "sessions": {
+    "s_e5ce3cc70cf76d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "80b69257-0fbb-4a0b-8cbf-71cff4b8eba1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
