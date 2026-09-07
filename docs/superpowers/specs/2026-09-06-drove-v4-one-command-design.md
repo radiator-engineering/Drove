@@ -93,3 +93,19 @@ README quick start becomes: write a Drovefile, run `drove`.
   (accessor default only), `src/executor.rs`, `src/cli.rs` (the `up` path
   only). Runs in parallel with PR 16; second to merge rebases.
 - **PR 18 `pr18-dogfood`** — D45 and docs. Sonnet. After both.
+
+## 5. Amendment: ambient host env ranks below the profile (D46)
+
+Herdr exports `HERDR_SESSION` (and Radiator `RADIATOR_HUB`) into every pane
+it hosts. Under D41 that ambient value outranked the profile's declared
+session, so `drove monitoring` run from inside session `drove` targeted
+`drove`, not `drove-mon`. Ambient host variables say where you are, not
+where you want to go.
+
+**D46.** Precedence becomes: flag > explicit env (`DROVE_BACKEND`,
+`DROVE_SESSION` mirroring `--session`, `DROVE_TARGET` mirroring `--target`)
+> profile > file > ambient host env (`HERDR_SESSION`, `RADIATOR_HUB`, the
+ambient Radiator detection) > built-in. The precedence-table test gains
+the ambient layer for both backends; a test shows a profile with
+`session = "drove-mon"` resolving to `drove-mon` while `HERDR_SESSION=drove`
+is set, and `DROVE_SESSION=x` still winning over the profile.
