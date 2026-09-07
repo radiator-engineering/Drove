@@ -1936,3 +1936,201 @@ fn status_json_lists_a_pane_whose_process_info_call_failed() {
         "status --json must list the pane whose process_info call failed: {report}"
     );
 }
+
+// D53 point 1: a pane's `cwd` can't change in place, so an edit to it plans
+// as a destructive close-and-split, and `up` must refuse to apply it without
+// `--yes`.
+
+fn drovefile_with_pane_cwd(cwd: &str) -> String {
+    format!(
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "review", cwd = "{cwd}"),
+        ])]),
+    ],
+)
+"#
+    )
+}
+
+/// Runs `drove render --json` against `drovefile` (no backend needed) and
+/// returns the `review` pane resource's recorded digest, for a state file
+/// that must parse as this feature's composite-digest shape to exercise its
+/// category classification rather than the pre-D53 legacy fallback.
+fn render_review_pane_digest(drovefile: &Path) -> String {
+    let output = Command::cargo_bin("drove")
+        .expect("binary")
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--json",
+            "render",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ir: Value = serde_json::from_slice(&output).expect("valid IR JSON");
+    ir["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .find(|resource| resource["kind"] == "pane" && resource["name"] == "review")
+        .expect("review pane resource")["digest"]
+        .as_str()
+        .expect("digest string")
+        .to_owned()
+}
+
+fn write_state_with_review_pane(state_home: &Path, repo_root: &Path, pane_digest: &str) {
+    let state_path = state_file_path(state_home, repo_root);
+    fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
+    let state = json!({
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "profiles": {
+            "default": {
+                "desired_digest": "",
+                "resources": {
+                    "dev": {
+                        "kind": "workspace",
+                        "backend_id": "w1",
+                        "parent": null,
+                        "digest": "stale-digest",
+                        "adopted": null,
+                        "last_outcome": null,
+                    },
+                    "dev/main": {
+                        "kind": "placement",
+                        "backend_id": "w1:t1",
+                        "parent": "dev",
+                        "digest": "stale-digest",
+                        "adopted": null,
+                        "last_outcome": null,
+                    },
+                    "review": {
+                        "kind": "pane",
+                        "backend_id": "w1:p1",
+                        "parent": "dev/main",
+                        "digest": pane_digest,
+                        "adopted": null,
+                        "last_outcome": null,
+                    },
+                },
+            }
+        },
+        "approvals": [],
+        "journal": [],
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state file");
+}
+
+/// Answers whatever sequence of requests one `drove plan`/`status`/`up` run
+/// against this fixed one-workspace, one-tab, one-pane layout makes —
+/// `ping`, `session.snapshot`, `pane.process_info`, and, for `up`'s destructive
+/// close-and-split, `layout.export` + `pane.split` + `pane.rename`. Spawned
+/// detached (not joined): the exact number of requests a run makes is an
+/// implementation detail this test does not want to pin down, and the
+/// unapproved `ClosePane` half of the pair is never even sent.
+fn serve_cwd_edit_layout(path: PathBuf) {
+    let listener = bind_fake_herdr(&path).expect("bind fake Herdr socket");
+    thread::spawn(move || {
+        loop {
+            let stream = match listener.accept() {
+                Ok(stream) => stream,
+                Err(_) => return,
+            };
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            if stream.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let result = match request["method"].as_str().unwrap_or_default() {
+                "ping" => json!({}),
+                "session.snapshot" => json!({"snapshot": {
+                    "version": "0.8.2",
+                    "protocol": 1,
+                    "workspaces": [{"workspace_id": "w1", "label": "dev", "tokens": {}}],
+                    "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "main"}],
+                    "panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}],
+                    "agents": [],
+                }}),
+                "pane.process_info" => json!({"process_info": {"foreground_processes": []}}),
+                "layout.export" => json!({"layout": {
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "root": {"type": "pane", "pane_id": "w1:p1"},
+                }}),
+                "pane.split" => json!({"pane": {"pane_id": "w1:p9"}}),
+                "pane.rename" => json!({}),
+                _ => json!({}),
+            };
+            let response = json!({"id": request["id"], "result": result});
+            let _ = serde_json::to_writer(stream.get_mut(), &response);
+            let _ = stream.get_mut().write_all(b"\n");
+        }
+    });
+}
+
+#[test]
+fn e2e_up_after_a_cwd_edit_shows_destructive_and_refuses_without_approval() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(&drovefile, drovefile_with_pane_cwd("a")).expect("Drovefile");
+    let old_digest = render_review_pane_digest(&drovefile);
+
+    let state_home = directory.path().join("state");
+    write_state_with_review_pane(&state_home, directory.path(), &old_digest);
+
+    // The declared cwd changed since the recorded digest: `a` -> `b`.
+    fs::write(&drovefile, drovefile_with_pane_cwd("b")).expect("Drovefile edit");
+
+    let plan_socket = directory.path().join("herdr-plan.sock");
+    serve_cwd_edit_layout(plan_socket.clone());
+    Command::cargo_bin("drove")
+        .expect("binary")
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            plan_socket.to_str().expect("UTF-8 socket"),
+            "plan",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("[destructive]"))
+        .stdout(predicate::str::contains(
+            "cwd changed; a pane cannot change directory in place",
+        ));
+
+    let up_socket = directory.path().join("herdr-up.sock");
+    serve_cwd_edit_layout(up_socket.clone());
+    Command::cargo_bin("drove")
+        .expect("binary")
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            up_socket.to_str().expect("UTF-8 socket"),
+            "up",
+            "--no-focus",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "warning: a destructive action needs approval; re-run with --yes to apply it",
+        ));
+}

@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    backend::ProcessInfo,
     ir::{Ir, PlacementGroup, Resource},
     model::{Pane, Profile, Workspace},
 };
@@ -62,6 +63,15 @@ pub struct Observed {
     /// detect a topology change (a pane moved to a different group).
     pub parent: Option<String>,
     pub owner: Option<Owner>,
+    /// What the backend currently reports running in this pane (D51 point
+    /// 2, D54), when a caller actually asked one. The outer `Option` is
+    /// whether live data was fetched at all — `None` (the default) means
+    /// this `Snapshot` was built from local state alone (D16) with no
+    /// backend consulted, so drift can't be judged either way and D54 stays
+    /// silent. Once fetched, the inner `Option` is the backend's own answer:
+    /// `Some(info)` for a running command, `None` for an idle shell or a
+    /// pane the backend lost.
+    pub process_info: Option<Option<ProcessInfo>>,
 }
 
 /// The ownership tokens `drove_name` (the map key), `drove_profile` and
@@ -97,6 +107,7 @@ impl Snapshot {
                     profile: profile.to_owned(),
                     digest: digest.to_owned(),
                 }),
+                process_info: None,
             },
         );
         self
@@ -116,8 +127,34 @@ impl Snapshot {
                 backend_id: backend_id.to_owned(),
                 parent: parent.map(str::to_owned),
                 owner: None,
+                process_info: None,
             },
         );
+        self
+    }
+
+    /// Attaches what the backend reports running in an already-inserted
+    /// pane (D54). A no-op when `identity` isn't in the snapshot yet, so
+    /// callers can merge live process info in without caring about
+    /// insertion order.
+    pub fn with_process_info(mut self, identity: &str, process_info: Option<ProcessInfo>) -> Self {
+        if let Some(observed) = self.resources.get_mut(identity) {
+            observed.process_info = Some(process_info);
+        }
+        self
+    }
+
+    /// Merges every pane's live `process_info` from a Herdr snapshot in by
+    /// matching backend ids (D54) — the smallest way to get drift detection
+    /// the declared-fallback `to_snapshot` (D16) has no live backend to ask.
+    pub fn merge_process_info(mut self, live: &crate::backend::herdr::SessionSnapshot) -> Self {
+        for observed in self.resources.values_mut() {
+            if observed.kind == "pane"
+                && let Some(pane) = live.pane(&observed.backend_id)
+            {
+                observed.process_info = Some(pane.process_info.clone());
+            }
+        }
         self
     }
 }
@@ -248,6 +285,25 @@ fn effective_owner<'a>(observed: &'a Observed, profile: &str) -> Option<&'a Owne
         .owner
         .as_ref()
         .filter(|owner| owner.profile == profile)
+}
+
+/// Compares two composite digests (D53: [`crate::ir`]'s `composite_digest`)
+/// category by category, returning the categories whose value differs.
+/// `None` when either side isn't that JSON-object shape — a plain digest
+/// recorded before this feature, or a hand-built one in a test — so callers
+/// can fall back to the pre-D53 whole-digest behavior for that one
+/// transition apply.
+fn diff_categories(old: &str, new: &str) -> Option<BTreeSet<String>> {
+    let old = serde_json::from_str::<Value>(old).ok()?;
+    let new = serde_json::from_str::<Value>(new).ok()?;
+    let old = old.as_object()?;
+    let new = new.as_object()?;
+    Some(
+        new.keys()
+            .filter(|key| old.get(key.as_str()) != new.get(key.as_str()))
+            .cloned()
+            .collect(),
+    )
 }
 
 pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
@@ -434,18 +490,60 @@ fn plan_workspace(
             if let Some(owner) = effective_owner(observed, &profile.name)
                 && owner.digest != resource.digest
             {
-                ranked.push((
-                    RANK_WORKSPACE,
-                    PHASE_RENAME,
-                    id.clone(),
-                    PlannedAction {
-                        kind: Action::Core(CoreAction::RenameWorkspace),
-                        address: id,
-                        backend_id: Some(observed.backend_id.clone()),
-                        destructive: false,
-                        reason: "workspace label, cwd, or env changed".into(),
-                    },
-                ));
+                let changed = diff_categories(&owner.digest, &resource.digest);
+                // D53 point 2: only the workspace's own `label`/`cwd`/`env`
+                // warrant a `RenameWorkspace` here — a pane-only change
+                // (the `children` category alone) is already planned by
+                // that pane's own rule and would otherwise fight it with a
+                // spurious rename every run. Unclassifiable (legacy) digests
+                // keep the old always-rename behavior, conservatively.
+                let own_field_changed = changed
+                    .as_ref()
+                    .map(|changed| changed.iter().any(|key| key != "children"))
+                    .unwrap_or(true);
+                if own_field_changed {
+                    ranked.push((
+                        RANK_WORKSPACE,
+                        PHASE_RENAME,
+                        id.clone(),
+                        PlannedAction {
+                            kind: Action::Core(CoreAction::RenameWorkspace),
+                            address: id.clone(),
+                            backend_id: Some(observed.backend_id.clone()),
+                            destructive: false,
+                            reason: "workspace label, cwd, or env changed".into(),
+                        },
+                    ));
+                }
+                // D53 point 2: `cwd`/`env` changing cascades the pane rule
+                // (point 1) to every pane that inherits it — a pane with no
+                // `cwd` of its own. Only fires when the category breakdown
+                // says so; a legacy digest cascades nothing (it already
+                // renamed, conservatively, above) rather than guessing.
+                let place_changed = changed
+                    .as_ref()
+                    .is_some_and(|changed| changed.contains("cwd") || changed.contains("env"));
+                if place_changed && let Some(workspace) = workspace_by_name(profile, &id) {
+                    for pane in workspace.tabs.iter().flat_map(|group| &group.panes) {
+                        if pane.cwd.is_some() {
+                            continue; // has its own cwd; does not inherit
+                        }
+                        let Some(pane_observed) = snapshot.resources.get(&pane.name) else {
+                            continue; // not created yet; the create picks up the new cwd
+                        };
+                        if effective_owner(pane_observed, &profile.name).is_none() {
+                            continue;
+                        }
+                        push_close_and_split(
+                            &pane.name,
+                            pane_observed.backend_id.clone(),
+                            format!(
+                                "workspace `{id}` cwd changed; a pane cannot change directory in place"
+                            ),
+                            ranked,
+                        );
+                    }
+                }
             }
         }
     }
@@ -487,30 +585,57 @@ fn plan_group(
         && owner.digest != group.topology_digest
     {
         let backend_id = Some(observed.backend_id.clone());
-        ranked.push((
-            RANK_TAB,
-            PHASE_RENAME,
-            id.clone(),
-            PlannedAction {
-                kind: Action::Herdr(HerdrAction::RenameTab),
-                address: id.clone(),
-                backend_id: backend_id.clone(),
-                destructive: false,
-                reason: "placement group label changed".into(),
-            },
-        ));
-        ranked.push((
-            RANK_TAB,
-            PHASE_UPDATE,
-            id.clone(),
-            PlannedAction {
-                kind: Action::Herdr(HerdrAction::SetRatio),
-                address: id,
-                backend_id,
-                destructive: false,
-                reason: "placement group ratios changed".into(),
-            },
-        ));
+        let changed = diff_categories(&owner.digest, &group.topology_digest);
+        // D53 point 4: reordering panes or flipping a group's split direction
+        // (the same set of panes) has no backend verb — `SetRatio` would
+        // silently apply the new ratio list to the old physical order. A
+        // pane added or removed keeps the legacy `RenameTab` + `SetRatio`
+        // pair (right per the audit); so does a digest with no category
+        // breakdown yet (recorded before this feature).
+        let reordered = changed.as_ref().is_some_and(|changed| {
+            changed.contains("order_split") && !changed.contains("pane_set")
+        });
+        if reordered {
+            ranked.push((
+                RANK_TAB,
+                PHASE_CONFLICT,
+                id.clone(),
+                PlannedAction {
+                    kind: Action::Core(CoreAction::Conflict),
+                    address: id,
+                    backend_id,
+                    destructive: false,
+                    reason:
+                        "cannot reorder panes or change the split in place; remove the group and re-add it"
+                            .into(),
+                },
+            ));
+        } else {
+            ranked.push((
+                RANK_TAB,
+                PHASE_RENAME,
+                id.clone(),
+                PlannedAction {
+                    kind: Action::Herdr(HerdrAction::RenameTab),
+                    address: id.clone(),
+                    backend_id: backend_id.clone(),
+                    destructive: false,
+                    reason: "placement group label changed".into(),
+                },
+            ));
+            ranked.push((
+                RANK_TAB,
+                PHASE_UPDATE,
+                id.clone(),
+                PlannedAction {
+                    kind: Action::Herdr(HerdrAction::SetRatio),
+                    address: id,
+                    backend_id,
+                    destructive: false,
+                    reason: "placement group ratios changed".into(),
+                },
+            ));
+        }
     }
 
     false
@@ -559,8 +684,10 @@ fn plan_pane(
             }
             (Some(_), Some(owner)) => {
                 adopted.insert(resource.name.clone(), true);
-                if owner.digest != resource.digest {
-                    push_pane_content_change(&id, observed, serves, ranked);
+                if owner.digest != resource.digest
+                    && let Some(observed) = observed
+                {
+                    push_pane_content_change(&id, observed, owner, resource, ranked);
                 }
             }
             (None, _) => {
@@ -660,7 +787,13 @@ fn plan_normal_pane(
     };
 
     if owner.digest == resource.digest && observed.parent.as_deref() == resource.parent.as_deref() {
-        return; // converged
+        // Converged by digest: still worth a look at what's actually
+        // running, for a serve pane (D54) — a digest only ever compares two
+        // declared states, so it's blind to a change made by hand.
+        if serves {
+            check_drift(id, resource, observed, ranked);
+        }
+        return;
     }
 
     if observed.parent.as_deref() != resource.parent.as_deref() {
@@ -690,44 +823,252 @@ fn plan_normal_pane(
             },
         ));
     } else {
-        push_pane_content_change(id, Some(observed), serves, ranked);
+        push_pane_content_change(id, observed, owner, resource, ranked);
     }
 }
 
-fn push_pane_content_change(
+fn push_rename_pane(
     id: &str,
-    observed: Option<&Observed>,
-    serves: bool,
+    backend_id: Option<String>,
+    reason: String,
     ranked: &mut Vec<RankedAction>,
 ) {
-    let backend_id = observed.map(|observed| observed.backend_id.clone());
-    if serves {
-        ranked.push((
-            RANK_PANE,
-            PHASE_UPDATE,
-            id.to_owned(),
-            PlannedAction {
-                kind: Action::Core(CoreAction::RestartCommand),
-                address: id.to_owned(),
+    ranked.push((
+        RANK_PANE,
+        PHASE_RENAME,
+        id.to_owned(),
+        PlannedAction {
+            kind: Action::Core(CoreAction::RenamePane),
+            address: id.to_owned(),
+            backend_id,
+            destructive: false,
+            reason,
+        },
+    ));
+}
+
+fn push_restart_command(
+    id: &str,
+    backend_id: Option<String>,
+    reason: String,
+    ranked: &mut Vec<RankedAction>,
+) {
+    ranked.push((
+        RANK_PANE,
+        PHASE_UPDATE,
+        id.to_owned(),
+        PlannedAction {
+            kind: Action::Core(CoreAction::RestartCommand),
+            address: id.to_owned(),
+            backend_id,
+            destructive: false,
+            reason,
+        },
+    ));
+}
+
+/// A pane can't change its own working directory or environment in place
+/// (D53 point 1: no Herdr verb re-`cd`s a live shell), so this closes and
+/// re-splits it with the new declaration — the same destructive pattern as
+/// a placement-group move, gated the same way (D22).
+fn push_close_and_split(
+    id: &str,
+    backend_id: String,
+    reason: String,
+    ranked: &mut Vec<RankedAction>,
+) {
+    ranked.push((
+        RANK_PANE,
+        PHASE_CLOSE,
+        id.to_owned(),
+        PlannedAction {
+            kind: Action::Core(CoreAction::ClosePane),
+            address: id.to_owned(),
+            backend_id: Some(backend_id),
+            destructive: true,
+            reason: reason.clone(),
+        },
+    ));
+    ranked.push((
+        RANK_PANE,
+        PHASE_CREATE,
+        id.to_owned(),
+        PlannedAction {
+            kind: Action::Herdr(HerdrAction::SplitPane),
+            address: id.to_owned(),
+            backend_id: None,
+            destructive: false,
+            reason,
+        },
+    ));
+}
+
+/// Routes a pane content change to a verb (D53), now that the composite
+/// digest (D53, [`crate::ir`]) can say *which* category changed instead of
+/// just *that* something did:
+///
+/// - `cwd`/`env`: destructive recreate (point 1) — Herdr's `run_command`
+///   composite (`pane.send_text` + `pane.send_keys`; there is no native verb
+///   that takes a working directory, checked against `herdr api schema
+///   --json` for Herdr 0.8.2) can't `cd` an existing shell, so the
+///   `serve`-pane exception in point 1 never applies today.
+/// - `serve`: restart in place (unchanged from before D53).
+/// - `label` and/or `on_start` alone: `RenamePane`. `on_start` has no verb
+///   of its own (point 3, "no backend action") — it still rides `RenamePane`
+///   so the plan updates the recorded digest and doesn't repeat the message
+///   forever; that call is a same-label no-op on the backend when `label`
+///   itself didn't change.
+/// - anything else (`ready`, `after`, `adopt`, `on_stop`): `Conflict` (point
+///   5) — the planner has no verb to map it to.
+/// - no category breakdown recorded yet (a digest from before this
+///   feature): the pre-D53 fallback, for one transition apply.
+fn push_pane_content_change(
+    id: &str,
+    observed: &Observed,
+    owner: &Owner,
+    resource: &Resource,
+    ranked: &mut Vec<RankedAction>,
+) {
+    let backend_id = Some(observed.backend_id.clone());
+    let Some(changed) = diff_categories(&owner.digest, &resource.digest) else {
+        if pane_serves(resource) {
+            push_restart_command(
+                id,
                 backend_id,
-                destructive: false,
-                reason: "serve command changed; restarting in place".into(),
-            },
-        ));
-    } else {
-        ranked.push((
-            RANK_PANE,
-            PHASE_RENAME,
-            id.to_owned(),
-            PlannedAction {
-                kind: Action::Core(CoreAction::RenamePane),
-                address: id.to_owned(),
+                "serve command changed; restarting in place".into(),
+                ranked,
+            );
+        } else {
+            push_rename_pane(
+                id,
                 backend_id,
-                destructive: false,
-                reason: "pane label or configuration changed".into(),
-            },
-        ));
+                "pane label or configuration changed".into(),
+                ranked,
+            );
+        }
+        return;
+    };
+
+    if changed.contains("cwd") || changed.contains("env") {
+        let field = match (changed.contains("cwd"), changed.contains("env")) {
+            (true, true) => "cwd and env",
+            (true, false) => "cwd",
+            _ => "env",
+        };
+        push_close_and_split(
+            id,
+            observed.backend_id.clone(),
+            format!("{field} changed; a pane cannot change directory in place"),
+            ranked,
+        );
+        return;
     }
+
+    if changed.contains("serve") {
+        push_restart_command(
+            id,
+            backend_id,
+            "serve command changed; restarting in place".into(),
+            ranked,
+        );
+        return;
+    }
+
+    let only_label_or_on_start = !changed.is_empty()
+        && changed
+            .iter()
+            .all(|key| key == "label" || key == "on_start");
+    if only_label_or_on_start {
+        let reason = if changed.contains("on_start") {
+            format!("on_start changed for `{id}`; runs on next create")
+        } else {
+            "pane label or configuration changed".into()
+        };
+        push_rename_pane(id, backend_id, reason, ranked);
+        return;
+    }
+
+    ranked.push((
+        RANK_PANE,
+        PHASE_CONFLICT,
+        id.to_owned(),
+        PlannedAction {
+            kind: Action::Core(CoreAction::Conflict),
+            address: id.to_owned(),
+            backend_id,
+            destructive: false,
+            reason: format!(
+                "unsupported change: {}",
+                changed.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        },
+    ));
+}
+
+/// D54: for a pane declaring `serve`, compares what the backend reports
+/// running (`process_info`, merged in by [`Snapshot::merge_process_info`])
+/// against the declared argv, independent of the recorded digest — a user
+/// running a different command by hand, or a crashed process replaced by an
+/// idle shell, never shows up in a digest that only ever compares declared
+/// states to each other.
+fn check_drift(id: &str, resource: &Resource, observed: &Observed, ranked: &mut Vec<RankedAction>) {
+    // No live data was fetched for this plan (a `Snapshot` built from local
+    // state alone, D16) — nothing to compare against, so stay silent rather
+    // than treat "unknown" as "nothing running".
+    let Some(live) = &observed.process_info else {
+        return;
+    };
+    let declared = declared_serve_argv(resource);
+    if declared.is_empty() {
+        return;
+    }
+    let matches = live
+        .as_ref()
+        .is_some_and(|info| normalize_argv(&info.command) == normalize_argv(&declared));
+    if matches {
+        return;
+    }
+    let reason = match live {
+        Some(info) => format!("drifted: running {}", info.command.join(" ")),
+        None => "drifted: nothing running".to_owned(),
+    };
+    push_restart_command(id, Some(observed.backend_id.clone()), reason, ranked);
+}
+
+fn declared_serve_argv(resource: &Resource) -> Vec<String> {
+    resource
+        .fields
+        .get("serve")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(Value::as_array)
+        .map(|argv| {
+            argv.iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const SHELL_WRAPPERS: [&str; 3] = ["sh", "bash", "zsh"];
+
+/// D54 point 1: trims trailing whitespace and, when the whole argv is a
+/// `sh -c "<command>"`-shaped wrapper, unwraps it to the words of the
+/// wrapped command before comparing.
+fn normalize_argv(argv: &[String]) -> Vec<String> {
+    let trimmed: Vec<String> = argv.iter().map(|arg| arg.trim().to_owned()).collect();
+    if let [program, flag, command] = trimmed.as_slice()
+        && flag == "-c"
+    {
+        let program_name = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program.as_str());
+        if SHELL_WRAPPERS.contains(&program_name) {
+            return command.split_whitespace().map(str::to_owned).collect();
+        }
+    }
+    trimmed
 }
 
 fn plan_agent(
@@ -1511,5 +1852,429 @@ mod tests {
         );
         let plan = build_plan(&profile, &snapshot).expect("plan");
         assert_eq!(plan.render(), "in sync: profile `default`\n");
+    }
+
+    // --- D53: the planner never reports success for an edit it cannot apply ---
+
+    fn pane_profile(pane: serde_json::Value) -> Profile {
+        profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [pane]}]
+            }]
+        }))
+    }
+
+    /// A converged snapshot recorded from `old`, so a plan against `new`
+    /// (built from an otherwise-identical profile) exercises the real
+    /// composite-digest category comparison rather than the pre-D53
+    /// fallback a synthetic `"stale-digest"` string takes.
+    fn converged_from(old: &Profile) -> Snapshot {
+        let ir = old.to_ir();
+        converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            pane_digest(&ir, "review"),
+        )
+    }
+
+    #[test]
+    fn cwd_change_recreates_a_non_serve_pane_destructively() {
+        let old = pane_profile(json!({"name": "review", "cwd": "a"}));
+        let new = pane_profile(json!({"name": "review", "cwd": "b"}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::ClosePane),
+                Action::Herdr(HerdrAction::SplitPane)
+            ]
+        );
+        assert!(plan.actions[0].destructive);
+        assert_eq!(
+            plan.actions[0].reason,
+            "cwd changed; a pane cannot change directory in place"
+        );
+    }
+
+    #[test]
+    fn env_change_recreates_a_pane_destructively() {
+        let old = pane_profile(json!({"name": "review", "env": {"K": "1"}}));
+        let new = pane_profile(json!({"name": "review", "env": {"K": "2"}}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::ClosePane),
+                Action::Herdr(HerdrAction::SplitPane)
+            ]
+        );
+        assert_eq!(
+            plan.actions[0].reason,
+            "env changed; a pane cannot change directory in place"
+        );
+    }
+
+    /// D53 point 1's exception (a `serve` pane whose `cwd` change can go
+    /// through `RestartCommand` instead) never applies: Drove's
+    /// `run_command` types text into an existing shell (`pane.send_text` +
+    /// `pane.send_keys`), it does not take a `cwd`, and Herdr 0.8.2's own
+    /// `pane.split`/`pane.send_*` verbs have no working-directory parameter
+    /// either (`herdr api schema --json`). A `serve` pane's `cwd` change
+    /// still recreates the pane.
+    #[test]
+    fn cwd_change_on_a_serve_pane_still_recreates_destructively() {
+        let old = pane_profile(json!({"name": "review", "cwd": "a", "serve": [["bash"]]}));
+        let new = pane_profile(json!({"name": "review", "cwd": "b", "serve": [["bash"]]}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::ClosePane),
+                Action::Herdr(HerdrAction::SplitPane)
+            ]
+        );
+    }
+
+    #[test]
+    fn on_start_change_alone_has_no_backend_action_but_records_the_new_digest() {
+        let old = pane_profile(json!({"name": "review", "on_start": ["echo", "old"]}));
+        let new = pane_profile(json!({"name": "review", "on_start": ["echo", "new"]}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
+        assert_eq!(
+            plan.actions[0].reason,
+            "on_start changed for `review`; runs on next create"
+        );
+    }
+
+    #[test]
+    fn unmapped_pane_change_is_a_conflict() {
+        let old = pane_profile(json!({"name": "review", "on_stop": ["echo", "old"]}));
+        let new = pane_profile(json!({"name": "review", "on_stop": ["echo", "new"]}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::Conflict)]);
+        assert_eq!(plan.actions[0].reason, "unsupported change: other");
+    }
+
+    #[test]
+    fn workspace_cwd_change_renames_and_cascades_to_an_inheriting_pane() {
+        let old = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "a",
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let new = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "b",
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let old_ir = old.to_ir();
+        let snapshot = Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(&old_ir, "workspace", "dev"),
+            )
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                group_digest(&old_ir, "dev/main"),
+            )
+            .owned(
+                "pane",
+                "review",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "review"),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::RenameWorkspace) && a.address == "dev")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::ClosePane)
+                    && a.address == "review"
+                    && a.destructive
+                    && a.reason
+                        == "workspace `dev` cwd changed; a pane cannot change directory in place")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Herdr(HerdrAction::SplitPane) && a.address == "review")
+        );
+    }
+
+    #[test]
+    fn workspace_is_not_renamed_when_only_a_pane_changed() {
+        let old = pane_profile(json!({"name": "review", "serve": [["bash"]]}));
+        let new = pane_profile(json!({"name": "review", "serve": [["bash", "-x"]]}));
+        let snapshot = converged_from(&old);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::RenameWorkspace)),
+            "a pane-only change must not also rename the workspace: {plan:?}"
+        );
+    }
+
+    fn two_pane_group(first: &str, second: &str) -> Profile {
+        profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "ratios": [0.5],
+                    "panes": [{"name": first}, {"name": second}]
+                }]
+            }]
+        }))
+    }
+
+    #[test]
+    fn reordering_panes_in_a_tab_is_a_conflict_not_a_silent_ratio_change() {
+        let old = two_pane_group("a", "b");
+        let new = two_pane_group("b", "a");
+        let old_ir = old.to_ir();
+        let snapshot = converged_shell(&old_ir)
+            .owned(
+                "pane",
+                "a",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "a"),
+            )
+            .owned(
+                "pane",
+                "b",
+                "w1:p2",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "b"),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::Conflict)]);
+        assert_eq!(
+            plan.actions[0].reason,
+            "cannot reorder panes or change the split in place; remove the group and re-add it"
+        );
+    }
+
+    #[test]
+    fn changing_split_direction_with_the_same_panes_is_a_conflict() {
+        let old = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "split": "right",
+                    "panes": [{"name": "a"}, {"name": "b"}]
+                }]
+            }]
+        }));
+        let new = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "split": "down",
+                    "panes": [{"name": "a"}, {"name": "b"}]
+                }]
+            }]
+        }));
+        let old_ir = old.to_ir();
+        let snapshot = converged_shell(&old_ir)
+            .owned(
+                "pane",
+                "a",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "a"),
+            )
+            .owned(
+                "pane",
+                "b",
+                "w1:p2",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "b"),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::Conflict)]);
+    }
+
+    #[test]
+    fn ratio_only_change_still_renames_tab_and_sets_ratio() {
+        let old = two_pane_group("a", "b");
+        let mut new = old.clone();
+        new.workspaces[0].tabs[0].ratios = vec![0.75];
+        let old_ir = old.to_ir();
+        let snapshot = converged_shell(&old_ir)
+            .owned(
+                "pane",
+                "a",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "a"),
+            )
+            .owned(
+                "pane",
+                "b",
+                "w1:p2",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "b"),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Herdr(HerdrAction::RenameTab),
+                Action::Herdr(HerdrAction::SetRatio)
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_a_pane_still_uses_rename_tab_and_set_ratio() {
+        let old = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "a"}]}]
+            }]
+        }));
+        let new = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "ratios": [0.5], "panes": [{"name": "a"}, {"name": "b"}]}]
+            }]
+        }));
+        let old_ir = old.to_ir();
+        let snapshot = Snapshot::default().owned(
+            "placement",
+            "dev/main",
+            "w1:t1",
+            Some("dev"),
+            "default",
+            group_digest(&old_ir, "dev/main"),
+        );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Herdr(HerdrAction::RenameTab))
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::Conflict))
+        );
+    }
+
+    // --- D54: process drift ---
+
+    fn serving_pane_snapshot(argv: &[&str]) -> (Profile, Ir, Snapshot) {
+        let profile = pane_profile(json!({"name": "review", "serve": [argv]}));
+        let ir = profile.to_ir();
+        let snapshot = converged_shell(&ir).owned(
+            "pane",
+            "review",
+            "w1:p1",
+            Some("dev/main"),
+            "default",
+            pane_digest(&ir, "review"),
+        );
+        (profile, ir, snapshot)
+    }
+
+    #[test]
+    fn drift_restarts_a_pane_running_a_different_command() {
+        let (profile, _, snapshot) = serving_pane_snapshot(&["bash"]);
+        let snapshot = snapshot.with_process_info(
+            "review",
+            Some(crate::backend::ProcessInfo {
+                command: vec!["vim".into()],
+                pid: Some(1),
+            }),
+        );
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RestartCommand)]);
+        assert_eq!(plan.actions[0].reason, "drifted: running vim");
+    }
+
+    #[test]
+    fn drift_restarts_a_pane_running_nothing() {
+        let (profile, _, snapshot) = serving_pane_snapshot(&["bash"]);
+        let snapshot = snapshot.with_process_info("review", None);
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert_eq!(kinds(&plan), [Action::Core(CoreAction::RestartCommand)]);
+        assert_eq!(plan.actions[0].reason, "drifted: nothing running");
+    }
+
+    #[test]
+    fn no_drift_when_the_running_command_matches() {
+        let (profile, _, snapshot) = serving_pane_snapshot(&["bash"]);
+        let snapshot = snapshot.with_process_info(
+            "review",
+            Some(crate::backend::ProcessInfo {
+                command: vec!["bash".into()],
+                pid: Some(1),
+            }),
+        );
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(
+            plan.actions.is_empty(),
+            "matching command must not drift: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn no_drift_without_live_process_info() {
+        // No `with_process_info`/`merge_process_info` call at all: a
+        // declared-fallback `Snapshot` (D16) with no backend consulted.
+        let (profile, _, snapshot) = serving_pane_snapshot(&["bash"]);
+        let plan = build_plan(&profile, &snapshot).expect("plan");
+        assert!(
+            plan.actions.is_empty(),
+            "no live data means no drift verdict either way: {plan:?}"
+        );
     }
 }

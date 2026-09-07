@@ -347,7 +347,19 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
     let caller_pane_id = client
         .caller_pane_id()
         .filter(|id| live_snapshot.panes.iter().any(|pane| &pane.pane_id == id));
+    // D54: fold the live snapshot's per-pane `process_info` in so the
+    // planner can compare what's actually running to what's declared, not
+    // only the declared state to itself. Only when the backend actually
+    // reports the capability: Radiator sets a pane's `process_info` to
+    // `None` both when nothing is running and when the hub simply omitted
+    // it, and merging that unconditionally would read an unreported process
+    // as idle and plan a spurious `RestartCommand`.
     let snapshot = pruned.to_snapshot(&profile.name, caller_pane_id);
+    let snapshot = if client.capabilities().process_info {
+        snapshot.merge_process_info(&live_snapshot)
+    } else {
+        snapshot
+    };
     let plan = build_plan(profile, &snapshot)?;
 
     // Only `status` and `plan` reach here: Render/Run/Down/Lint/Ls returned
@@ -729,6 +741,15 @@ fn up_command(
         .profile(profile_arg)
         .map(|managed| managed.to_snapshot(profile_arg, caller_pane_id))
         .unwrap_or_default();
+    // D54: same live `process_info` merge as `plan`/`status`, gated the same
+    // way on the backend's capability, when the target was reachable for
+    // the D48 prune above.
+    let snapshot = match &live_snapshot {
+        Ok(live_snapshot) if client.capabilities().process_info => {
+            snapshot.merge_process_info(live_snapshot)
+        }
+        _ => snapshot,
+    };
     let mut plan = build_plan(profile, &snapshot)?;
 
     let is_herdr = backend_id == select::HERDR_BACKEND;
@@ -774,6 +795,14 @@ fn up_command(
                 .profile(profile_arg)
                 .map(|managed| managed.to_snapshot(profile_arg, caller_pane_id))
                 .unwrap_or_default();
+            // D54: same capability-gated `process_info` merge as above,
+            // against the snapshot just fetched from the now-started
+            // session.
+            let snapshot = if client.capabilities().process_info {
+                snapshot.merge_process_info(&live)
+            } else {
+                snapshot
+            };
             plan = build_plan(profile, &snapshot)?;
         }
     }

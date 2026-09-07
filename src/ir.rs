@@ -91,13 +91,37 @@ fn content_digest(fields: &Value, children: &[&str]) -> Result<String> {
     canonical_digest(&json!({"fields": fields, "children": children}))
 }
 
+/// Bundles several independently hashed content categories into one string
+/// (D53): still a single opaque value for the existing "did anything about
+/// this resource change since the last apply" equality check, but one the
+/// planner can also parse back to tell *which* category changed — `cwd`/
+/// `env` can't be edited on a live pane in place, `on_start` is a one-shot
+/// hook, and so on need different verbs (or none) than a cosmetic `label`
+/// change. `serde_json::Map` orders its keys (no `preserve_order` feature),
+/// so this is stable regardless of the order `parts` is built in.
+fn composite_digest(parts: &[(&str, &str)]) -> String {
+    let mut object = serde_json::Map::new();
+    for (key, value) in parts {
+        object.insert((*key).to_owned(), json!(value));
+    }
+    Value::Object(object).to_string()
+}
+
 fn topology_digest(name: &str, split: Split, ratios: &[f64], panes: &[String]) -> Result<String> {
-    canonical_digest(&json!({
-        "name": name,
-        "split": split,
-        "ratios": ratios,
-        "panes": panes,
-    }))
+    let mut pane_set = panes.to_vec();
+    pane_set.sort();
+    // `pane_set` catches an added/removed pane (unordered); `order_split`
+    // catches a reorder or a split-direction change with the same panes;
+    // `ratios` stands alone so a ratio-only edit doesn't look like either
+    // (D53 point 4).
+    let pane_set = canonical_digest(&json!({"panes": pane_set}))?;
+    let order_split = canonical_digest(&json!({"name": name, "split": split, "panes": panes}))?;
+    let ratios_digest = canonical_digest(&json!({"ratios": ratios}))?;
+    Ok(composite_digest(&[
+        ("pane_set", &pane_set),
+        ("order_split", &order_split),
+        ("ratios", &ratios_digest),
+    ]))
 }
 
 pub fn to_ir(profile: &Profile) -> Ir {
@@ -157,7 +181,35 @@ fn to_ir_inner(profile: &Profile) -> Result<Ir> {
                     "on_stop": pane.on_stop,
                 });
                 let agent_children: Vec<&str> = agent_digest.as_deref().into_iter().collect();
-                let pane_digest = content_digest(&content_fields, &agent_children)?;
+                // D53: split into categories a planner rebuild can route
+                // differently — `cwd`/`env` need a recreate, `serve` restarts
+                // in place, `on_start` is a one-shot hook, everything else
+                // (`ready`, `after`, `adopt`, `on_stop`) has no mapped verb
+                // yet. The agent's own content rides along with `serve`
+                // since it only ever matters for a pane that also runs one.
+                let label_digest = content_digest(&json!({"label": pane.label}), &[])?;
+                let cwd_digest = content_digest(
+                    &json!({"cwd": pane.cwd.as_deref().map(crate::paths::normalize_for_digest)}),
+                    &[],
+                )?;
+                let env_digest = content_digest(&json!({"env": pane.env}), &[])?;
+                let serve_digest = content_digest(
+                    &json!({"serve": pane.serve, "ready": pane.ready}),
+                    &agent_children,
+                )?;
+                let on_start_digest = content_digest(&json!({"on_start": pane.on_start}), &[])?;
+                let other_digest = content_digest(
+                    &json!({"after": pane.after, "adopt": pane.adopt, "on_stop": pane.on_stop}),
+                    &[],
+                )?;
+                let pane_digest = composite_digest(&[
+                    ("label", &label_digest),
+                    ("cwd", &cwd_digest),
+                    ("env", &env_digest),
+                    ("serve", &serve_digest),
+                    ("on_start", &on_start_digest),
+                    ("other", &other_digest),
+                ]);
                 pane_digests.push(pane_digest.clone());
                 ordered_panes.push(pane.name.clone());
 
@@ -201,13 +253,29 @@ fn to_ir_inner(profile: &Profile) -> Result<Ir> {
             "env": workspace.env,
         });
         // The workspace digest still folds in each group's shape and its
-        // panes' content, so a change anywhere under the workspace changes it.
+        // panes' content, so a change anywhere under the workspace changes
+        // it — but kept in its own `children` category (D53) so the planner
+        // can tell a pane-only change (nothing to do at the workspace level)
+        // apart from the workspace's own `label`/`cwd`/`env` changing (a
+        // `RenameWorkspace`, cascaded to inheriting panes for `cwd`/`env`).
         let mut child_digests: Vec<&str> = Vec::new();
         for (group_topology, pane_digests) in &group_digests {
             child_digests.push(group_topology.as_str());
             child_digests.extend(pane_digests.iter().map(String::as_str));
         }
-        let workspace_digest = content_digest(&workspace_fields, &child_digests)?;
+        let ws_label_digest = content_digest(&json!({"label": workspace.label}), &[])?;
+        let ws_cwd_digest = content_digest(
+            &json!({"cwd": crate::paths::normalize_for_digest(&workspace.cwd)}),
+            &[],
+        )?;
+        let ws_env_digest = content_digest(&json!({"env": workspace.env}), &[])?;
+        let ws_children_digest = content_digest(&json!({}), &child_digests)?;
+        let workspace_digest = composite_digest(&[
+            ("label", &ws_label_digest),
+            ("cwd", &ws_cwd_digest),
+            ("env", &ws_env_digest),
+            ("children", &ws_children_digest),
+        ]);
 
         resources.push(Resource {
             kind: "workspace".into(),

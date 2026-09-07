@@ -32,49 +32,60 @@ fn pane_content_digests(drovefile: &std::path::Path) -> BTreeMap<String, String>
         .collect()
 }
 
-/// The pane content digest each example must still produce (D30): these are
-/// the values the v2 IR recorded, captured before the core/flavor seam split
-/// placement out of the pane's content digest. They must not move — a v2 state
-/// file has to upgrade to v3 with every pane seen as converged.
+/// The pane content digest each example must still produce (D30): originally
+/// the value the v2 IR recorded, captured before the core/flavor seam split
+/// placement out of the pane's content digest, so a v2 state file could
+/// upgrade to v3 with every pane seen as converged.
+///
+/// D53 changed `Resource.digest` again, from one hash of a pane's whole
+/// content to a composite JSON object of per-category hashes (`cwd`, `env`,
+/// `serve`, ...), so the planner can classify which category changed instead
+/// of only that something did. Each category hash below is still exactly the
+/// pre-D53 `content_digest` of that category (unchanged since D30), so this
+/// test still catches drift in what a category's content digest covers; the
+/// v2-to-v3 upgrade guarantee no longer applies verbatim, since a v2- or
+/// pre-D53-v3-recorded digest string does not parse as this composite shape
+/// and replans once, as any digest-format change forces (see D53's
+/// `diff_categories` fallback in `src/planner.rs`).
 const BASIC_V2_PANE_DIGESTS: &[(&str, &str)] = &[
     (
         "editor",
-        "999810892ca9ffcf59d6e38630d7291fc4a7968d6e844da5f2f3f2b1a33e423a",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"728c981e3aad62fd5b893e8a2ab14c0d7dde019d6dcef6d0d71248d5a3225ceb\"}",
     ),
     (
         "tests",
-        "999810892ca9ffcf59d6e38630d7291fc4a7968d6e844da5f2f3f2b1a33e423a",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"728c981e3aad62fd5b893e8a2ab14c0d7dde019d6dcef6d0d71248d5a3225ceb\"}",
     ),
 ];
 
 const LOG_DRIVEN_V2_PANE_DIGESTS: &[(&str, &str)] = &[
     (
         "controller",
-        "2f216875f6a64cbc90eb85ae822d1974508a5468eb22bab4d3642a83f8607ea5",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"b306b3084d85d40c8bcc555474e499eebe504f74fcbad8dfed59b9400ba374e4\",\"serve\":\"728c981e3aad62fd5b893e8a2ab14c0d7dde019d6dcef6d0d71248d5a3225ceb\"}",
     ),
     (
         "eventlog",
-        "9b8ce54e9a6996defe651b29ead1c5308592987dcc16386ce52239be52610b6c",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"751666fb7db0bebbc2ec905bf493260c99ab3742562075b1a5507c06e79d1378\"}",
     ),
     (
         "agentmon",
-        "08f3d038c1492c025ce50a19eb1799c2d93f04283c87788163c65fe9aaa5592b",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"3c81c9927eae8c04a29cc1ae76f52f508b97ef2369be4e7db9cc6b7dcfa93272\"}",
     ),
     (
         "spiceedit",
-        "eee8d28ddc2863087fe0a9a97525dc7eeb84edcfb0c6c36efff510fb0a6b0d61",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"3a5e63d8178dbc33b2d979bee8fa8ddae86993ab81eea796758c91f75ec5256c\"}",
     ),
     (
         "commit-reactor",
-        "23369cbc760fc95564d41d46658fe8062649db0af972284e06d56624a5866f17",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"ed157801ab1bd3ac9b981a99e8dcd02ac45c7d21724d95c18b1fdd1c9023cc27\",\"other\":\"631493e03b384122dce9880bbd98ff13009ec3a82930fa9d2141844c5250d9e2\",\"serve\":\"7a305d7cbbe31204a9ad54a1600cdcec53e59ae635cc053e7f0bc7b2596a0205\"}",
     ),
     (
         "gitlog",
-        "1aab2f0cdbf7f5313d7e71911736e1ceff9a5adc9d491618850ea46f729ab8a2",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"3849dacfee5ac53976eb31d0d65015c1171fae907d9a344b7c97e787129077e5\"}",
     ),
     (
         "doc-sync-reactor",
-        "3ad096e0bd86bab962f8e423d2d89485070ca6e0fcfe9d7fa5a87e13ccbf799d",
+        "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"7cec09ef17a109f71b9955dce4b8747dfd5fc19ab8f3b26b03a69c1ad43b1258\",\"other\":\"4a0b8a4fa07e674dfff30da3fe3dd2b7a3005133e6336a84ddc4a994f6ed61de\",\"serve\":\"42a5a79093e145dbf08596abc41cf6adc431dea488213af3d3caa57201b5bcda\"}",
     ),
 ];
 
