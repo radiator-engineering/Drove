@@ -829,7 +829,11 @@ fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> ser
             changed,
             tasks_run,
         } => {
-            object["status"] = serde_json::json!("in_sync");
+            object["status"] = if report.failed.is_empty() {
+                serde_json::json!("in_sync")
+            } else {
+                serde_json::json!("partial_failure")
+            };
             object["created"] = serde_json::json!(created);
             object["changed"] = serde_json::json!(changed);
             object["tasks_run"] = serde_json::json!(tasks_run);
@@ -857,10 +861,17 @@ fn print_up_summary(
             created,
             changed,
             tasks_run,
-        } => println!(
-            "profile {}: {created} created, {changed} changed, {tasks_run} tasks run, in sync",
-            profile.name
-        ),
+        } => {
+            let sync_word = if report.failed.is_empty() {
+                "in sync"
+            } else {
+                "partial failure"
+            };
+            println!(
+                "profile {}: {created} created, {changed} changed, {tasks_run} tasks run, {sync_word}",
+                profile.name
+            )
+        }
         UpOutcome::AlreadyRunning => {
             println!(
                 "profile {}: already running, brought to front",
@@ -1577,6 +1588,10 @@ profile("default", workspaces = [control])
         assert_eq!(object["failed"][0]["error"], "boom");
         assert_eq!(object["skipped"][0]["action"], "ops/main");
         assert_eq!(object["skipped"][0]["depends_on"], "ops");
+        assert_eq!(
+            object["status"], "partial_failure",
+            "a partial apply must not report in_sync"
+        );
     }
 
     #[test]

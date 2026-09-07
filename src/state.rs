@@ -89,6 +89,16 @@ impl LocalState {
     }
 
     pub fn begin_action(&mut self, action: &str, digest: &str) -> Result<()> {
+        // A prior attempt at this same action that was killed before
+        // `finish_action` ran would otherwise sit `completed: false` forever
+        // once this attempt succeeds, leaving `status`/`run` reporting an
+        // interruption that's actually resolved.
+        for entry in self.journal.iter_mut() {
+            if entry.action == action && !entry.completed {
+                entry.completed = true;
+                entry.success = None;
+            }
+        }
         self.journal.push(JournalEntry {
             action: action.to_owned(),
             digest: digest.to_owned(),
@@ -499,6 +509,40 @@ mod tests {
         assert!(state.has_interrupted("task:scaffold"));
         assert!(!state.has_interrupted("task:build"));
         assert!(!state.has_interrupted("task:unknown"));
+    }
+
+    #[test]
+    fn begin_action_supersedes_a_stale_incomplete_entry_for_the_same_action() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = LocalState {
+            schema_version: 1,
+            repo_root: PathBuf::from("/repo"),
+            profiles: BTreeMap::new(),
+            approvals: BTreeSet::new(),
+            journal: Vec::new(),
+            path: dir.path().join("state.json"),
+        };
+
+        // A first run of `task:scaffold` was killed before `finish_action`
+        // ran, leaving a stale `completed: false` entry.
+        state
+            .begin_action("task:scaffold", "digest-1")
+            .expect("begin first attempt");
+        assert!(state.has_interrupted("task:scaffold"));
+
+        // A retry begins and this time completes; the stale entry from the
+        // killed attempt must stop being reported once the retry starts,
+        // not linger forever (CodeRabbit finding on PR #31).
+        state
+            .begin_action("task:scaffold", "digest-1")
+            .expect("begin retry");
+        state.finish_action("digest-1", true).expect("finish retry");
+
+        assert!(
+            !state.has_interrupted("task:scaffold"),
+            "a completed retry must clear the earlier killed attempt too"
+        );
+        assert!(state.interrupted().is_empty());
     }
 
     #[test]

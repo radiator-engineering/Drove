@@ -637,7 +637,10 @@ fn action_dependencies(ir: &Ir, action: &PlannedAction) -> Vec<String> {
 /// same plan are still created (D29). Destructive actions are always applied;
 /// [`up`] uses `apply_plan_gated` instead to hold them behind `--yes`.
 pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Vec<(String, Outcome)> {
-    apply_plan_gated(backend, ir, plan, true, ApplyState::default(), |_, _, _| {}).0
+    apply_plan_gated(backend, ir, plan, true, ApplyState::default(), |_, _, _| {
+        true
+    })
+    .0
 }
 
 /// Like [`apply_plan`], but when `approve` is false every destructive action
@@ -651,7 +654,9 @@ pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Vec<(String, O
 /// collected into `skipped` rather than attempted. `on_action` runs with each
 /// action's outcome and the backend ids accumulated so far, right before the
 /// next action starts — a caller that saves state there (`up` does) leaves a
-/// killed process describing exactly what succeeded (D52 point 1).
+/// killed process describing exactly what succeeded (D52 point 1). If
+/// `on_action` returns `false` (its own save failed), the loop stops before
+/// the next action so nothing more is applied without a record of it.
 /// Every action's outcome, the backend ids created along the way, and what
 /// failed or was skipped — [`apply_plan_gated`]'s result.
 type ApplyPlanResult = (
@@ -667,7 +672,7 @@ fn apply_plan_gated(
     plan: &Plan,
     approve: bool,
     seed: ApplyState,
-    mut on_action: impl FnMut(&PlannedAction, &Outcome, &ApplyState),
+    mut on_action: impl FnMut(&PlannedAction, &Outcome, &ApplyState) -> bool,
 ) -> ApplyPlanResult {
     let mut state = seed;
     let mut outcomes: Vec<Option<(String, Outcome)>> =
@@ -727,14 +732,18 @@ fn apply_plan_gated(
         ) {
             blocked.insert(action.address.clone());
         }
-        on_action(action, &outcome, &state);
+        let keep_going = on_action(action, &outcome, &state);
         outcomes[index] = Some((action.address.clone(), outcome));
+        if !keep_going {
+            break;
+        }
     }
 
-    let outcomes = outcomes
-        .into_iter()
-        .map(|outcome| outcome.expect("every action applied exactly once"))
-        .collect();
+    // Ordinarily every slot is filled (`order` visits every action), but
+    // `on_action` returning `false` stops the loop before the rest run, so
+    // trailing entries stay `None` rather than lying about an outcome they
+    // never got.
+    let outcomes = outcomes.into_iter().flatten().collect();
     (outcomes, state, failed, skipped)
 }
 
@@ -828,14 +837,13 @@ pub fn up(
         approve,
         seed,
         |action, outcome, applied| {
-            if save_error.is_some() {
-                return;
-            }
             let managed = state.profile_mut(ctx.profile);
             let changed = record_action_ownership(managed, &existing, ir, action, outcome, applied);
             if changed && let Err(error) = state.save() {
                 save_error = Some(error);
+                return false;
             }
+            true
         },
     );
     if let Some(error) = save_error {
@@ -1422,7 +1430,7 @@ fn string_map(fields: &serde_json::Value, key: &str) -> BTreeMap<String, String>
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Mutex};
+    use std::{fs, path::PathBuf, sync::Mutex};
 
     use anyhow::bail;
     use serde_json::json;
@@ -2750,6 +2758,58 @@ mod tests {
             addresses,
             vec!["ops", "ops/main"],
             "only the failed workspace (and what depends on it) is replanned: {addresses:?}"
+        );
+    }
+
+    #[test]
+    fn up_stops_applying_further_actions_once_a_state_save_fails() {
+        let (mut state, dir) = temp_state();
+        // Force every `state.save()` to fail: its parent directory component
+        // is actually a plain file, so `fs::create_dir_all` cannot create it.
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, b"not a directory").expect("write blocker file");
+        state.path = blocker.join("state.json");
+
+        let profile = two_workspace_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreateWorkspace), "ops"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let result = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            None,
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "a state save failure must surface as an error, not a silent partial apply"
+        );
+
+        // The first action's backend call happened (its outcome had to be
+        // known before the save that failed), but the loop must have stopped
+        // there instead of going on to apply `ops` without any record of
+        // `dev` or a chance to record `ops` either.
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c == "create_workspace:dev"),
+            "the first action still applies before the save fails: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "create_workspace:ops"),
+            "no action after the save failure may reach the backend: {calls:?}"
         );
     }
 
