@@ -12,6 +12,20 @@ import sys
 import tomllib
 
 
+UNRELATED_PROVIDER_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDECODE",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+)
+
+
+def scrub_unrelated_provider_env(env):
+    for key in UNRELATED_PROVIDER_KEYS:
+        env.pop(key, None)
+
+
 def main():
     role = sys.argv[1]
     if role not in ("commit", "docs"):
@@ -34,6 +48,7 @@ def main():
     env = os.environ.copy()
     env["LOG_DRIVEN_WORKER"] = policy["identity"]
     if role == "commit":
+        scrub_unrelated_provider_env(env)
         argv = ["cursor-agent", "-p", "--force", "--trust", "--model",
                 env.get("EVENTLOG_MODEL", policy["model"]), "--output-format", "text", prompt]
         return subprocess.run(argv, env=env, stdout=sys.stderr).returncode

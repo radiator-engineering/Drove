@@ -29,6 +29,8 @@ use crate::model::SplitDirection;
 /// How long [`HerdrExt::ensure_session`] waits for a just-started session's
 /// socket to answer `ping` before giving up (D43 step 2).
 const SESSION_START_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_START_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -332,17 +334,19 @@ impl HerdrClient {
     /// pane with a command"). Use Herdr's atomic `pane.send_input`, also used
     /// by its `pane run` CLI, after shell creation or verified interruption.
     pub fn run_command(&self, pane_id: &str, command: &[String]) -> Result<()> {
+        self.run_command_after_shell_ready(pane_id, command, COMMAND_START_TIMEOUT)
+    }
+
+    fn run_command_after_shell_ready(
+        &self,
+        pane_id: &str,
+        command: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
         if command.is_empty() {
             return Ok(());
         }
-        let result = self.request("pane.process_info", json!({"pane_id": pane_id}))?;
-        let info: RawPaneProcessInfo = serde_json::from_value(
-            result
-                .get("process_info")
-                .cloned()
-                .context("missing pane process info")?,
-        )?;
-        let shell = verified_idle_shell_name(pane_id, &info)?;
+        let shell = self.wait_for_idle_shell(pane_id, timeout, BusyPanePolicy::WaitOnly)?;
         self.run_command_in_shell(pane_id, &shell, command)
     }
 
@@ -366,14 +370,32 @@ impl HerdrClient {
         if argv.is_empty() {
             return Ok(());
         }
+        let shell = self.wait_for_idle_shell(pane_id, timeout, BusyPanePolicy::InterruptOnce)?;
+        self.run_command_in_shell(pane_id, &shell, argv)
+    }
+
+    fn wait_for_idle_shell(
+        &self,
+        pane_id: &str,
+        timeout: Duration,
+        policy: BusyPanePolicy,
+    ) -> Result<String> {
         let deadline = Instant::now() + timeout;
         let mut interrupted = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!(
-                    "pane {pane_id} did not return to its shell after interrupt; command not sent"
-                );
+                let message = match policy {
+                    BusyPanePolicy::WaitOnly => {
+                        format!("pane {pane_id} did not become idle; command not sent")
+                    }
+                    BusyPanePolicy::InterruptOnce => {
+                        format!(
+                            "pane {pane_id} did not return to its shell after interrupt; command not sent"
+                        )
+                    }
+                };
+                bail!(message);
             }
             let result = self.request_with_timeout(
                 "pane.process_info",
@@ -386,29 +408,20 @@ impl HerdrClient {
                     .cloned()
                     .context("missing pane process info")?,
             )?;
-            let shell = info
-                .shell_pid
-                .context("cannot restart pane without a known shell pid")?;
-            if info
-                .foreground_process_group_id
-                .is_none_or(|pid| pid == shell)
-                && info
-                    .foreground_processes
-                    .iter()
-                    .all(|process| process.pid == shell)
-            {
-                let shell = verified_idle_shell_name(pane_id, &info)?;
-                return self.run_command_in_shell(pane_id, &shell, argv);
+            match idle_shell_name(pane_id, &info)? {
+                ShellReadiness::Idle(shell) => return Ok(shell),
+                ShellReadiness::Busy => {
+                    if policy == BusyPanePolicy::InterruptOnce && !interrupted {
+                        self.request_with_timeout(
+                            "pane.send_keys",
+                            json!({"pane_id": pane_id, "keys": ["ctrl+c"]}),
+                            Some(remaining),
+                        )?;
+                        interrupted = true;
+                    }
+                    thread::sleep(COMMAND_POLL_INTERVAL.min(remaining));
+                }
             }
-            if !interrupted {
-                self.request_with_timeout(
-                    "pane.send_keys",
-                    json!({"pane_id": pane_id, "keys": ["ctrl+c"]}),
-                    Some(remaining),
-                )?;
-                interrupted = true;
-            }
-            thread::sleep(Duration::from_millis(25).min(remaining));
         }
     }
 
@@ -563,7 +576,18 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn verified_idle_shell_name(pane_id: &str, info: &RawPaneProcessInfo) -> Result<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyPanePolicy {
+    WaitOnly,
+    InterruptOnce,
+}
+
+enum ShellReadiness {
+    Idle(String),
+    Busy,
+}
+
+fn idle_shell_name(pane_id: &str, info: &RawPaneProcessInfo) -> Result<ShellReadiness> {
     let shell = info
         .shell_pid
         .context("cannot restart pane without a known shell pid")?;
@@ -574,8 +598,9 @@ fn verified_idle_shell_name(pane_id: &str, info: &RawPaneProcessInfo) -> Result<
             .foreground_processes
             .iter()
             .all(|process| process.pid == shell)
+        || info.foreground_processes.is_empty()
     {
-        bail!("pane {pane_id} is busy; command not sent");
+        return Ok(ShellReadiness::Busy);
     }
     let root = info
         .foreground_processes
@@ -599,7 +624,7 @@ fn verified_idle_shell_name(pane_id: &str, info: &RawPaneProcessInfo) -> Result<
             "pane {pane_id} directly runs {name}, not a shell; cannot restart in place; command not sent"
         );
     }
-    Ok(name)
+    Ok(ShellReadiness::Idle(name))
 }
 
 fn is_known_shell(name: &str) -> bool {
@@ -1900,6 +1925,90 @@ $captured | ConvertTo-Json -Compress | Set-Content -LiteralPath $out -NoNewline 
         assert_eq!(requests[1]["params"]["keys"], json!(["ctrl+c"]));
         assert_eq!(requests[4]["params"]["text"], "'echo' 'it'\\''s ready'");
         assert_eq!(requests[4]["params"]["keys"], json!(["Enter"]));
+    }
+
+    #[test]
+    fn initial_launch_waits_for_transient_startup_to_become_idle() {
+        let starting = json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 200,
+            "foreground_processes": [{"pid": 200, "name": "fnm"}]}});
+        let partial = json!({"process_info": {"shell_pid": 100}});
+        let shell = json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+            "foreground_processes": [{"pid": 100, "name": "-zsh"}]}});
+        let (_dir, client, server) = scripted_restart(vec![
+            ("pane.process_info", starting),
+            ("pane.process_info", partial),
+            ("pane.process_info", shell),
+            ("pane.send_input", json!({})),
+        ]);
+        client
+            .run_command_after_shell_ready(
+                "w1:p2",
+                &["eventlog".into(), "reactor".into()],
+                Duration::from_secs(2),
+            )
+            .expect("initial launch");
+        let requests = server.join().expect("server");
+        assert_eq!(requests[3]["params"]["text"], "'eventlog' 'reactor'");
+        assert!(
+            !requests.iter().any(|r| r["method"] == "pane.send_keys"),
+            "initial launch must not interrupt shell startup"
+        );
+    }
+
+    #[test]
+    fn initial_launch_times_out_without_interrupting_or_sending_input() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("busy-initial-launch.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let stop = request["method"] == "test.stop";
+                let result = if request["method"] == "pane.process_info" {
+                    json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 200,
+                        "foreground_processes": [{"pid": 200, "name": "fnm"}]}})
+                } else {
+                    json!({})
+                };
+                serde_json::to_writer(
+                    stream.get_mut(),
+                    &json!({"id": request["id"], "result": result}),
+                )
+                .expect("write");
+                stream.get_mut().write_all(b"\n").expect("newline");
+                requests.push(request);
+                if stop {
+                    break;
+                }
+            }
+            requests
+        });
+        let client = HerdrClient::new(path);
+        let result = client.run_command_after_shell_ready(
+            "w1:p2",
+            &["eventlog".into()],
+            Duration::from_millis(150),
+        );
+        client
+            .request("test.stop", json!({}))
+            .expect("stop fake server");
+        let requests = server.join().expect("server");
+        assert!(
+            result
+                .expect_err("busy startup must refuse launch")
+                .to_string()
+                .contains("command not sent")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["method"] == "pane.send_keys" || r["method"] == "pane.send_input")
+        );
     }
 
     #[test]

@@ -302,3 +302,90 @@ fn moving_a_pane_between_tabs_keeps_content_but_changes_topology() {
         "the moved pane lands in `side`"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn model_command_commit_scrubs_unrelated_provider_env_but_preserves_cursor_and_git_env() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for script in [
+        ".context/bin/model-command.py",
+        "examples/log-driven/.context/bin/model-command.py",
+    ] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin dir");
+        let capture = directory.path().join("env.txt");
+        let stub = bin.join("cursor-agent");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+{
+  printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-unset}"
+  printf 'CLAUDECODE=%s\n' "${CLAUDECODE-unset}"
+  printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-unset}"
+  printf 'GEMINI_API_KEY=%s\n' "${GEMINI_API_KEY-unset}"
+  printf 'GOOGLE_API_KEY=%s\n' "${GOOGLE_API_KEY-unset}"
+  printf 'CURSOR_API_KEY=%s\n' "${CURSOR_API_KEY-unset}"
+  printf 'SSH_AUTH_SOCK=%s\n' "${SSH_AUTH_SOCK-unset}"
+  printf 'GIT_AUTHOR_NAME=%s\n' "${GIT_AUTHOR_NAME-unset}"
+  printf 'LOG_DRIVEN_WORKER=%s\n' "${LOG_DRIVEN_WORKER-unset}"
+} > "$MODEL_ENV_CAPTURE"
+"#,
+        )
+        .expect("write cursor stub");
+        let mut permissions = fs::metadata(&stub).expect("stub metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&stub, permissions).expect("chmod cursor stub");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let output = Command::new("python3")
+            .arg(repo.join(script))
+            .arg("commit")
+            .current_dir(&repo)
+            .env("PATH", path)
+            .env("MODEL_ENV_CAPTURE", &capture)
+            .env("EVENTLOG_SEQ", "42")
+            .env("EVENTLOG_REF", "ref")
+            .env("EVENTLOG_PATHS", "src/lib.rs")
+            .env("ANTHROPIC_API_KEY", "anthropic")
+            .env("CLAUDECODE", "claude-code")
+            .env("OPENAI_API_KEY", "openai")
+            .env("GEMINI_API_KEY", "gemini")
+            .env("GOOGLE_API_KEY", "google")
+            .env("CURSOR_API_KEY", "cursor")
+            .env("SSH_AUTH_SOCK", "/tmp/signing-agent.sock")
+            .env("GIT_AUTHOR_NAME", "Drove Test")
+            .output()
+            .expect("run model command");
+        assert!(
+            output.status.success(),
+            "{script} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let env = fs::read_to_string(&capture).expect("read env capture");
+        assert!(env.contains("ANTHROPIC_API_KEY=unset"), "{script}");
+        assert!(env.contains("CLAUDECODE=unset"), "{script}");
+        assert!(env.contains("OPENAI_API_KEY=unset"), "{script}");
+        assert!(env.contains("GEMINI_API_KEY=unset"), "{script}");
+        assert!(env.contains("GOOGLE_API_KEY=unset"), "{script}");
+        assert!(env.contains("CURSOR_API_KEY=cursor"), "{script}");
+        assert!(
+            env.contains("SSH_AUTH_SOCK=/tmp/signing-agent.sock"),
+            "{script}"
+        );
+        assert!(env.contains("GIT_AUTHOR_NAME=Drove Test"), "{script}");
+        assert!(
+            env.contains("LOG_DRIVEN_WORKER=cursor-committer"),
+            "{script}"
+        );
+    }
+}

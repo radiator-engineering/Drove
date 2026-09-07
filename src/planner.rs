@@ -1088,7 +1088,10 @@ fn push_pane_content_change(
         } else {
             "pane label or configuration changed".into()
         };
-        push_rename_pane(id, backend_id, reason, ranked);
+        push_rename_pane(id, backend_id.clone(), reason, ranked);
+        if observed.command_started == Some(false) {
+            push_restart_command(id, backend_id, "command start pending".to_owned(), ranked);
+        }
         return;
     }
 
@@ -1573,6 +1576,25 @@ mod tests {
         let snapshot = converged_from(&old);
         let plan = build_plan(&new, &snapshot).expect("plan");
         assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
+    }
+
+    #[test]
+    fn changed_label_with_pending_command_start_renames_then_restarts_in_one_plan() {
+        let old = pane_profile(json!({"name": "review", "label": "old", "serve": [["serve"]]}));
+        let new = pane_profile(json!({"name": "review", "label": "new", "serve": [["serve"]]}));
+        let snapshot = converged_from(&old).with_command_started("review", false);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::RenamePane),
+                Action::Core(CoreAction::RestartCommand)
+            ]
+        );
+        assert_eq!(
+            plan.actions[1].reason, "command start pending",
+            "pending command start must be fixed in the same up, not deferred"
+        );
     }
 
     // D53 migration: a pane, workspace, or group still recorded under a

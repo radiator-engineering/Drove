@@ -8,7 +8,7 @@ Keep the log and existing work when replacing an older shell-based setup.
 
 For the native log-driven reactor layout, install eventlog 0.2.0 or newer;
 it supplies the `setup`, `action` and `lifecycle` support this layout uses.
-The public upstream release target is
+The public upstream release is
 https://github.com/radiator-engineering/eventlog/releases/tag/v0.2.0. From
 the repository root, run:
 

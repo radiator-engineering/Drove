@@ -995,15 +995,7 @@ pub fn up(
                 return Ok(());
             };
             let managed = state.profile_mut(ctx.profile);
-            // A rename before a restart cannot record the desired command
-            // digest yet: a blocked startup must remain out of sync on retry.
-            let pending_restart = action.kind == Action::Core(CoreAction::RenamePane)
-                && plan.actions.iter().any(|candidate| {
-                    candidate.address == action.address
-                        && candidate.kind == Action::Core(CoreAction::RestartCommand)
-                });
-            let changed = !pending_restart
-                && record_action_ownership(managed, &existing, ir, action, outcome, applied);
+            let changed = record_action_ownership(managed, &existing, ir, action, outcome, applied);
             if changed && let Err(error) = state.save() {
                 save_error = Some(error);
                 anyhow::bail!("cannot save action ownership");
@@ -1275,7 +1267,7 @@ fn record_action_ownership(
                                 label: None,
                                 cwd,
                                 adopted: None,
-                                command_started: command_started(ir, pane, applied),
+                                command_started: command_started(ir, pane, applied, existing),
                                 last_outcome: None,
                             },
                         );
@@ -1312,7 +1304,7 @@ fn record_action_ownership(
                     label: None,
                     cwd,
                     adopted,
-                    command_started: command_started(ir, address, applied),
+                    command_started: command_started(ir, address, applied, existing),
                     last_outcome: None,
                 },
             );
@@ -1355,9 +1347,28 @@ fn group_topology_digest<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
         .map(|group| group.topology_digest.as_str())
 }
 
-fn command_started(ir: &Ir, pane: &str, applied: &ApplyState) -> Option<bool> {
-    (!pane_command(ir, pane).is_empty())
-        .then(|| applied.command_started.get(pane).copied().unwrap_or(true))
+fn command_started(
+    ir: &Ir,
+    pane: &str,
+    applied: &ApplyState,
+    existing: &ManagedProfile,
+) -> Option<bool> {
+    if pane_command(ir, pane).is_empty() {
+        return None;
+    }
+    Some(
+        applied
+            .command_started
+            .get(pane)
+            .copied()
+            .or_else(|| {
+                existing
+                    .resources
+                    .get(pane)
+                    .and_then(|resource| resource.command_started)
+            })
+            .unwrap_or(true),
+    )
 }
 
 fn group_workspace<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
@@ -2440,7 +2451,7 @@ mod tests {
         /// Calls (matched against the same string [`RecordingHerdr::record`]
         /// logs) that fail instead of succeeding, so a test can prove `up`
         /// collects one action's error and keeps applying the rest (D52).
-        fail_calls: BTreeSet<&'static str>,
+        fail_calls: BTreeSet<String>,
     }
 
     impl RecordingHerdr {
@@ -2461,7 +2472,14 @@ mod tests {
         /// what recording-then-failing looks like against a real backend.
         fn running_failing(fail_calls: &[&'static str]) -> Self {
             Self {
-                fail_calls: fail_calls.iter().copied().collect(),
+                fail_calls: fail_calls.iter().map(|call| (*call).to_owned()).collect(),
+                ..Self::running()
+            }
+        }
+
+        fn running_failing_owned(fail_calls: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                fail_calls: fail_calls.into_iter().collect(),
                 ..Self::running()
             }
         }
@@ -2513,7 +2531,7 @@ mod tests {
         fn create_workspace(&self, label: &str, _cwd: &Path) -> Result<String> {
             let call = format!("create_workspace:{label}");
             self.record(call.clone());
-            if self.fail_calls.contains(call.as_str()) {
+            if self.fail_calls.contains(&call) {
                 bail!("boom: {call}");
             }
             let workspace_id = self.id("w");
@@ -2545,13 +2563,17 @@ mod tests {
         fn start_command(&self, id: &str, _argv: &[String]) -> Result<()> {
             let call = format!("start_command:{id}");
             self.record(call.clone());
-            if self.fail_calls.contains(call.as_str()) {
+            if self.fail_calls.contains(&call) {
                 bail!("boom: {call}");
             }
             Ok(())
         }
         fn restart_command(&self, id: &str, _argv: &[String]) -> Result<()> {
-            self.record(format!("restart_command:{id}"));
+            let call = format!("restart_command:{id}");
+            self.record(call.clone());
+            if self.fail_calls.contains(&call) {
+                bail!("boom: {call}");
+            }
             Ok(())
         }
         fn prompt_agent(&self, id: &str, _prompt: &str) -> Result<()> {
@@ -3113,7 +3135,7 @@ mod tests {
         pane.serve = vec![vec!["serve-tests".into()]];
         profile.workspaces[0].tabs[0].panes.push(pane);
         let backend = RecordingHerdr {
-            fail_calls: ["start_command:p4"].into_iter().collect(),
+            fail_calls: ["start_command:p4".to_owned()].into_iter().collect(),
             ..backend
         };
         let report = pane_hook_up(
@@ -3158,6 +3180,142 @@ mod tests {
             Some(true)
         );
         assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn rename_pane_with_pending_command_start_restarts_in_the_same_up() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = up_profile();
+        let backend = RecordingHerdr::running();
+        pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        {
+            let pane = state
+                .profile_mut("default")
+                .resources
+                .get_mut("editor")
+                .expect("managed pane");
+            pane.command_started = Some(false);
+        }
+        let pane_id = state.profile("default").expect("managed").resources["editor"]
+            .backend_id
+            .clone();
+        state.save().expect("save pending command start");
+        profile.workspaces[0].tabs[0].panes[0].label = Some("Editor".into());
+
+        let plan = pane_hook_plan(&profile, &state);
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(plan.actions[0].kind, Action::Core(CoreAction::RenamePane));
+        assert_eq!(
+            plan.actions[1].kind,
+            Action::Core(CoreAction::RestartCommand)
+        );
+        let backend = RecordingHerdr::running();
+        let report = pane_hook_up(
+            &profile,
+            &plan,
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            backend.calls(),
+            [
+                format!("rename_pane:{pane_id}:Editor"),
+                format!("restart_command:{pane_id}")
+            ]
+        );
+        assert_eq!(
+            report.outcome,
+            UpOutcome::Reconciled {
+                created: 0,
+                changed: 2,
+                tasks_run: 0
+            }
+        );
+        assert_eq!(
+            state.profile("default").expect("managed").resources["editor"].command_started,
+            Some(true)
+        );
+
+        assert!(pane_hook_plan(&profile, &state).actions.is_empty());
+    }
+
+    #[test]
+    fn failed_pending_restart_after_rename_reports_partial_and_remains_pending() {
+        let (mut state, _dir) = temp_state();
+        let mut profile = up_profile();
+        let backend = RecordingHerdr::running();
+        pane_hook_up(
+            &profile,
+            &pane_hook_plan(&profile, &state),
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        {
+            let pane = state
+                .profile_mut("default")
+                .resources
+                .get_mut("editor")
+                .expect("managed pane");
+            pane.command_started = Some(false);
+        }
+        let pane_id = state.profile("default").expect("managed").resources["editor"]
+            .backend_id
+            .clone();
+        state.save().expect("save pending command start");
+        profile.workspaces[0].tabs[0].panes[0].label = Some("Editor".into());
+
+        let plan = pane_hook_plan(&profile, &state);
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(plan.actions[0].kind, Action::Core(CoreAction::RenamePane));
+        assert_eq!(
+            plan.actions[1].kind,
+            Action::Core(CoreAction::RestartCommand)
+        );
+        let backend = RecordingHerdr::running_failing_owned([format!("restart_command:{pane_id}")]);
+        let report = pane_hook_up(
+            &profile,
+            &plan,
+            &backend,
+            &FakeRunner::default(),
+            &mut state,
+            true,
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].address, "editor");
+        assert_eq!(
+            report.outcome,
+            UpOutcome::Reconciled {
+                created: 0,
+                changed: 1,
+                tasks_run: 0
+            }
+        );
+        assert_eq!(
+            state.profile("default").expect("managed").resources["editor"].command_started,
+            Some(false)
+        );
+        let retry = pane_hook_plan(&profile, &state);
+        assert_eq!(retry.actions.len(), 1);
+        assert_eq!(
+            retry.actions[0].kind,
+            Action::Core(CoreAction::RestartCommand)
+        );
+        assert_eq!(
+            retry.actions[0].backend_id.as_deref(),
+            Some(pane_id.as_str())
+        );
     }
 
     #[test]

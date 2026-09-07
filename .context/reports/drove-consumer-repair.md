@@ -129,6 +129,15 @@ Key output: `/tmp/drove-restart-shell-tests.out`,
 Original log/source snapshots, manifests, recovery refs, ownership maps,
 model captures and bootstrap acknowledgment are in the evidence root.
 
+## Eventlog 0.2.0 publication verification
+
+After the historical recovery above, upstream published the native capability
+floor Drove's log-driven layout now documents. The `eventlog-cli` 0.2.0 crate
+is unyanked at https://crates.io/crates/eventlog-cli/0.2.0. The upstream tag
+source is bfc3b466b5a760f946d867af85a8660103bd8e6d. The installed registry
+binary at `/Users/jjmartin/.cargo/bin/eventlog` has SHA-256
+`6ebcabf14e5cdea2d79be9193cd16961891b1abbbcc4253e6d871f8da3b3fe78`.
+
 Historical strict-doctor violations remain visible; history is not rewritten
 to hide old missing claims, duplicate spawns or conflicts. No log was erased
 or manually rewritten, and no reactor lock directory was manually removed.
@@ -157,4 +166,3 @@ or manually rewritten, and no reactor lock directory was manually removed.
 - `.context/reports/audit-summary.md` — SHA-256 `41c5ca236ff4e2e2c219644d331a6887d953ac60ceaa0cc8fc95a203816548de`
 - `.context/reports/eventlog-cutover.md` — SHA-256 `c5ede2d584d766e9cda6153c1983c95fe20827febe16eb95f7dfa81fc2d3aa28`
 - `.context/reports/eventlog-handoff.md` — SHA-256 `f206d78337b6ab6bff02a2d2f2735596d75846257f9f64f6a1659d9d28e5c8b1`
-
