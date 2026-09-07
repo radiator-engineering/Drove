@@ -37,3 +37,4 @@ files = workspace("files", panes = [
 
 default = profile("default", workspaces = [control, maintenance, files], tasks = [scaffold, protect_log])
 profile("core", extends = default, without = [files])
+profile("monitoring", session = "drove-mon", workspaces = [control])
