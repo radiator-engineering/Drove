@@ -1,0 +1,26 @@
+tests/cli.rs
+  s_4534414f58c9b6::t_b0b645bc7eaa7a 554
+docs/drovefile.md
+  s_4534414f58c9b6::t_ea6f893a192c75 211
+src/backend/herdr.rs
+  s_4534414f58c9b6::t_b5477dccb4b539 698-721
+  s_4534414f58c9b6::t_a6b2e27309eb99 1587,1607-1629
+  s_4534414f58c9b6::t_928a6b508c1be4 656-664,670-679
+  s_4534414f58c9b6::t_d5911316e0cf40 1630-1631
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6ff8a8f42afb96b27d49967982d488fbd6911be0",
+  "prompts": {},
+  "sessions": {
+    "s_4534414f58c9b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e7c0c8c-dcec-48d1-a8cd-bec70505b648",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
