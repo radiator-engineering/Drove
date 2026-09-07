@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Herdr backend: the first declared tab of a workspace Drove creates now
   reuses the root tab Herdr's `workspace.create` always hands back, instead
   of opening a new tab and leaving that root tab stray (#25).
+- `up`, `plan`, and `status` now prune local state against the live backend
+  snapshot before building a plan: a recorded resource whose backend id no
+  longer exists (a Herdr session stopped and restarted, which wipes its
+  workspaces and id counter) is dropped and planned as a fresh create
+  instead of trusted as already there, which previously left `status`
+  reporting `in_sync` and `up` failing with `workspace_not_found`. `status`
+  reports each pruned resource under a new `recreate` line, and its `--json`
+  report gains a `"pruned"` list of the dropped identities.
 
 ## [0.1.0] - 2026-09-07
 
