@@ -668,6 +668,40 @@ fn up_command(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The `--json` body for the `up` summary (D43 step 5), built pure so its
+/// shape is testable without capturing stdout.
+fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> serde_json::Value {
+    let tasks: Vec<_> = report
+        .tasks
+        .iter()
+        .map(
+            |(name, outcome)| serde_json::json!({"task": name, "outcome": outcome_label(*outcome)}),
+        )
+        .collect();
+    let mut object = serde_json::json!({
+        "profile": profile.name,
+        "focused": report.focused,
+        "tasks": tasks,
+    });
+    match &report.outcome {
+        UpOutcome::Reconciled {
+            created,
+            changed,
+            tasks_run,
+        } => {
+            object["status"] = serde_json::json!("in_sync");
+            object["created"] = serde_json::json!(created);
+            object["changed"] = serde_json::json!(changed);
+            object["tasks_run"] = serde_json::json!(tasks_run);
+        }
+        UpOutcome::AlreadyRunning => {
+            object["status"] = serde_json::json!("already_running");
+        }
+        UpOutcome::CannotStart { .. } => unreachable!("handled before summary"),
+    }
+    object
+}
+
 /// The one summary line D43 step 5 prints (or its `--json` form).
 fn print_up_summary(
     profile: &Profile,
@@ -675,33 +709,7 @@ fn print_up_summary(
     json: bool,
 ) -> Result<()> {
     if json {
-        let tasks: Vec<_> = report
-            .tasks
-            .iter()
-            .map(|(name, outcome)| serde_json::json!({"task": name, "outcome": outcome_label(*outcome)}))
-            .collect();
-        let mut object = serde_json::json!({
-            "profile": profile.name,
-            "focused": report.focused,
-            "tasks": tasks,
-        });
-        match &report.outcome {
-            UpOutcome::Reconciled {
-                created,
-                changed,
-                tasks_run,
-            } => {
-                object["status"] = serde_json::json!("in_sync");
-                object["created"] = serde_json::json!(created);
-                object["changed"] = serde_json::json!(changed);
-                object["tasks_run"] = serde_json::json!(tasks_run);
-            }
-            UpOutcome::AlreadyRunning => {
-                object["status"] = serde_json::json!("already_running");
-            }
-            UpOutcome::CannotStart { .. } => unreachable!("handled before summary"),
-        }
-        println!("{object}");
+        println!("{}", up_summary_json(profile, report));
         return Ok(());
     }
     match &report.outcome {
@@ -1266,6 +1274,16 @@ profile("default", workspaces = [control])
     }
 
     #[test]
+    fn clap_parses_up_with_workspace_and_no_focus() {
+        let cli = Cli::try_parse_from(["drove", "up", "--workspace", "api", "--no-focus", "--yes"])
+            .expect("parse");
+        assert!(matches!(
+            &cli.command,
+            Some(Command::Up { workspace: Some(w), no_focus: true, yes: true, .. }) if w == "api"
+        ));
+    }
+
+    #[test]
     fn clap_parses_positional_profile_after_a_subcommand() {
         let cli = Cli::try_parse_from(["drove", "status", "monitoring"]).expect("parse");
         assert!(matches!(
@@ -1306,5 +1324,63 @@ profile("default", workspaces = [control])
     fn clap_parses_ls() {
         let cli = Cli::try_parse_from(["drove", "ls"]).expect("parse");
         assert!(matches!(cli.command, Some(Command::Ls)));
+    }
+
+    #[test]
+    fn up_flags_cover_the_bare_command_and_explicit_up_only() {
+        // `drove` with no subcommand is the up workflow with defaults.
+        assert_eq!(up_flags(&None), Some((false, None, false)));
+        // Other subcommands are read-only and never route through `up`.
+        assert_eq!(up_flags(&Some(Command::Status { profile: None })), None);
+        assert_eq!(up_flags(&Some(Command::Plan { profile: None })), None);
+        // Explicit `up` carries its flags through.
+        let cli = Cli::try_parse_from(["drove", "up", "--workspace", "api"]).expect("parse");
+        assert_eq!(
+            up_flags(&cli.command),
+            Some((false, Some("api".to_owned()), false))
+        );
+    }
+
+    fn report(outcome: UpOutcome) -> crate::executor::UpReport {
+        crate::executor::UpReport {
+            outcome,
+            tasks: Vec::new(),
+            focused: Some("w1".to_owned()),
+            blocked_destructive: false,
+        }
+    }
+
+    #[test]
+    fn up_summary_json_carries_the_reconciled_shape() {
+        let profile = Profile {
+            name: "dev".into(),
+            ..Default::default()
+        };
+        let object = up_summary_json(
+            &profile,
+            &report(UpOutcome::Reconciled {
+                created: 2,
+                changed: 1,
+                tasks_run: 3,
+            }),
+        );
+        assert_eq!(object["profile"], "dev");
+        assert_eq!(object["status"], "in_sync");
+        assert_eq!(object["created"], 2);
+        assert_eq!(object["changed"], 1);
+        assert_eq!(object["tasks_run"], 3);
+        assert_eq!(object["focused"], "w1");
+    }
+
+    #[test]
+    fn up_summary_json_carries_the_already_running_shape() {
+        let profile = Profile {
+            name: "dev".into(),
+            ..Default::default()
+        };
+        let object = up_summary_json(&profile, &report(UpOutcome::AlreadyRunning));
+        assert_eq!(object["status"], "already_running");
+        // The reconciled counts are absent in this form.
+        assert!(object.get("created").is_none());
     }
 }

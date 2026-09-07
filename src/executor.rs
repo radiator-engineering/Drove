@@ -528,6 +528,33 @@ struct ApplyState {
     pane_ids: BTreeMap<String, String>,
 }
 
+impl ApplyState {
+    /// Seeds the resolver with the backend ids a previous run recorded, so an
+    /// action against a parent that already converged (and so needs no action
+    /// this run) still resolves that parent's id. Without this, a later `up`
+    /// that only adds a pane to an existing group cannot find the group's
+    /// workspace, since nothing populated `workspace_ids` for it this run.
+    fn seeded_from(managed: Option<&crate::state::ManagedProfile>) -> Self {
+        let mut state = Self::default();
+        let Some(managed) = managed else {
+            return state;
+        };
+        for (address, resource) in &managed.resources {
+            if resource.backend_id.is_empty() {
+                continue;
+            }
+            let map = match resource.kind.as_str() {
+                "workspace" => &mut state.workspace_ids,
+                "placement" => &mut state.group_ids,
+                "pane" => &mut state.pane_ids,
+                _ => continue,
+            };
+            map.insert(address.clone(), resource.backend_id.clone());
+        }
+        state
+    }
+}
+
 /// Applies every action in `plan` against `backend`, resolving each verb's
 /// concrete arguments from `ir`, and returns each action's [`Outcome`] in
 /// order. A flavor action on a backend without that flavor is surfaced as
@@ -535,7 +562,7 @@ struct ApplyState {
 /// same plan are still created (D29). Destructive actions are always applied;
 /// [`up`] uses `apply_plan_gated` instead to hold them behind `--yes`.
 pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Result<Vec<(String, Outcome)>> {
-    Ok(apply_plan_gated(backend, ir, plan, true)?.0)
+    Ok(apply_plan_gated(backend, ir, plan, true, ApplyState::default())?.0)
 }
 
 /// Like [`apply_plan`], but when `approve` is false every destructive action
@@ -548,17 +575,45 @@ fn apply_plan_gated(
     ir: &Ir,
     plan: &Plan,
     approve: bool,
+    seed: ApplyState,
 ) -> Result<(Vec<(String, Outcome)>, ApplyState)> {
-    let mut state = ApplyState::default();
-    let mut outcomes = Vec::with_capacity(plan.actions.len());
-    for action in &plan.actions {
+    let mut state = seed;
+    let mut outcomes: Vec<Option<(String, Outcome)>> =
+        (0..plan.actions.len()).map(|_| None).collect();
+
+    // A `SetRatio` addresses a split gap, so it must run after the panes that
+    // create the group's gaps. The plan orders every Herdr tab action ahead of
+    // the pane splits (its rank sorts before the pane rank), which is right for
+    // `plan`/`status` output but would apply a ratio before its gap exists when
+    // a pane is added to an existing group. So apply the ratios last, keeping
+    // each action's outcome in its original plan position.
+    let is_deferred =
+        |action: &PlannedAction| matches!(action.kind, Action::Herdr(HerdrAction::SetRatio));
+    let order = plan
+        .actions
+        .iter()
+        .enumerate()
+        .filter(|(_, action)| !is_deferred(action))
+        .chain(
+            plan.actions
+                .iter()
+                .enumerate()
+                .filter(|(_, action)| is_deferred(action)),
+        );
+
+    for (index, action) in order {
         let outcome = if action.destructive && !approve {
             Outcome::Skipped
         } else {
             apply_action(backend, ir, &mut state, action)?
         };
-        outcomes.push((action.address.clone(), outcome));
+        outcomes[index] = Some((action.address.clone(), outcome));
     }
+
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("every action applied exactly once"))
+        .collect();
     Ok((outcomes, state))
 }
 
@@ -629,7 +684,10 @@ pub fn up(
     // Step 3: run the plan's tasks, then apply its backend actions and record
     // the resources that came into being so the next run sees them in sync.
     let tasks = execute_plan_tasks(profile, plan, ctx, state, approve)?;
-    let (outcomes, applied) = apply_plan_gated(backend, ir, plan, approve)?;
+    // Seed the resolver with what a previous run recorded, so an action
+    // against a parent that already converged still finds its backend id.
+    let seed = ApplyState::seeded_from(state.profile(ctx.profile));
+    let (outcomes, applied) = apply_plan_gated(backend, ir, plan, approve, seed)?;
     record_ownership(state, ctx.profile, ir, plan, &outcomes, &applied)?;
 
     let blocked_destructive = !approve && plan.has_destructive_actions();
@@ -2196,6 +2254,157 @@ mod tests {
                 changed: 0,
                 tasks_run: 0
             }
+        );
+    }
+
+    #[test]
+    fn up_splits_a_pane_into_a_converged_group_using_recorded_ids() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "editor"}, {"name": "tests"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        // A previous run recorded the workspace, the group and the first pane;
+        // only `tests` is being added now, so its parents need no action this
+        // run and their ids live only in recorded state.
+        {
+            let managed = state.profile_mut("default");
+            for (address, kind, backend, parent) in [
+                ("dev", "workspace", "w1", None),
+                ("dev/main", "placement", "t1", Some("dev")),
+                ("editor", "pane", "p1", Some("dev/main")),
+            ] {
+                managed.resources.insert(
+                    address.to_owned(),
+                    ManagedResource {
+                        kind: kind.into(),
+                        backend_id: backend.into(),
+                        parent: parent.map(ToOwned::to_owned),
+                        digest: "d".into(),
+                        adopted: None,
+                        last_outcome: None,
+                    },
+                );
+            }
+        }
+        let plan = up_plan(&[(Action::Herdr(HerdrAction::SplitPane), "tests")]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up must resolve the converged workspace from recorded state");
+
+        let calls = backend.calls();
+        // The new pane splits into the group's recorded Herdr tab, and no
+        // error is raised for the workspace that was never touched this run.
+        assert!(
+            calls.iter().any(|c| c.starts_with("split_pane:t1:")),
+            "the pane must split into the recorded tab: {calls:?}"
+        );
+        assert!(
+            state
+                .profile("default")
+                .expect("profile")
+                .resources
+                .contains_key("tests"),
+            "the new pane is recorded"
+        );
+        assert!(matches!(report.outcome, UpOutcome::Reconciled { .. }));
+    }
+
+    #[test]
+    fn set_ratio_is_applied_after_the_split_that_creates_its_gap() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "split": "right",
+                    "ratios": [0.6],
+                    "panes": [{"name": "editor"}, {"name": "tests"}]
+                }]
+            }]
+        }));
+        let ir = profile.to_ir();
+        {
+            let managed = state.profile_mut("default");
+            for (address, kind, backend, parent) in [
+                ("dev", "workspace", "w1", None),
+                ("dev/main", "placement", "t1", Some("dev")),
+                ("editor", "pane", "p1", Some("dev/main")),
+            ] {
+                managed.resources.insert(
+                    address.to_owned(),
+                    ManagedResource {
+                        kind: kind.into(),
+                        backend_id: backend.into(),
+                        parent: parent.map(ToOwned::to_owned),
+                        digest: "d".into(),
+                        adopted: None,
+                        last_outcome: None,
+                    },
+                );
+            }
+        }
+        // The planner orders every Herdr tab action ahead of the pane splits,
+        // so the ratio comes first in the plan — but applying it before the
+        // split exists would fail against a real backend.
+        let plan = up_plan(&[
+            (Action::Herdr(HerdrAction::SetRatio), "dev/main"),
+            (Action::Herdr(HerdrAction::SplitPane), "tests"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        let split_at = calls
+            .iter()
+            .position(|c| c.starts_with("split_pane:"))
+            .expect("a split happened");
+        let ratio_at = calls
+            .iter()
+            .position(|c| c.starts_with("set_ratio:"))
+            .expect("a ratio was set");
+        assert!(
+            ratio_at > split_at,
+            "the ratio must be applied after the split, whatever the plan order: {calls:?}"
         );
     }
 
