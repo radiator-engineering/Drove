@@ -324,6 +324,11 @@ pub struct DownReport {
     pub detached: Vec<String>,
     /// `(resource identity, hook succeeded)` for every `on_stop` hook run.
     pub hooks_run: Vec<(String, bool)>,
+    /// `(resource identity, error message)` for every `close_pane` call that
+    /// failed (D50): the resource is still detached and the failure does not
+    /// abort the teardown, so a pane the session already lost is treated as
+    /// already gone rather than blocking `down`.
+    pub close_failed: Vec<(String, String)>,
 }
 
 /// `drove down` (D19): runs each owned resource's `on_stop` hook (if the
@@ -331,7 +336,9 @@ pub struct DownReport {
 /// closes owned panes on the backend — in reverse dependency order.
 /// Resources the backend doesn't recognize as owned by this profile (an
 /// unmanaged pane) are never touched, because they are never in
-/// `state`'s managed set to begin with.
+/// `state`'s managed set to begin with. A `close_pane` failure (D50) no
+/// longer aborts the loop: the resource is still detached and saved, and
+/// the failure is collected in [`DownReport::close_failed`] instead.
 pub fn down(
     profile: &Profile,
     ctx: &ExecutionContext<'_>,
@@ -371,8 +378,9 @@ pub fn down(
         if purge
             && resource.kind == "pane"
             && let Some(backend) = backend
+            && let Err(error) = backend.close_pane(&resource.backend_id)
         {
-            backend.close_pane(&resource.backend_id)?;
+            report.close_failed.push((id.clone(), error.to_string()));
         }
 
         state.profile_mut(ctx.profile).resources.remove(&id);
@@ -1285,6 +1293,7 @@ fn string_map(fields: &serde_json::Value, key: &str) -> BTreeMap<String, String>
 mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
+    use anyhow::bail;
     use serde_json::json;
 
     use super::*;
@@ -1811,6 +1820,105 @@ mod tests {
             }
         }
         // No `herdr()` override: it inherits the default `None`.
+    }
+
+    /// A backend whose `close_pane` fails for one chosen backend id and
+    /// succeeds for every other (D50), so a `down --purge` test can prove a
+    /// lost pane no longer aborts the teardown.
+    struct CloseFailsBackend {
+        fails_for: &'static str,
+    }
+
+    impl Backend for CloseFailsBackend {
+        fn snapshot(&self) -> Result<crate::backend::herdr::SessionSnapshot> {
+            Ok(Default::default())
+        }
+        fn caller_pane_id(&self) -> Option<String> {
+            None
+        }
+        fn create_workspace(&self, _label: &str, _cwd: &Path) -> Result<String> {
+            Ok("w1".into())
+        }
+        fn rename_workspace(&self, _id: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        fn create_pane(&self, _workspace_id: &str, _spec: &PaneSpec) -> Result<String> {
+            Ok("p1".into())
+        }
+        fn close_pane(&self, id: &str) -> Result<()> {
+            if id == self.fails_for {
+                bail!("pane_not_found: {id}");
+            }
+            Ok(())
+        }
+        fn rename_pane(&self, _id: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+        fn restart_command(&self, _id: &str, _argv: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn prompt_agent(&self, _id: &str, _prompt: &str) -> Result<()> {
+            Ok(())
+        }
+        fn process_info(&self, _id: &str) -> Result<Option<crate::backend::ProcessInfo>> {
+            Ok(None)
+        }
+        fn report_tokens(&self, _address: &str, _tokens: &BTreeMap<String, String>) -> Result<()> {
+            Ok(())
+        }
+        fn output(&self, _id: &str, _timeout: std::time::Duration) -> Result<String> {
+            Ok(String::new())
+        }
+        fn capabilities(&self) -> crate::backend::Capabilities {
+            crate::backend::Capabilities {
+                workspace_env: false,
+                pane_command_at_create: true,
+                metadata_tokens: false,
+                process_info: false,
+                events: false,
+                readiness_output: false,
+            }
+        }
+    }
+
+    #[test]
+    fn down_collects_a_close_pane_failure_without_aborting_the_teardown() {
+        let (mut state, _dir) = temp_state();
+        let profile = down_test_profile();
+        seed_managed(
+            &mut state,
+            &[
+                ("dev", "workspace", None),
+                ("gitlog", "pane", Some("dev/main")),
+            ],
+        );
+
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+        let backend = CloseFailsBackend {
+            fails_for: "backend-gitlog",
+        };
+        let report = down(
+            &profile,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            true,
+            Some(&backend),
+        )
+        .expect("down");
+
+        assert_eq!(report.detached, vec!["gitlog", "dev"]);
+        assert_eq!(report.close_failed.len(), 1);
+        let (id, message) = &report.close_failed[0];
+        assert_eq!(id, "gitlog");
+        assert!(message.contains("pane_not_found"));
+
+        let managed = state.profile("default").expect("profile recorded");
+        assert!(
+            managed.resources.is_empty(),
+            "every managed resource must still be detached and saved"
+        );
     }
 
     /// A fake Herdr for the `up` flow (D43): it hands out backend ids for
