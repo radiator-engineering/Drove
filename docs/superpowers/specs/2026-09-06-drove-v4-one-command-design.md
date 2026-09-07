@@ -146,3 +146,59 @@ a named session is stopped then deleted, in that order, after the hooks and
 detach; `default` and an unnamed target are never touched and the report
 carries no `session`; a session that is already stopped is still deleted;
 a missing binary is an error and the resources are still detached.
+
+## 7. Amendment: local state is pruned against the live snapshot (D48)
+
+Drove's local state records the backend id of every resource it created.
+`plan`, `status` and `up` built the observed snapshot from that record
+alone, so a session that had been stopped and restarted (Herdr wipes its
+workspaces and restarts the id counter) still looked `in_sync`, and `up`
+then failed with `workspace_not_found` when it added a pane to a workspace
+that no longer existed (issue 24). A pane Herdr closed after its process
+exited (issue 20) and a stale caller pane (issue 22) are the same defect at
+pane level.
+
+**D48.** Before a plan is built, the managed set is pruned against the live
+backend snapshot: a managed resource whose recorded backend id is not in
+the snapshot is dropped from the managed set, together with everything
+placed under it (a missing workspace drops its tabs and panes; a missing
+tab drops its panes). The planner then sees those resources as absent and
+plans their creation; `status` lists each one under a new `recreate` reason
+instead of reporting `in_sync`. The prune is saved to local state only when
+`up` applies; `plan` and `status` never write. A backend whose snapshot
+cannot be read leaves the state untouched and fails as today.
+
+Implementation: one pure function `prune_missing(managed, &snapshot) ->
+(ManagedProfile, Vec<String>)` beside `LocalState` (the second value is the
+dropped identities, for `status` output and the JSON report's `"pruned"`
+list), called from the one place `cli.rs` turns local state into the
+planner's snapshot. Tests: a fake snapshot missing a workspace prunes the
+workspace and its tabs and panes and the plan creates them again; a missing
+pane prunes only that pane; a full snapshot prunes nothing and the plan is
+unchanged; `status` prints `recreate` for a pruned resource; `plan` leaves
+the state file byte-identical.
+
+## 8. Amendment: the first tab reuses Herdr's root tab (D49)
+
+Herdr's `workspace.create` always returns a root tab (labelled `1`) holding
+one idle shell pane. Drove opened each declared `herdr.tab()` as a new tab,
+so every workspace it created kept a stray `1` tab (issue 25).
+
+**D49.** When Drove creates a workspace on the Herdr backend, the first
+declared tab of that workspace is applied to the root tab Herdr returned
+(`apply_layout` with that `tab_id`, then `rename_tab` to the declared
+label) instead of opening a new tab. Later tabs open as today. A workspace
+Drove adopted or found already present is untouched: the reuse applies only
+to a root tab that Drove's own `create_workspace` call produced in this
+apply. The root tab's idle shell pane is replaced by the layout, so nothing
+running is lost.
+
+Implementation: `create_workspace` on the Herdr client returns the root tab
+id alongside the workspace id (a small struct, or the executor reads it
+from the same response); the executor passes it to the first `CreateTab`
+for that workspace; `HerdrExt::create_tab` gains an `existing_tab:
+Option<&str>` parameter. Tests: a fake Herdr records that the first tab's
+`apply_layout` carried the root `tab_id` and a `tab.rename`, the second
+tab's did not; a pre-existing workspace never gets the reuse; the
+`tests/herdr_contract.rs` fixture for `workspace.create` includes the
+root tab.
