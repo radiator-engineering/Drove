@@ -91,3 +91,32 @@ it; `>>` appends still succeed.
 - pr-lifecycle = .context/PR-WORKFLOW.md: worker owns the PR to done (all threads answered, APPROVE, green, current), reviewer owns the verdict and re-reviews each push, controller merges.
 - ambient-env-below-profile = D46: flag > DROVE_* env > profile > file > ambient host env (HERDR_SESSION, RADIATOR_HUB) > built-in; DROVE_SESSION / DROVE_TARGET added as explicit env overrides. Found by running `drove ls` from inside the drove session: monitoring resolved to `drove`.
 - down-stops-named-session = D47 (2026-09-07): `drove down` on Herdr, after hooks and detach, runs `herdr session stop NAME` then `herdr session delete NAME` for the resolved named target; never for `default` or an unnamed target. New `HerdrExt::stop_session`, shelled out like `ensure_session`. Spec section 6 of the v4 design.
+- prune-stale-state = D48 (2026-09-07): before planning, managed resources whose backend id is absent from the live snapshot are dropped (with their dependents) and planned as creates; `status` reports them as `recreate`; only `up` saves the prune. Fixes issues 24, 20, 22. Spec section 7.
+- reuse-root-tab = D49 (2026-09-07): on Herdr, the first declared tab of a workspace Drove itself created is applied onto Herdr's root tab and renamed, so no stray `1` tab remains. Fixes issue 25. Spec section 8.
+- down-tolerates-missing = D50 (2026-09-07): `drove down` prunes stale ids against the live snapshot before closing panes and never aborts on a `close_pane` error; missing resources are detached and reported as `pruned` / `close_failed`, exit 0, and the D47 session stop still runs. Fixes issue 29. Spec section 9.
+- live-plan = D51 (2026-09-07): `up` re-snapshots and re-plans after it starts the session; a failing per-pane `process_info` never fails the snapshot; the caller pane id must be in the snapshot; `lint` prunes; a corrupt state file is renamed and ignored; a target named `default` means no named session; stop output is scanned line by line. Audit group A. Spec section 10.
+- apply-progress = D52 (2026-09-07): apply records ownership and saves per action, collects failures, skips dependents, exits 1 with what remains; `status` shows interrupted journal entries. Audit group B. Spec section 11.
+- planner-truth = D53 (2026-09-07): cwd/env edits plan as gated destructive recreate (or `RestartCommand` with cwd for serve panes when Herdr allows); `on_start` edits record only; reorder or split change is a `Conflict`; renames carry only labels. Audit group C. Spec section 12.
+- command-drift = D54 (2026-09-07): `plan` compares a serve pane's live command to its declared argv and emits `RestartCommand` with reason `drifted`; `status` shows `drift`. Audit group D. Spec section 12.
+- identity-beyond-id = D55 (2026-09-07): managed profiles record their target and resources record label and cwd; a different target starts fresh; `prune_missing` drops a reused id whose live label or cwd contradicts the record; contract test checks field shapes. Audit group E. Spec section 13.
+
+## 2026-09-07 eventlog CLI migration
+
+- reactor-runtime = eventlog-cli-native-react (event 473): the user authorized replacing removed shell helpers with the `eventlog` CLI from the sibling `../event-log` project. Native `eventlog react` owns locking, supervision, intent, resume and acknowledgments; repository scripts supply scoped actions. Contract: `.context/handoffs/eventlog-migration.md`.
+- Implementation uses Codex gpt-5.6-terra/high in its own worktree and Herdr workspace; independent review uses gpt-5.6-sol/high in a separate worktree and workspace. Composer 2.5 Fast and Claude Sonnet remain the committer and documentation models.
+- The controller owns this user-authorized live cutover. The old reactors were idle and stopped gracefully in their existing maintenance panes; their shutdown handlers released their locks. No locks or log history are manually deleted. Outstanding acknowledgments and documentation work must be reconciled from evidence before any checkpoint is advanced.
+
+## 2026-09-07 reusable infrastructure scope correction
+
+The user clarified that eventlog must set up and maintain infrastructure across
+arbitrary repositories and Drovefiles, without repeating the engineering done
+here. Reusable reactor actions, lifecycle/setup support, runtime fixes, and
+validation belong in `../event-log` and its distributed skill. Drove is a
+consumer and migration acceptance case. The three Drove migration worktrees
+are archived and unregistered, and their worker workspaces are closed; their
+drafts are not accepted or ready for cutover. See `.context/reports/eventlog-handoff.md`.
+No new per-project reactor framework should be landed here.
+
+## D56 — Upstream consumer cutover (2026-09-07)
+
+Use eventlog setup and its generated helper, native react, and lifecycle commands. Preserve Composer 2.5 Fast for commit authorship and Claude Sonnet for documentation; model labels alone do not select an invocation. Retire removed shell-helper references and local reactor machinery. Preserve log history and inherited dirty artifacts; recover the audited commit prefix only with reachable Git evidence and exact-path backlog results. Validate recovery on disposable copies before the authorized live cutover. The Drove controller exclusively owns this log; upstream changes belong to the event-log coordinator.
