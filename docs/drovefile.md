@@ -146,6 +146,8 @@ Reordering panes within a tab, or changing its `split` direction, while keeping 
 
 A `serve` pane is also checked against what the backend actually reports running, independent of whether anything in the Drovefile changed: if the live command doesn't match the declared `serve` argv (after trimming whitespace and unwrapping a `sh -c "..."`/`bash -c "..."`/`zsh -c "..."` wrapper), or nothing is running at all, `plan`/`status`/`up` reports `RestartCommand` with a reason starting `drifted: `.
 
+On the Herdr backend, applying `RestartCommand` never types into a pane that is still busy. It interrupts the pane's foreground job once (`ctrl+c`) and polls until the pane reports back to its own shell. Only then does it send the replacement command, in one atomic step. If the pane hasn't returned to a shell within 10 seconds, the old command keeps running and the apply fails with "did not return to its shell after interrupt; command not sent". If the pane's foreground process is a program running directly in place of a shell, the apply fails immediately with "cannot restart in place" instead of interrupting it. A restart needs a shell to return to, so `create_pane` and `create_tab` always open a pane with an interactive shell first, then type its `command`, if any, into that shell — rather than starting the pane with the command already in place.
+
 ## Agents
 
 An agent is a property of its pane:
