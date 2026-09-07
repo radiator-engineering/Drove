@@ -533,7 +533,7 @@ struct ApplyState {
 /// order. A flavor action on a backend without that flavor is surfaced as
 /// [`Outcome::Unsupported`] and the loop continues, so core resources in the
 /// same plan are still created (D29). Destructive actions are always applied;
-/// [`up`] uses [`apply_plan_gated`] instead to hold them behind `--yes`.
+/// [`up`] uses `apply_plan_gated` instead to hold them behind `--yes`.
 pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Result<Vec<(String, Outcome)>> {
     Ok(apply_plan_gated(backend, ir, plan, true)?.0)
 }
@@ -838,6 +838,30 @@ fn record_ownership(
                         },
                     ));
                 }
+                // A fresh `CreateTab` builds every pane in the group with no
+                // per-pane action, so record each one here (its parent is the
+                // group) — otherwise the next run would see them unobserved
+                // and split them in again.
+                if action.kind == Action::Herdr(HerdrAction::CreateTab)
+                    && let Ok(group) = placement_group(ir, address)
+                {
+                    for pane in &group.panes {
+                        if let Ok(digest) = digest_of(ir, "pane", pane) {
+                            let backend_id = resolve(pane, &applied.pane_ids, None);
+                            changes.push(Change::Upsert(
+                                pane.clone(),
+                                ManagedResource {
+                                    kind: "pane".into(),
+                                    backend_id,
+                                    parent: Some(address.to_owned()),
+                                    digest: digest.to_owned(),
+                                    adopted: None,
+                                    last_outcome: None,
+                                },
+                            ));
+                        }
+                    }
+                }
             }
             Action::Core(
                 CoreAction::CreatePane | CoreAction::RenamePane | CoreAction::RestartCommand,
@@ -1023,8 +1047,26 @@ fn apply_herdr(
         HerdrAction::CreateTab => {
             let group = placement_group(ir, &action.address)?;
             let workspace_id = backend_id(state.workspace_ids.get(&group.workspace), action)?;
-            let tab_id = ext.create_tab(&workspace_id, &group.label, group.split, &group.ratios)?;
-            state.group_ids.insert(action.address.clone(), tab_id);
+            // A fresh group plans one `CreateTab` and no per-pane splits, so
+            // this builds the whole tab: every declared pane, then the ratios.
+            let specs = group
+                .panes
+                .iter()
+                .map(|pane| pane_spec(ir, pane))
+                .collect::<Result<Vec<_>>>()?;
+            let layout = ext.create_tab(
+                &workspace_id,
+                &group.label,
+                group.split,
+                &group.ratios,
+                &specs,
+            )?;
+            state
+                .group_ids
+                .insert(action.address.clone(), layout.tab_id);
+            for (pane, pane_id) in group.panes.iter().zip(layout.pane_ids) {
+                state.pane_ids.insert(pane.clone(), pane_id);
+            }
             Ok(Outcome::Applied)
         }
         HerdrAction::RenameTab => {
@@ -1099,8 +1141,15 @@ fn pane_create_inputs(ir: &Ir, state: &ApplyState, pane: &str) -> Result<(String
         .get(&group.workspace)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("workspace `{}` has no backend id yet", group.workspace))?;
+    Ok((workspace_id, pane_spec(ir, pane)?))
+}
+
+/// The [`PaneSpec`] for one declared pane: its label, cwd, command and env,
+/// independent of any workspace backend id (used when building the panes of a
+/// fresh Herdr tab up front, before their splits run).
+fn pane_spec(ir: &Ir, pane: &str) -> Result<PaneSpec> {
     let fields = resource_fields(ir, "pane", pane)?;
-    let spec = PaneSpec {
+    Ok(PaneSpec {
         label: string_field(fields, "label").or_else(|| Some(pane.to_owned())),
         cwd: string_field(fields, "cwd").map(std::path::PathBuf::from),
         command: {
@@ -1108,8 +1157,7 @@ fn pane_create_inputs(ir: &Ir, state: &ApplyState, pane: &str) -> Result<(String
             (!argv.is_empty()).then_some(argv)
         },
         env: string_map(fields, "env"),
-    };
-    Ok((workspace_id, spec))
+    })
 }
 
 /// The first `serve` candidate's argv (D8: `any_of` tries them in order; the
@@ -1810,10 +1858,23 @@ mod tests {
             workspace_id: &str,
             label: &str,
             _split: crate::backend::Split,
-            _ratios: &[f64],
-        ) -> Result<String> {
+            ratios: &[f64],
+            panes: &[PaneSpec],
+        ) -> Result<crate::backend::TabLayout> {
             self.record(format!("create_tab:{workspace_id}:{label}"));
-            Ok(self.id("t"))
+            let tab_id = self.id("t");
+            let pane_ids = panes
+                .iter()
+                .map(|spec| {
+                    let pane_label = spec.label.clone().unwrap_or_default();
+                    self.record(format!("tab_pane:{tab_id}:{pane_label}"));
+                    self.id("p")
+                })
+                .collect();
+            if !ratios.is_empty() {
+                self.record(format!("set_ratio:{tab_id}"));
+            }
+            Ok(crate::backend::TabLayout { tab_id, pane_ids })
         }
         fn split_pane(
             &self,
@@ -2054,6 +2115,87 @@ mod tests {
         assert!(
             backend.calls().is_empty(),
             "an unstartable session applies nothing and focuses nothing"
+        );
+    }
+
+    #[test]
+    fn up_builds_a_fresh_multi_pane_tab_and_records_every_pane() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{
+                    "name": "main",
+                    "split": "right",
+                    "ratios": [0.67],
+                    "panes": [{"name": "editor"}, {"name": "tests"}],
+                }]
+            }]
+        }));
+        let ir = profile.to_ir();
+        // A fresh group plans one CreateTab and no per-pane splits.
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Herdr(HerdrAction::CreateTab), "dev/main"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        // Both declared panes are built as part of the one CreateTab, and the
+        // ratio is applied once (the executor never emits a bare set_ratio on
+        // a one-pane Herdr tab).
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_tab:")),
+            "the Herdr tab must be created: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("tab_pane:")).count(),
+            2,
+            "both panes must be built into the tab: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("set_ratio:")),
+            "the ratio must be applied: {calls:?}"
+        );
+
+        // The group and each pane are recorded, so a second run sees them
+        // owned instead of splitting them in again.
+        let managed = state.profile("default").expect("profile recorded");
+        assert!(managed.resources.contains_key("dev/main"), "group recorded");
+        assert!(
+            managed.resources.contains_key("editor"),
+            "first pane recorded"
+        );
+        assert!(
+            managed.resources.contains_key("tests"),
+            "second pane recorded"
+        );
+        assert_eq!(
+            report.outcome,
+            UpOutcome::Reconciled {
+                created: 2,
+                changed: 0,
+                tasks_run: 0
+            }
         );
     }
 

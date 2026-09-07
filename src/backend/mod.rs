@@ -126,17 +126,34 @@ pub enum SessionState {
     CannotStart { hint: String },
 }
 
+/// The result of building a fresh Herdr tab ([`HerdrExt::create_tab`]): the
+/// new Herdr tab's backend id, and the backend ids of the panes it holds in
+/// the declared order they were created. The caller records these so a later
+/// run sees the Herdr tab and its panes as owned rather than remaking them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabLayout {
+    pub tab_id: String,
+    pub pane_ids: Vec<String>,
+}
+
 /// The Herdr flavor: tabs, splits, ratios, agent start, plus the session and
 /// focus verbs `drove up` drives — verbs only Herdr implements (spec §3, D28,
 /// D44). Reached through [`Backend::herdr`].
 pub trait HerdrExt {
+    /// Builds a fresh Herdr tab holding `panes` in declared order, split in
+    /// `split`, then applies `ratios`. Herdr has no empty tab, so the first
+    /// pane opens the Herdr tab and the rest are split into it; `ratios` are
+    /// applied only after every split gap exists (a fresh group plans one
+    /// `CreateTab`, never per-pane splits). Returns the Herdr tab and pane
+    /// backend ids (D29).
     fn create_tab(
         &self,
         workspace_id: &str,
         label: &str,
         split: Split,
         ratios: &[f64],
-    ) -> Result<String>;
+        panes: &[PaneSpec],
+    ) -> Result<TabLayout>;
 
     fn split_pane(&self, tab_id: &str, spec: &PaneSpec, split: Split) -> Result<String>;
 
