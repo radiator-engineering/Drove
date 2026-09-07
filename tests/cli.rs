@@ -525,7 +525,21 @@ fn down_with_no_declared_session_never_touches_herdr() {
 
     let mut command = Command::cargo_bin("drove").expect("binary");
     command
-        .args(["--file", drovefile.to_str().expect("UTF-8 path"), "down"])
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            // No session is declared, so the default socket resolution
+            // (D50's live-snapshot probe) would otherwise reach whatever
+            // ambient Herdr session the test happens to run inside; pin it
+            // to a socket nothing is listening on so the test is hermetic.
+            "--socket",
+            directory
+                .path()
+                .join("missing.sock")
+                .to_str()
+                .expect("UTF-8 socket"),
+            "down",
+        ])
         .env("DROVE_STATE_HOME", directory.path().join("state"))
         .env("HERDR_BIN_PATH", &herdr)
         .env_remove("HERDR_SESSION")
@@ -538,7 +552,14 @@ fn down_with_no_declared_session_never_touches_herdr() {
         .stdout(predicate::str::contains(
             "nothing owned by profile `default`",
         ))
-        .stdout(predicate::str::contains("session").not());
+        // D50: nothing is listening on the pinned socket, so the
+        // live-snapshot probe fails and prints its own warning; that
+        // warning is not a session stop/delete.
+        .stdout(predicate::str::contains(
+            "warning: session not reachable; detaching without closing panes",
+        ))
+        .stdout(predicate::str::contains("stopped session").not())
+        .stdout(predicate::str::contains("deleted session").not());
 }
 
 #[test]
@@ -567,7 +588,13 @@ fn down_never_touches_the_default_session() {
         .stdout(predicate::str::contains(
             "nothing owned by profile `default`",
         ))
-        .stdout(predicate::str::contains("session").not());
+        // D50: the same unreachable-snapshot warning as above; `default` is
+        // still never stopped or deleted (D47).
+        .stdout(predicate::str::contains(
+            "warning: session not reachable; detaching without closing panes",
+        ))
+        .stdout(predicate::str::contains("stopped session").not())
+        .stdout(predicate::str::contains("deleted session").not());
 }
 
 #[cfg(unix)]
@@ -635,6 +662,172 @@ fn down_with_a_missing_herdr_binary_still_reports_the_detach_then_fails() {
             "nothing owned by profile `default`",
         ))
         .stderr(predicate::str::contains("cannot run the herdr binary"));
+}
+
+// D50: `down` never aborts on a resource the session already lost (issue
+// 29). `executor::down` used to call `close_pane` for every recorded pane
+// under `--purge`, and the first `pane_not_found` aborted the teardown
+// before anything was detached or saved, and before the D47 session stop
+// ran. `down_command` now prunes the managed profile against the live
+// snapshot the same way `up_command` does after D48, so a pane the session
+// no longer has is detached from state without ever reaching the backend.
+
+fn write_state_with_stale_pane(state_home: &Path, repo_root: &Path) {
+    let state_path = state_file_path(state_home, repo_root);
+    fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
+    let state = json!({
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "profiles": {
+            "default": {
+                "desired_digest": "",
+                "resources": {
+                    "dev": {
+                        "kind": "workspace",
+                        "backend_id": "w1",
+                        "parent": null,
+                        "digest": "digest",
+                        "adopted": null,
+                        "last_outcome": null,
+                    },
+                    "dev/main": {
+                        "kind": "placement",
+                        "backend_id": "w1:t1",
+                        "parent": "dev",
+                        "digest": "digest",
+                        "adopted": null,
+                        "last_outcome": null,
+                    },
+                    "gitlog": {
+                        "kind": "pane",
+                        "backend_id": "w1:p8",
+                        "parent": "dev/main",
+                        "digest": "digest",
+                        "adopted": null,
+                        "last_outcome": null,
+                    }
+                },
+            }
+        },
+        "approvals": [],
+        "journal": [],
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state file");
+}
+
+#[test]
+fn down_purge_prunes_a_pane_the_session_already_lost_instead_of_aborting() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev", tabs = [tab(name = "main", panes = [
+            pane(name = "gitlog"),
+        ])]),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_stale_pane(&state_home, directory.path());
+
+    // The session still has the workspace and its tab, but not the pane
+    // (`w1:p8`) local state recorded — the live failure from issue 29.
+    let socket = directory.path().join("herdr.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({
+            "version": "0.8.2",
+            "protocol": 1,
+            "workspaces": [{"workspace_id": "w1", "label": "dev", "tokens": {}}],
+            "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "main"}],
+            "panes": [],
+            "agents": [],
+        }),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "down",
+            "--purge",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pruned gitlog (not in session)"));
+    server.join().expect("fake Herdr server thread");
+
+    let state_path = state_file_path(&state_home, directory.path());
+    let saved: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read state")).expect("state JSON");
+    assert_eq!(saved["profiles"]["default"]["resources"], json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+fn down_warns_and_still_stops_the_session_when_it_is_unreachable() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        "herdr.session(\"x\")\nprofile(name = \"default\")",
+    )
+    .expect("Drovefile");
+    let log = directory.path().join("argv.log");
+    let herdr = write_fake_herdr(directory.path(), &log, "exit 0");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            directory
+                .path()
+                .join("missing.sock")
+                .to_str()
+                .expect("UTF-8 socket"),
+            "down",
+        ])
+        .env("DROVE_STATE_HOME", directory.path().join("state"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_SESSION")
+        .env_remove("RADIATOR_HUB")
+        .env_remove("DROVE_BACKEND")
+        .env_remove("DROVE_SESSION")
+        .env_remove("DROVE_TARGET")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "warning: session not reachable; detaching without closing panes",
+        ))
+        .stdout(predicate::str::contains("stopped session x"));
+
+    let calls = fs::read_to_string(&log).expect("argv log");
+    let mut lines = calls.lines();
+    assert_eq!(lines.next(), Some("session stop x --json"));
+    assert_eq!(lines.next(), Some("session delete x --json"));
+    assert_eq!(lines.next(), None);
 }
 
 // D48: local state is pruned against the live backend snapshot before a

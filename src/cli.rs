@@ -517,13 +517,22 @@ fn lint_command(profile: &Profile, repo_root: &Path, json: bool) -> Result<ExitC
     Ok(ExitCode::SUCCESS)
 }
 
-/// `drove down` (D19, D47): runs every `on_stop` hook and detaches every
-/// owned resource, then — on the Herdr backend, when the resolved target
-/// names a session other than `default` (D46 precedence) — stops and
+/// `drove down` (D19, D47, D50): runs every `on_stop` hook and detaches
+/// every owned resource, then — on the Herdr backend, when the resolved
+/// target names a session other than `default` (D46 precedence) — stops and
 /// deletes that session. The detach is saved to local state before the
 /// session is touched, so a `stop_session` failure (a missing `herdr`
 /// binary, or a failed delete) still leaves the resources detached and a
 /// retry of `down` idempotent.
+///
+/// Before tearing anything down, the live snapshot is fetched (D50) the same
+/// way `up_command` does after D48, and the managed profile is pruned
+/// against it: a resource the session no longer has is detached from state
+/// without any backend call, reported under `pruned`, so a session that
+/// already lost a pane never makes `down` abort. When the snapshot can't be
+/// fetched at all (the session isn't running), `down` proceeds without a
+/// backend — no `close_pane` calls — and warns; the D47 session stop still
+/// runs below.
 fn down_command(
     profile: &Profile,
     backend_id: &str,
@@ -540,14 +549,41 @@ fn down_command(
         profile: &profile.name,
         runner: &HostCommandRunner,
     };
-    let backend: Option<&dyn Backend> = if purge { Some(client.as_ref()) } else { None };
+
+    let live_snapshot = client.snapshot();
+    let session_unreachable = live_snapshot.is_err();
+    let mut pruned: Vec<String> = Vec::new();
+    if let Ok(live_snapshot) = &live_snapshot {
+        let managed = state.profile(&profile.name).cloned().unwrap_or_default();
+        let (pruned_profile, dropped) = crate::state::prune_missing(&managed, live_snapshot);
+        if !dropped.is_empty() {
+            state.profiles.insert(profile.name.clone(), pruned_profile);
+            state.save()?;
+            pruned = dropped;
+        }
+    }
+
+    let backend: Option<&dyn Backend> = if purge && !session_unreachable {
+        Some(client.as_ref())
+    } else {
+        None
+    };
     let report = down(profile, &ctx, &mut state, yes, purge, backend)?;
 
     if !json {
+        if session_unreachable {
+            println!("warning: session not reachable; detaching without closing panes");
+        }
+        for id in &pruned {
+            println!("pruned {id} (not in session)");
+        }
         for id in &report.detached {
             println!("detached {id}");
         }
-        if report.detached.is_empty() {
+        for (id, message) in &report.close_failed {
+            println!("warning: could not close {id}: {message}");
+        }
+        if report.detached.is_empty() && pruned.is_empty() {
             println!("nothing owned by profile `{}`", profile.name);
         }
     }
@@ -567,6 +603,10 @@ fn down_command(
             "detached": report.detached,
             "hooks_run": report.hooks_run.iter().map(|(name, success)| {
                 serde_json::json!({"resource": name, "success": success})
+            }).collect::<Vec<_>>(),
+            "pruned": pruned,
+            "close_failed": report.close_failed.iter().map(|(id, error)| {
+                serde_json::json!({"id": id, "error": error})
             }).collect::<Vec<_>>(),
         });
         if let Some((name, stop)) = &session {

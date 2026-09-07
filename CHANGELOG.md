@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `drove down --purge` no longer aborts when the session has already lost a
+  resource it recorded: the pane, tab, or workspace is pruned from local
+  state instead of aborting on `pane_not_found`, and a `close_pane` failure
+  for a resource that's still there no longer stops the teardown either
+  (#29).
+
 ## [0.1.1] - 2026-09-07
 
 ### Added
