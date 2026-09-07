@@ -1,0 +1,23 @@
+.context/handoffs/pr24-down-session.md
+  s_cb2150f40e2ee6::t_4160caa7eb22f0 1-23
+.context/DECISIONS.md
+  s_cb2150f40e2ee6::t_fb41c0d297f826 93
+docs/superpowers/specs/2026-09-06-drove-v4-one-command-design.md
+  s_cb2150f40e2ee6::t_fb41c0d297f826 112-148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "bf2589f24a161cae3e0b748b4d02afe66086ba56",
+  "prompts": {},
+  "sessions": {
+    "s_cb2150f40e2ee6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e664b5f2-82b7-44ad-88c5-dfa8273d9611",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
