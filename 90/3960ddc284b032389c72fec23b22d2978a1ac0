@@ -1,0 +1,89 @@
+.context/handoffs/pr14-was-rename.md
+  s_d653f929eefc31::t_8544c98321a35a 1-27
+.context/handoffs/recon-herdr-api.md
+  s_d653f929eefc31::t_8544c98321a35a 1-30
+.context/handoffs/recon-prior-art.md
+  s_d653f929eefc31::t_8544c98321a35a 1-22
+.context/handoffs/radiator-hub-protocol.md
+  s_d653f929eefc31::t_8544c98321a35a 1-18
+.context/handoffs/pr12-backend-select.md
+  s_d653f929eefc31::t_8544c98321a35a 1-26
+.context/handoffs/pr19-ambient-env.md
+  s_d653f929eefc31::t_8544c98321a35a 1-20
+.context/handoffs/recon-radiator-gaps.md
+  s_d653f929eefc31::t_8544c98321a35a 1-17
+.context/handoffs/pr1-model-ir.md
+  s_d653f929eefc31::t_8544c98321a35a 1-28
+.context/handoffs/recon-dsl-critique.md
+  s_d653f929eefc31::t_8544c98321a35a 1-25
+.context/handoffs/recon-forward-build-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-349
+.context/handoffs/recon-radiator-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-297
+.context/handoffs/pr13-dsl-v3.md
+  s_d653f929eefc31::t_8544c98321a35a 1-28
+.context/handoffs/pr16-profile-targets.md
+  s_d653f929eefc31::t_8544c98321a35a 1-25
+.context/DECISIONS.md
+  s_d653f929eefc31::t_8544c98321a35a 92
+.context/handoffs/pr18-dogfood.md
+  s_d653f929eefc31::t_8544c98321a35a 1-19
+.context/handoffs/recon-radiator-gaps-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-56
+.context/handoffs/recon-radiator.md
+  s_d653f929eefc31::t_8544c98321a35a 1-25
+.context/handoffs/pr10-radiator-catchup.md
+  s_d653f929eefc31::t_8544c98321a35a 1-27
+.context/handoffs/recon-prior-art-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-277
+.context/handoffs/pr17-one-command-up.md
+  s_d653f929eefc31::t_8544c98321a35a 1-27
+.context/handoffs/recon-setup-skill.md
+  s_d653f929eefc31::t_8544c98321a35a 1-23
+.context/handoffs/ci-setup.md
+  s_d653f929eefc31::t_8544c98321a35a 1-17
+.context/handoffs/pr3-herdr-backend.md
+  s_d653f929eefc31::t_8544c98321a35a 1-20
+.context/handoffs/pr5-radiator-backend.md
+  s_d653f929eefc31::t_8544c98321a35a 1-22
+.context/handoffs/pr-review-template.md
+  s_d653f929eefc31::t_8544c98321a35a 1-20
+.context/handoffs/pr11-backend-seam.md
+  s_d653f929eefc31::t_8544c98321a35a 1-32
+.context/handoffs/scaffold-hardening.md
+  s_d653f929eefc31::t_8544c98321a35a 1-500
+.context/handoffs/recon-dsl-critique-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-199
+.context/handoffs/recon-forward-build.md
+  s_d653f929eefc31::t_8544c98321a35a 1-33
+.context/handoffs/pr-tasks-hooks.md
+  s_d653f929eefc31::t_8544c98321a35a 1-18
+.context/handoffs/pr15-docs-reframe.md
+  s_d653f929eefc31::t_8544c98321a35a 1-26
+.context/handoffs/recon-setup-skill-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-173
+.context/handoffs/release-prep.md
+  s_d653f929eefc31::t_8544c98321a35a 1-27
+.context/handoffs/pr9-windows.md
+  s_d653f929eefc31::t_8544c98321a35a 1-24
+.context/handoffs/recon-herdr-api-report.md
+  s_d653f929eefc31::t_8544c98321a35a 1-300
+.context/handoffs/pr2-planner.md
+  s_d653f929eefc31::t_8544c98321a35a 1-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "903960ddc284b032389c72fec23b22d2978a1ac0",
+  "prompts": {},
+  "sessions": {
+    "s_d653f929eefc31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "76e0448a-8170-417d-9202-0a1e289ba475",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
