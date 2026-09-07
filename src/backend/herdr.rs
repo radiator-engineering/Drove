@@ -1879,7 +1879,31 @@ exit 0"#,
         .expect("write fake herdr script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
             .expect("make fake herdr script executable");
+        warm_up(&script);
+        // The warm-up run above may have appended to `log`; the caller's
+        // assertions expect it to start empty.
+        let _ = fs::write(log, "");
         script
+    }
+
+    /// A parallel `cargo test` run occasionally hits Linux's `ETXTBSY`
+    /// ("text file busy", os error 26) execing a script immediately after
+    /// writing and chmod'ing it — a known kernel race between another
+    /// thread's fork() and this file's write-fd closing. Retrying a
+    /// throwaway invocation until it succeeds settles the race before the
+    /// real test calls into `run_stop_session`.
+    #[cfg(unix)]
+    fn warm_up(script: &Path) {
+        for _ in 0..50 {
+            match Command::new(script).arg("--warmup").output() {
+                Ok(_) => return,
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("warm up fake herdr script: {error}"),
+            }
+        }
+        panic!("fake herdr script stayed text-busy after 50 retries");
     }
 
     #[test]
