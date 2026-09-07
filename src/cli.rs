@@ -348,10 +348,17 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         cli.command,
         Some(Command::Status { .. }) | Some(Command::Plan { .. })
     ));
-    // Only `status` annotates what the prune dropped (D48); `plan` renders
-    // the plan alone, unchanged.
+    // Only `status` annotates what the prune dropped (D48) and any
+    // interrupted journal entry (D52 point 4); `plan` renders the plan
+    // alone, unchanged.
     let is_status = matches!(cli.command, Some(Command::Status { .. }));
-    print_plan(&plan, cli.json, is_status.then_some(dropped.as_slice()))?;
+    let interrupted = state.interrupted();
+    print_plan(
+        &plan,
+        cli.json,
+        is_status.then_some(dropped.as_slice()),
+        is_status.then_some(interrupted.as_slice()),
+    )?;
     print_warnings(&compiled.warnings);
     Ok(if plan.status == SyncStatus::InSync {
         ExitCode::SUCCESS
@@ -445,6 +452,12 @@ fn run_command(
             Ok(ExitCode::SUCCESS)
         }
         Some(name) => {
+            // D52 point 4: a previous `run` of this task began but never
+            // recorded completion (killed mid-execution) — say so before
+            // rerunning it, instead of silently retrying.
+            if !json && state.has_interrupted(&format!("task:{name}")) {
+                println!("previous run of {name} did not finish; rerunning");
+            }
             let ctx = ExecutionContext {
                 repo_root,
                 profile: &profile.name,
@@ -682,7 +695,7 @@ fn up_command(
         .iter()
         .any(|action| action.kind == Action::Core(CoreAction::Conflict))
     {
-        print_plan(&plan, json, None)?;
+        print_plan(&plan, json, None, None)?;
         return Ok(ExitCode::from(2));
     }
 
@@ -750,12 +763,25 @@ fn up_command(
     }
 
     print_up_summary(profile, &report, json)?;
+    // D52 point 3: one line per failure and per skip, printed after the
+    // summary and after everything already applied has been saved.
+    if !json {
+        for failure in &report.failed {
+            println!("failed: {}: {}", failure.address, failure.error);
+        }
+        for skip in &report.skipped {
+            println!("skipped: {}: depends on {}", skip.address, skip.depends_on);
+        }
+    }
 
     let blocked = report.blocked_destructive
-        || report
-            .tasks
-            .iter()
-            .any(|(_, outcome)| matches!(outcome, TaskOutcome::Blocked | TaskOutcome::Ran(false)));
+        || !report.failed.is_empty()
+        || report.tasks.iter().any(|(_, outcome)| {
+            matches!(
+                outcome,
+                TaskOutcome::Blocked | TaskOutcome::Ran(false) | TaskOutcome::DependencySkipped
+            )
+        });
     if blocked {
         if report.blocked_destructive {
             eprintln!(
@@ -782,10 +808,22 @@ fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> ser
             |(name, outcome)| serde_json::json!({"task": name, "outcome": outcome_label(*outcome)}),
         )
         .collect();
+    let failed: Vec<_> = report
+        .failed
+        .iter()
+        .map(|failure| serde_json::json!({"action": failure.address, "error": failure.error}))
+        .collect();
+    let skipped: Vec<_> = report
+        .skipped
+        .iter()
+        .map(|skip| serde_json::json!({"action": skip.address, "depends_on": skip.depends_on}))
+        .collect();
     let mut object = serde_json::json!({
         "profile": profile.name,
         "focused": report.focused,
         "tasks": tasks,
+        "failed": failed,
+        "skipped": skipped,
     });
     match &report.outcome {
         UpOutcome::Reconciled {
@@ -793,7 +831,11 @@ fn up_summary_json(profile: &Profile, report: &crate::executor::UpReport) -> ser
             changed,
             tasks_run,
         } => {
-            object["status"] = serde_json::json!("in_sync");
+            object["status"] = if report.failed.is_empty() {
+                serde_json::json!("in_sync")
+            } else {
+                serde_json::json!("partial_failure")
+            };
             object["created"] = serde_json::json!(created);
             object["changed"] = serde_json::json!(changed);
             object["tasks_run"] = serde_json::json!(tasks_run);
@@ -821,10 +863,17 @@ fn print_up_summary(
             created,
             changed,
             tasks_run,
-        } => println!(
-            "profile {}: {created} created, {changed} changed, {tasks_run} tasks run, in sync",
-            profile.name
-        ),
+        } => {
+            let sync_word = if report.failed.is_empty() {
+                "in sync"
+            } else {
+                "partial failure"
+            };
+            println!(
+                "profile {}: {created} created, {changed} changed, {tasks_run} tasks run, {sync_word}",
+                profile.name
+            )
+        }
         UpOutcome::AlreadyRunning => {
             println!(
                 "profile {}: already running, brought to front",
@@ -877,7 +926,7 @@ fn report_task_outcomes(results: &[(String, TaskOutcome)], json: bool) -> Result
     for (_, outcome) in results {
         match outcome {
             TaskOutcome::Blocked => blocked = true,
-            TaskOutcome::Ran(false) => failed = true,
+            TaskOutcome::Ran(false) | TaskOutcome::DependencySkipped => failed = true,
             _ => {}
         }
     }
@@ -907,6 +956,7 @@ fn outcome_label(outcome: TaskOutcome) -> &'static str {
         TaskOutcome::Ran(true) => "ran",
         TaskOutcome::Ran(false) => "failed",
         TaskOutcome::Blocked => "blocked",
+        TaskOutcome::DependencySkipped => "dependency_skipped",
     }
 }
 
@@ -917,6 +967,9 @@ fn describe_outcome(name: &str, outcome: TaskOutcome) -> String {
         TaskOutcome::Ran(false) => format!("{name}: failed"),
         TaskOutcome::Blocked => {
             format!("{name}: blocked (needs approval; re-run with --yes)")
+        }
+        TaskOutcome::DependencySkipped => {
+            format!("{name}: skipped (an `after` prerequisite did not succeed)")
         }
     }
 }
@@ -971,19 +1024,36 @@ fn backend_socket_display(backend_id: &str, target: &select::Target) -> PathBuf 
 /// backend id no longer exists in the live snapshot, so the plan below now
 /// recreates them. `pruned` is `None` for every caller but `status`, so
 /// `plan`'s JSON output carries no `"pruned"` key and is unchanged.
-fn print_plan(plan: &Plan, json: bool, pruned: Option<&[String]>) -> Result<()> {
+fn print_plan(
+    plan: &Plan,
+    json: bool,
+    pruned: Option<&[String]>,
+    interrupted: Option<&[(&str, &str)]>,
+) -> Result<()> {
     if json {
         let mut value = serde_json::to_value(plan)?;
-        if let Some(pruned) = pruned
-            && let Some(object) = value.as_object_mut()
-        {
-            object.insert("pruned".into(), serde_json::json!(pruned));
+        if let Some(object) = value.as_object_mut() {
+            if let Some(pruned) = pruned {
+                object.insert("pruned".into(), serde_json::json!(pruned));
+            }
+            if let Some(interrupted) = interrupted {
+                let rows: Vec<_> = interrupted
+                    .iter()
+                    .map(|(action, digest)| serde_json::json!({"action": action, "digest": digest}))
+                    .collect();
+                object.insert("interrupted".into(), serde_json::json!(rows));
+            }
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     for identity in pruned.unwrap_or_default() {
         println!("recreate {identity}: backend id no longer exists; recreating");
+    }
+    // D52 point 4: a journal entry an earlier apply began but never finished
+    // (a killed `run`/hook) is surfaced here instead of silently retried.
+    for (action, digest) in interrupted.unwrap_or_default() {
+        println!("interrupted {action} ({digest})");
     }
     print!("{}", plan.render());
     Ok(())
@@ -1470,6 +1540,8 @@ profile("default", workspaces = [control])
             tasks: Vec::new(),
             focused: Some("w1".to_owned()),
             blocked_destructive: false,
+            failed: Vec::new(),
+            skipped: Vec::new(),
         }
     }
 
@@ -1493,6 +1565,39 @@ profile("default", workspaces = [control])
         assert_eq!(object["changed"], 1);
         assert_eq!(object["tasks_run"], 3);
         assert_eq!(object["focused"], "w1");
+    }
+
+    #[test]
+    fn up_summary_json_carries_failed_and_skipped_actions() {
+        use crate::executor::{FailedAction, SkippedAction};
+
+        let profile = Profile {
+            name: "dev".into(),
+            ..Default::default()
+        };
+        let mut report = report(UpOutcome::Reconciled {
+            created: 1,
+            changed: 0,
+            tasks_run: 0,
+        });
+        report.failed.push(FailedAction {
+            address: "ops".into(),
+            error: "boom".into(),
+        });
+        report.skipped.push(SkippedAction {
+            address: "ops/main".into(),
+            depends_on: "ops".into(),
+        });
+
+        let object = up_summary_json(&profile, &report);
+        assert_eq!(object["failed"][0]["action"], "ops");
+        assert_eq!(object["failed"][0]["error"], "boom");
+        assert_eq!(object["skipped"][0]["action"], "ops/main");
+        assert_eq!(object["skipped"][0]["depends_on"], "ops");
+        assert_eq!(
+            object["status"], "partial_failure",
+            "a partial apply must not report in_sync"
+        );
     }
 
     #[test]
