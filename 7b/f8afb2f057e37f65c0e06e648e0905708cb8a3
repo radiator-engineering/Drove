@@ -1,0 +1,19 @@
+src/backend/mod.rs
+  s_4534414f58c9b6::t_eb2df378c9055f 206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7bf8afb2f057e37f65c0e06e648e0905708cb8a3",
+  "prompts": {},
+  "sessions": {
+    "s_4534414f58c9b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e7c0c8c-dcec-48d1-a8cd-bec70505b648",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
