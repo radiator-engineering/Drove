@@ -17,13 +17,13 @@ radiator.hub("main")      # Radiator flavor: which named hub
 A Drovefile may declare both flavor instances; only the active backend's declaration is used. A profile may also name its own session or hub (see `profile` below), overriding the file-level declaration for that profile only. The backend id and target instance resolve in this order, most specific first:
 
 1. CLI: `--backend <id>`, `--target <name>` (`--session` is a Herdr alias of `--target`; `--socket` is an explicit override).
-2. `DROVE_*` environment: `DROVE_BACKEND` (no `DROVE_*` variable names a target instance yet).
+2. Explicit environment: `DROVE_BACKEND`; `DROVE_SESSION` (a Herdr alias of `DROVE_TARGET`) and `DROVE_TARGET` mirror `--session`/`--target`.
 3. Profile: `profile(..., session = ..., backend = ...)`.
 4. Drovefile: `backend(...)`, `herdr.session(...)`, `radiator.hub(...)`.
-5. Ambient host environment: `HERDR_SESSION` or `RADIATOR_HUB` per backend; `HERDR_SOCKET_PATH` as before.
+5. Ambient host environment: `HERDR_SESSION` or `RADIATOR_HUB` per backend (and the ambient Radiator hub detection); `HERDR_SOCKET_PATH` as before.
 6. Built-in: backend `herdr`; Herdr session `default`; Radiator hub `main`.
 
-A Drovefile's declaration is a default that an explicit flag, `DROVE_BACKEND`, or a profile's own `session`/`backend` overrides. Ambient host environment (`HERDR_SESSION`, `RADIATOR_HUB`) ranks below the file, so a profile that names its own session is not silently redirected by whatever session the calling terminal happens to sit in — it only takes over when the Drovefile leaves the target unset.
+A Drovefile's declaration is a default that an explicit flag, `DROVE_BACKEND`/`DROVE_SESSION`/`DROVE_TARGET`, or a profile's own `session`/`backend` overrides (D46). Ambient host environment (`HERDR_SESSION`, `RADIATOR_HUB`) ranks below the file: Herdr and Radiator export these into every pane they host, so without this ranking a profile's own `session` would be silently overridden by whichever session the calling terminal happens to sit in. It only takes over when the Drovefile leaves the target unset.
 
 ## `profile`
 
