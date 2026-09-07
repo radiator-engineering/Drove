@@ -348,6 +348,12 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
     // proposes detaching an identity a rename just migrated away from.
     let mut consumed_by_rename: BTreeSet<String> = BTreeSet::new();
 
+    // Panes the workspace `cwd`/`env` cascade below already closed and
+    // re-split: `plan_pane`/`plan_normal_pane` skip these, since the
+    // cascade's recreate already reflects each pane's current declaration
+    // (see the comment at the `cascaded.insert` call site).
+    let mut cascaded: BTreeSet<String> = BTreeSet::new();
+
     for resource in &ir.resources {
         if resource.kind == "workspace" {
             plan_workspace(
@@ -355,6 +361,7 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
                 profile,
                 snapshot,
                 &mut consumed_by_rename,
+                &mut cascaded,
                 &mut ranked,
             );
         }
@@ -373,12 +380,16 @@ pub fn build_plan(profile: &Profile, snapshot: &Snapshot) -> Result<Plan> {
             "pane" => {
                 let group_id = resource.parent.clone().unwrap_or_default();
                 let fresh = *group_fresh.get(&group_id).unwrap_or(&false);
+                let mut routing = PaneRouting {
+                    consumed_by_rename: &mut consumed_by_rename,
+                    cascaded: &cascaded,
+                };
                 plan_pane(
                     resource,
                     profile,
                     snapshot,
                     fresh,
-                    &mut consumed_by_rename,
+                    &mut routing,
                     &mut ranked,
                     &mut adopted,
                 );
@@ -449,6 +460,7 @@ fn plan_workspace(
     profile: &Profile,
     snapshot: &Snapshot,
     consumed_by_rename: &mut BTreeSet<String>,
+    cascaded: &mut BTreeSet<String>,
     ranked: &mut Vec<RankedAction>,
 ) {
     let id = resource.name.clone();
@@ -531,32 +543,60 @@ fn plan_workspace(
                     ));
                 }
                 // D53 point 2: `cwd`/`env` changing cascades the pane rule
-                // (point 1) to every pane that inherits it — a pane with no
-                // `cwd` of its own. Only fires when the category breakdown
-                // says so (a legacy digest never reaches here at all, see
-                // the `is_legacy_digest` guard above).
-                let place_changed = changed
+                // (point 1) to every pane that inherits the changed value —
+                // a pane with no `cwd` of its own inherits the workspace
+                // `cwd`; a pane with no `env` entries of its own inherits
+                // the workspace `env`. Checked per category, not together:
+                // a pane can own one and inherit the other, so a workspace
+                // `cwd`-only change must not cascade to a pane that only
+                // inherits `env` (and vice versa). Only fires when the
+                // category breakdown says so (a legacy digest never reaches
+                // here at all, see the `is_legacy_digest` guard above).
+                let ws_cwd_changed = changed
                     .as_ref()
-                    .is_some_and(|changed| changed.contains("cwd") || changed.contains("env"));
-                if place_changed && let Some(workspace) = workspace_by_name(profile, &id) {
+                    .is_some_and(|changed| changed.contains("cwd"));
+                let ws_env_changed = changed
+                    .as_ref()
+                    .is_some_and(|changed| changed.contains("env"));
+                if (ws_cwd_changed || ws_env_changed)
+                    && let Some(workspace) = workspace_by_name(profile, &id)
+                {
                     for pane in workspace.tabs.iter().flat_map(|group| &group.panes) {
-                        if pane.cwd.is_some() {
-                            continue; // has its own cwd; does not inherit
+                        let inherits_cwd = ws_cwd_changed && pane.cwd.is_none();
+                        let inherits_env = ws_env_changed && pane.env.is_empty();
+                        if !inherits_cwd && !inherits_env {
+                            continue;
                         }
                         let Some(pane_observed) = snapshot.resources.get(&pane.name) else {
-                            continue; // not created yet; the create picks up the new cwd
+                            continue; // not created yet; the create picks up the new value
                         };
                         if effective_owner(pane_observed, &profile.name).is_none() {
                             continue;
                         }
+                        let field = match (ws_cwd_changed, ws_env_changed) {
+                            (true, true) => "cwd/env",
+                            (true, false) => "cwd",
+                            (false, true) => "env",
+                            (false, false) => unreachable!(),
+                        };
                         push_close_and_split(
                             &pane.name,
                             pane_observed.backend_id.clone(),
                             format!(
-                                "workspace `{id}` cwd changed; a pane cannot change directory in place"
+                                "workspace `{id}` {field} changed; a pane cannot change directory or environment in place"
                             ),
                             ranked,
                         );
+                        // The per-pane rule (`plan_normal_pane`) recreates a
+                        // pane whose own digest changed or that moved
+                        // placement group; without this, a pane whose own
+                        // fields *also* changed (or that also moved) would
+                        // be recreated twice, or get a `RestartCommand`
+                        // against the backend id this cascade just closed.
+                        // The cascade's recreate already reflects the pane's
+                        // full current declaration, so the per-pane rule has
+                        // nothing left to add.
+                        cascaded.insert(pane.name.clone());
                     }
                 }
             }
@@ -657,6 +697,15 @@ fn plan_group(
     false
 }
 
+/// Bundles the two per-pane routing sets `plan_pane` threads through, so the
+/// function stays under clippy's argument-count limit.
+struct PaneRouting<'a> {
+    consumed_by_rename: &'a mut BTreeSet<String>,
+    /// Panes the workspace `cwd`/`env` cascade already closed and re-split
+    /// (see the `cascaded.insert` call site in `plan_workspace`).
+    cascaded: &'a BTreeSet<String>,
+}
+
 fn pane_serves(resource: &Resource) -> bool {
     resource
         .fields
@@ -671,11 +720,14 @@ fn plan_pane(
     profile: &Profile,
     snapshot: &Snapshot,
     group_fresh: bool,
-    consumed_by_rename: &mut BTreeSet<String>,
+    routing: &mut PaneRouting,
     ranked: &mut Vec<RankedAction>,
     adopted: &mut BTreeMap<String, bool>,
 ) {
     let id = resource.name.clone();
+    if routing.cascaded.contains(&id) {
+        return; // already closed and re-split by the workspace cascade
+    }
     let is_adopt = resource.fields.get("adopt").and_then(Value::as_str) == Some("caller");
     let serves = pane_serves(resource);
     let observed = snapshot.resources.get(&id);
@@ -700,10 +752,17 @@ fn plan_pane(
             }
             (Some(_), Some(owner)) => {
                 adopted.insert(resource.name.clone(), true);
-                if owner.digest != resource.digest
-                    && !is_legacy_digest(&owner.digest)
-                    && let Some(observed) = observed
-                {
+                let converged_by_digest =
+                    owner.digest == resource.digest || is_legacy_digest(&owner.digest);
+                if converged_by_digest {
+                    // Converged by digest: still worth a look at what's
+                    // actually running, for a serve pane (D54) — same as
+                    // the non-adopted path in `plan_normal_pane`, which an
+                    // adopted pane otherwise never reaches.
+                    if serves && let Some(observed) = observed {
+                        check_drift(&id, resource, observed, ranked);
+                    }
+                } else if let Some(observed) = observed {
                     push_pane_content_change(&id, observed, owner, resource, ranked);
                 }
             }
@@ -716,7 +775,7 @@ fn plan_pane(
                         profile,
                         snapshot,
                         serves,
-                        consumed_by_rename,
+                        routing.consumed_by_rename,
                         ranked,
                     );
                 }
@@ -734,7 +793,7 @@ fn plan_pane(
         profile,
         snapshot,
         serves,
-        consumed_by_rename,
+        routing.consumed_by_rename,
         ranked,
     );
 }
@@ -2131,7 +2190,73 @@ mod tests {
                     && a.address == "review"
                     && a.destructive
                     && a.reason
-                        == "workspace `dev` cwd changed; a pane cannot change directory in place")
+                        == "workspace `dev` cwd changed; a pane cannot change directory or environment in place")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Herdr(HerdrAction::SplitPane) && a.address == "review")
+        );
+    }
+
+    #[test]
+    fn workspace_env_change_cascades_to_an_inheriting_pane() {
+        let old = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "env": {"FOO": "a"},
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let new = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "env": {"FOO": "b"},
+                "tabs": [{"name": "main", "panes": [{"name": "review"}]}]
+            }]
+        }));
+        let old_ir = old.to_ir();
+        let snapshot = Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(&old_ir, "workspace", "dev"),
+            )
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                group_digest(&old_ir, "dev/main"),
+            )
+            .owned(
+                "pane",
+                "review",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "review"),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::RenameWorkspace) && a.address == "dev")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::ClosePane)
+                    && a.address == "review"
+                    && a.destructive
+                    && a.reason
+                        == "workspace `dev` env changed; a pane cannot change directory or environment in place")
         );
         assert!(
             plan.actions
@@ -2152,6 +2277,184 @@ mod tests {
                 .iter()
                 .any(|a| a.kind == Action::Core(CoreAction::RenameWorkspace)),
             "a pane-only change must not also rename the workspace: {plan:?}"
+        );
+    }
+
+    /// Compound case: a workspace `cwd` change cascades to an inheriting
+    /// pane at the same time that pane also moves to a different placement
+    /// group. Both `plan_workspace`'s cascade and `plan_normal_pane`'s own
+    /// parent-mismatch rule would otherwise close and re-split the same
+    /// pane independently — two `ClosePane`s racing to close a backend id
+    /// only the first one still finds live. The cascade must win outright,
+    /// not just first in rank order.
+    #[test]
+    fn cascade_and_a_placement_group_move_do_not_both_recreate_the_pane() {
+        let old = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "a",
+                "tabs": [
+                    {"name": "main", "panes": [{"name": "review"}]},
+                    {"name": "second", "panes": [{"name": "other"}]}
+                ]
+            }]
+        }));
+        let new = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "b",
+                "tabs": [
+                    {"name": "main", "panes": [{"name": "stub"}]},
+                    {"name": "second", "panes": [{"name": "other"}, {"name": "review"}]}
+                ]
+            }]
+        }));
+        let old_ir = old.to_ir();
+        let snapshot = Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(&old_ir, "workspace", "dev"),
+            )
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                group_digest(&old_ir, "dev/main"),
+            )
+            .owned(
+                "placement",
+                "dev/second",
+                "w1:t2",
+                Some("dev"),
+                "default",
+                group_digest(&old_ir, "dev/second"),
+            )
+            .owned(
+                "pane",
+                "review",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "review"),
+            )
+            .owned(
+                "pane",
+                "other",
+                "w1:p2",
+                Some("dev/second"),
+                "default",
+                pane_digest(&old_ir, "other"),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        let review_closes = plan
+            .actions
+            .iter()
+            .filter(|a| a.kind == Action::Core(CoreAction::ClosePane) && a.address == "review")
+            .count();
+        let review_splits = plan
+            .actions
+            .iter()
+            .filter(|a| a.kind == Action::Herdr(HerdrAction::SplitPane) && a.address == "review")
+            .count();
+        assert_eq!(
+            review_closes, 1,
+            "the cascade and the placement-group move must not both close `review`: {plan:?}"
+        );
+        assert_eq!(
+            review_splits, 1,
+            "the cascade and the placement-group move must not both re-split `review`: {plan:?}"
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::ClosePane)
+                    && a.address == "review"
+                    && a.reason.contains("cwd changed")),
+            "the surviving close should be the cascade's, not the placement-move's own: {plan:?}"
+        );
+    }
+
+    /// Compound case: a workspace `cwd` change cascades to an inheriting
+    /// serve pane whose live process has also drifted from what it
+    /// declares. The pane's own digest doesn't reflect an inherited `cwd`
+    /// (only the workspace's digest does), so before the cascade skip fix
+    /// `plan_normal_pane` would treat it as converged-by-digest and run
+    /// `check_drift` too, issuing a `RestartCommand` against the backend id
+    /// the cascade had just closed.
+    #[test]
+    fn cascade_and_command_drift_do_not_both_act_on_the_same_pane() {
+        let old = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "a",
+                "tabs": [{"name": "main", "panes": [{"name": "review", "serve": [["bash"]]}]}]
+            }]
+        }));
+        let new = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "cwd": "b",
+                "tabs": [{"name": "main", "panes": [{"name": "review", "serve": [["bash"]]}]}]
+            }]
+        }));
+        let old_ir = old.to_ir();
+        let snapshot = Snapshot::default()
+            .owned(
+                "workspace",
+                "dev",
+                "w1",
+                None,
+                "default",
+                resource_digest(&old_ir, "workspace", "dev"),
+            )
+            .owned(
+                "placement",
+                "dev/main",
+                "w1:t1",
+                Some("dev"),
+                "default",
+                group_digest(&old_ir, "dev/main"),
+            )
+            .owned(
+                "pane",
+                "review",
+                "w1:p1",
+                Some("dev/main"),
+                "default",
+                pane_digest(&old_ir, "review"),
+            )
+            .with_process_info(
+                "review",
+                Some(crate::backend::ProcessInfo {
+                    command: vec!["vim".into()],
+                    pid: Some(1),
+                }),
+            );
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == Action::Core(CoreAction::RestartCommand)),
+            "the cascade already recreates `review`; drift must not also restart it: {plan:?}"
+        );
+        assert_eq!(
+            plan.actions
+                .iter()
+                .filter(|a| a.address == "review")
+                .count(),
+            2,
+            "exactly the cascade's ClosePane and SplitPane, nothing else: {plan:?}"
         );
     }
 
