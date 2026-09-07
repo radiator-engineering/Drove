@@ -1,0 +1,20 @@
+docs/drovefile.md
+  s_d4b85cab015b24::t_99cc6705554a5c 149
+  s_d4b85cab015b24::t_6d4b7929ab75ac 150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "9b48d3adf8a4a09ebf07e71529e4e3a19d4f055e",
+  "prompts": {},
+  "sessions": {
+    "s_d4b85cab015b24": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2fbfee8c-1456-456d-8354-b1fa0f33466d",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
