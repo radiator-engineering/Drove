@@ -1,6 +1,8 @@
 //! Command-line interface.
 
 use std::{
+    ffi::OsString,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -12,8 +14,8 @@ use crate::{
     backend::{Backend, herdr, radiator, select},
     dsl::{compile, find_drovefile},
     executor::{
-        ExecutionContext, HostCommandRunner, TaskOutcome, down, execute_plan_tasks, list_tasks,
-        run_named_task,
+        ExecutionContext, HostCommandRunner, TaskOutcome, UpOutcome, down, list_tasks,
+        run_named_task, up,
     },
     model::{DroveConfig, Profile},
     planner::{Action, CoreAction, Plan, SyncStatus, build_plan},
@@ -77,15 +79,26 @@ enum Command {
     Status { profile: Option<String> },
     /// Print the ordered reconciliation plan.
     Plan { profile: Option<String> },
-    /// Reconcile the selected profile, then exit.
+    /// Reconcile the selected profile, bring its workspace to the front, and
+    /// (from outside Herdr) attach to the session.
     Up {
         /// Not yet implemented: the planner in this PR never proposes a replace.
         #[arg(long)]
         allow_replace: bool,
 
-        /// Approve any task `run`/hook argv this apply needs to execute.
+        /// Approve any task `run`/hook argv this apply needs to execute, and
+        /// any destructive backend action (D22).
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Workspace to bring to the front; defaults to the profile's first
+        /// declared workspace (D43 step 4).
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Reconcile only: do not focus a workspace or attach to the session.
+        #[arg(long)]
+        no_focus: bool,
 
         profile: Option<String>,
     },
@@ -272,6 +285,24 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         );
     }
 
+    // `drove` with no subcommand, and `drove up`, are the one command that
+    // gets you there (D43): they start the session if needed and apply the
+    // plan, so they route to `up_command` before the read-only reachability
+    // check below (which `plan`/`status` keep).
+    if let Some((yes, workspace, no_focus)) = up_flags(&cli.command) {
+        return up_command(
+            profile,
+            &backend_id,
+            &target,
+            &repo_root,
+            &profile.name,
+            workspace.as_deref(),
+            no_focus,
+            cli.json,
+            yes,
+        );
+    }
+
     let client = select::open(&backend_id, &target)?;
     if let Err(error) = client.snapshot() {
         let socket = backend_socket_display(&backend_id, &target);
@@ -295,7 +326,7 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::from(3));
     }
 
-    let mut state = LocalState::load(&repo_root)?;
+    let state = LocalState::load(&repo_root)?;
     // Backends cannot read ownership tokens back yet (PR 3), so a resource's
     // observed state comes only from local state's own record of the last
     // apply (D16's declared fallback) until live discovery lands.
@@ -305,48 +336,34 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         .unwrap_or_default();
     let plan = build_plan(profile, &snapshot)?;
 
-    match cli.command.unwrap_or(Command::Up {
-        allow_replace: false,
-        yes: false,
-        profile: None,
-    }) {
-        Command::Render { .. }
-        | Command::Run { .. }
-        | Command::Down { .. }
-        | Command::Lint { .. }
-        | Command::Ls => {
-            unreachable!("handled above")
-        }
-        Command::Status { .. } | Command::Plan { .. } => {
-            print_plan(&plan, cli.json)?;
-            print_warnings(&compiled.warnings);
-            Ok(if plan.status == SyncStatus::InSync {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            })
-        }
-        Command::Up { yes, .. } => {
-            print_plan(&plan, cli.json)?;
-            if plan
-                .actions
-                .iter()
-                .any(|action| action.kind == Action::Core(CoreAction::Conflict))
-            {
-                // Reconciling workspaces/tabs/panes/agents against the
-                // backend is out of scope here (PR 3/5); only the plan's
-                // `RunTask` actions execute (item 1/5 of this PR's brief).
-                return Ok(ExitCode::from(2));
-            }
+    // Only `status` and `plan` reach here: Render/Run/Down/Lint/Ls returned
+    // above, and Up (with the no-subcommand default) routed through
+    // `up_command`. Both are read-only: print the plan and report drift.
+    debug_assert!(matches!(
+        cli.command,
+        Some(Command::Status { .. }) | Some(Command::Plan { .. })
+    ));
+    print_plan(&plan, cli.json)?;
+    print_warnings(&compiled.warnings);
+    Ok(if plan.status == SyncStatus::InSync {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
 
-            let ctx = ExecutionContext {
-                repo_root: &repo_root,
-                profile: &profile.name,
-                runner: &HostCommandRunner,
-            };
-            let results = execute_plan_tasks(profile, &plan, &ctx, &mut state, yes)?;
-            report_task_outcomes(&results, cli.json)
-        }
+/// The `up` flags for `drove` with no subcommand (all defaults) and for an
+/// explicit `drove up`; `None` for any other subcommand.
+fn up_flags(command: &Option<Command>) -> Option<(bool, Option<String>, bool)> {
+    match command {
+        None => Some((false, None, false)),
+        Some(Command::Up {
+            yes,
+            workspace,
+            no_focus,
+            ..
+        }) => Some((*yes, workspace.clone(), *no_focus)),
+        _ => None,
     }
 }
 
@@ -529,6 +546,217 @@ fn down_command(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `drove up` / `drove [PROFILE]` (D43): start the session if it is not
+/// running, apply the plan (tasks and backend actions), bring the target
+/// workspace to the front, and — from a terminal outside Herdr — attach to the
+/// session so the caller lands in it.
+#[allow(clippy::too_many_arguments)]
+fn up_command(
+    profile: &Profile,
+    backend_id: &str,
+    target: &select::Target,
+    repo_root: &Path,
+    profile_arg: &str,
+    workspace: Option<&str>,
+    no_focus: bool,
+    json: bool,
+    yes: bool,
+) -> Result<ExitCode> {
+    let client = select::open(backend_id, target)?;
+    let mut state = LocalState::load(repo_root)?;
+    let snapshot = state
+        .profile(profile_arg)
+        .map(|managed| managed.to_snapshot(profile_arg, client.caller_pane_id()))
+        .unwrap_or_default();
+    let plan = build_plan(profile, &snapshot)?;
+
+    // A `Conflict` never applies anything and exits 2 (D43 step 3).
+    if plan
+        .actions
+        .iter()
+        .any(|action| action.kind == Action::Core(CoreAction::Conflict))
+    {
+        print_plan(&plan, json)?;
+        return Ok(ExitCode::from(2));
+    }
+
+    let is_herdr = backend_id == select::HERDR_BACKEND;
+    // A Radiator hub has no headless-start verb (D37): if it is unreachable,
+    // fail with the hub name rather than applying against a dead socket.
+    if !is_herdr && client.snapshot().is_err() {
+        let hub = target.name.as_deref().unwrap_or(radiator::DEFAULT_HUB_NAME);
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "profile": profile.name,
+                    "backend": backend_id,
+                    "status": "not_running",
+                    "hub": hub,
+                })
+            );
+        } else {
+            println!("cannot reach the Radiator hub `{hub}`; start it, then re-run `drove`");
+        }
+        return Ok(ExitCode::from(1));
+    }
+
+    // The session name for the headless start and the attach; a workspace to
+    // bring to the front (the flag, else the profile's first workspace).
+    let session = target.name.as_deref().unwrap_or("default");
+    let focus_target = workspace.or_else(|| profile.workspaces.first().map(|w| w.name.as_str()));
+    // `--json` implies `--no-focus` (D43 step 4).
+    let do_focus = !no_focus && !json;
+
+    let ctx = ExecutionContext {
+        repo_root,
+        profile: profile_arg,
+        runner: &HostCommandRunner,
+    };
+    let report = up(
+        client.as_ref(),
+        profile,
+        &profile.to_ir(),
+        &plan,
+        &ctx,
+        &mut state,
+        yes,
+        session,
+        focus_target,
+        do_focus,
+    )?;
+
+    if let UpOutcome::CannotStart { hint } = &report.outcome {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "profile": profile.name,
+                    "backend": backend_id,
+                    "status": "cannot_start",
+                    "hint": hint,
+                })
+            );
+        } else {
+            println!("cannot reach the Herdr session `{session}`; start it with:\n    {hint}");
+        }
+        return Ok(ExitCode::from(1));
+    }
+
+    print_up_summary(profile, &report, json)?;
+
+    let blocked = report.blocked_destructive
+        || report
+            .tasks
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, TaskOutcome::Blocked | TaskOutcome::Ran(false)));
+    if blocked {
+        if report.blocked_destructive {
+            eprintln!(
+                "warning: a destructive action needs approval; re-run with --yes to apply it"
+            );
+        }
+        return Ok(ExitCode::from(1));
+    }
+
+    // Step 4: from a terminal outside Herdr, land the caller in the session.
+    if do_focus && is_herdr && should_attach() {
+        return attach_session(session);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The one summary line D43 step 5 prints (or its `--json` form).
+fn print_up_summary(
+    profile: &Profile,
+    report: &crate::executor::UpReport,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let tasks: Vec<_> = report
+            .tasks
+            .iter()
+            .map(|(name, outcome)| serde_json::json!({"task": name, "outcome": outcome_label(*outcome)}))
+            .collect();
+        let mut object = serde_json::json!({
+            "profile": profile.name,
+            "focused": report.focused,
+            "tasks": tasks,
+        });
+        match &report.outcome {
+            UpOutcome::Reconciled {
+                created,
+                changed,
+                tasks_run,
+            } => {
+                object["status"] = serde_json::json!("in_sync");
+                object["created"] = serde_json::json!(created);
+                object["changed"] = serde_json::json!(changed);
+                object["tasks_run"] = serde_json::json!(tasks_run);
+            }
+            UpOutcome::AlreadyRunning => {
+                object["status"] = serde_json::json!("already_running");
+            }
+            UpOutcome::CannotStart { .. } => unreachable!("handled before summary"),
+        }
+        println!("{object}");
+        return Ok(());
+    }
+    match &report.outcome {
+        UpOutcome::Reconciled {
+            created,
+            changed,
+            tasks_run,
+        } => println!(
+            "profile {}: {created} created, {changed} changed, {tasks_run} tasks run, in sync",
+            profile.name
+        ),
+        UpOutcome::AlreadyRunning => {
+            println!(
+                "profile {}: already running, brought to front",
+                profile.name
+            )
+        }
+        UpOutcome::CannotStart { .. } => unreachable!("handled before summary"),
+    }
+    Ok(())
+}
+
+/// Whether `up` should replace this process with a session attach: only from a
+/// terminal outside Herdr (`HERDR_ENV` unset) whose stdout is a TTY (D43 step
+/// 4).
+fn should_attach() -> bool {
+    std::env::var_os("HERDR_ENV").is_none() && std::io::stdout().is_terminal()
+}
+
+/// Replaces this process with `herdr session attach NAME` (D43 step 4). On
+/// Unix `exec` replaces the process and returns only on failure; on Windows,
+/// which has no `exec`, it spawns, waits, and forwards the child's exit code.
+/// Isolated here so the rest of `up` stays testable without a real terminal.
+fn attach_session(name: &str) -> Result<ExitCode> {
+    let bin = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| OsString::from("herdr"));
+    let mut command = std::process::Command::new(bin);
+    command.args(["session", "attach", name]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // `exec` only returns if it fails to replace the process.
+        Err(command.exec()).context("cannot attach to the Herdr session")
+    }
+    #[cfg(windows)]
+    {
+        let status = command
+            .status()
+            .context("cannot attach to the Herdr session")?;
+        Ok(ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(1),
+        ))
+    }
 }
 
 fn report_task_outcomes(results: &[(String, TaskOutcome)], json: bool) -> Result<ExitCode> {

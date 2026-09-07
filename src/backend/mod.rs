@@ -112,8 +112,23 @@ pub trait Backend {
     }
 }
 
-/// The Herdr flavor: tabs, splits, ratios and agent start — verbs only Herdr
-/// implements (spec §3, D28). Reached through [`Backend::herdr`].
+/// The state of a named Herdr session's server after [`HerdrExt::ensure_session`]
+/// (D44): already up, just started headlessly, or unstartable without a TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// The session's socket already answered `ping`; nothing was started.
+    Running,
+    /// The session's server was not up, and this call started it headlessly
+    /// and saw its socket come up.
+    Started,
+    /// Nothing could start the session's server without a TUI. `hint` is the
+    /// exact command for the user to run by hand (`herdr --session NAME`).
+    CannotStart { hint: String },
+}
+
+/// The Herdr flavor: tabs, splits, ratios, agent start, plus the session and
+/// focus verbs `drove up` drives — verbs only Herdr implements (spec §3, D28,
+/// D44). Reached through [`Backend::herdr`].
 pub trait HerdrExt {
     fn create_tab(
         &self,
@@ -130,6 +145,17 @@ pub trait HerdrExt {
     fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()>;
 
     fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()>;
+
+    /// Brings workspace `id` to the front through `workspace.focus` (D43 step
+    /// 4, D44).
+    fn focus_workspace(&self, id: &str) -> Result<()>;
+
+    /// Ensures the named session's server is running (D43 step 2, D44):
+    /// [`SessionState::Running`] when its socket already answers `ping`,
+    /// otherwise starts the server headlessly by shelling out to the `herdr`
+    /// binary and returns [`SessionState::Started`] once the socket comes up,
+    /// or [`SessionState::CannotStart`] with the command to run by hand.
+    fn ensure_session(&self, name: &str) -> Result<SessionState>;
 }
 
 /// The Radiator flavor. Empty until the hub protocol for chat panes, runner

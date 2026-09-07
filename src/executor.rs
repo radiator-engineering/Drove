@@ -16,7 +16,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    backend::{Backend, PaneSpec},
+    backend::{Backend, PaneSpec, SessionState},
     ir::{Ir, Resource},
     model::{Profile, Task, canonical_digest},
     planner::{Action, CoreAction, HerdrAction, Plan, PlannedAction},
@@ -532,15 +532,394 @@ struct ApplyState {
 /// concrete arguments from `ir`, and returns each action's [`Outcome`] in
 /// order. A flavor action on a backend without that flavor is surfaced as
 /// [`Outcome::Unsupported`] and the loop continues, so core resources in the
-/// same plan are still created (D29).
+/// same plan are still created (D29). Destructive actions are always applied;
+/// [`up`] uses [`apply_plan_gated`] instead to hold them behind `--yes`.
 pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Result<Vec<(String, Outcome)>> {
+    Ok(apply_plan_gated(backend, ir, plan, true)?.0)
+}
+
+/// Like [`apply_plan`], but when `approve` is false every destructive action
+/// (a topology-change `ClosePane`, D22) is left unapplied and reported as
+/// [`Outcome::Skipped`] — the same `--yes` gate a task's `run` sits behind.
+/// Returns the per-action outcomes together with the backend ids created
+/// along the way, so a caller can record ownership from what actually ran.
+fn apply_plan_gated(
+    backend: &dyn Backend,
+    ir: &Ir,
+    plan: &Plan,
+    approve: bool,
+) -> Result<(Vec<(String, Outcome)>, ApplyState)> {
     let mut state = ApplyState::default();
     let mut outcomes = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
-        let outcome = apply_action(backend, ir, &mut state, action)?;
+        let outcome = if action.destructive && !approve {
+            Outcome::Skipped
+        } else {
+            apply_action(backend, ir, &mut state, action)?
+        };
         outcomes.push((action.address.clone(), outcome));
     }
-    Ok(outcomes)
+    Ok((outcomes, state))
+}
+
+/// What `drove up` did, reported as one summary line (D43 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpOutcome {
+    /// The session was reachable (or just started headlessly) and the plan's
+    /// tasks and backend actions were applied.
+    Reconciled {
+        created: usize,
+        changed: usize,
+        tasks_run: usize,
+    },
+    /// Nothing was out of sync; the workspace was only brought to the front.
+    AlreadyRunning,
+    /// The Herdr session's server was not reachable and could not be started
+    /// headlessly (D43 step 2); `hint` is the command to run by hand.
+    CannotStart { hint: String },
+}
+
+/// The full result of one [`up`] run.
+#[derive(Debug, Clone)]
+pub struct UpReport {
+    pub outcome: UpOutcome,
+    /// Per-task run results, for `--json` output and the process exit code.
+    pub tasks: Vec<(String, TaskOutcome)>,
+    /// The backend id of the workspace brought to the front, if any.
+    pub focused: Option<String>,
+    /// A destructive action was left unapplied for want of `--yes` (D22).
+    pub blocked_destructive: bool,
+}
+
+/// `drove up` end to end (D43): ensure the session is reachable, run the
+/// plan's tasks, apply its backend actions behind the `--yes` gate, record
+/// what was created, and bring the target workspace to the front. The caller
+/// (`src/cli.rs`) is responsible for the `Conflict` early exit before calling
+/// this, for printing the summary, and for the `exec herdr session attach`
+/// step, which is not exercised here.
+#[allow(clippy::too_many_arguments)]
+pub fn up(
+    backend: &dyn Backend,
+    profile: &Profile,
+    ir: &Ir,
+    plan: &Plan,
+    ctx: &ExecutionContext<'_>,
+    state: &mut LocalState,
+    approve: bool,
+    session: &str,
+    focus_workspace: Option<&str>,
+    do_focus: bool,
+) -> Result<UpReport> {
+    // Step 2: make the session reachable. Herdr starts its own server
+    // headlessly; a flavorless backend (Radiator) has no such verb, so the
+    // caller checks its reachability separately (D43 step 2, D44).
+    if let Some(ext) = backend.herdr()
+        && let SessionState::CannotStart { hint } = ext.ensure_session(session)?
+    {
+        return Ok(UpReport {
+            outcome: UpOutcome::CannotStart { hint },
+            tasks: Vec::new(),
+            focused: None,
+            blocked_destructive: false,
+        });
+    }
+
+    let was_in_sync = plan.actions.is_empty();
+
+    // Step 3: run the plan's tasks, then apply its backend actions and record
+    // the resources that came into being so the next run sees them in sync.
+    let tasks = execute_plan_tasks(profile, plan, ctx, state, approve)?;
+    let (outcomes, applied) = apply_plan_gated(backend, ir, plan, approve)?;
+    record_ownership(state, ctx.profile, ir, plan, &outcomes, &applied)?;
+
+    let blocked_destructive = !approve && plan.has_destructive_actions();
+    let (created, changed) = count_applied(plan, &outcomes);
+    let tasks_run = tasks
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, TaskOutcome::Ran(_)))
+        .count();
+
+    // Step 4: bring the target workspace to the front.
+    let focused = if do_focus {
+        focus_first_workspace(backend, state, ctx.profile, &applied, focus_workspace)?
+    } else {
+        None
+    };
+
+    let outcome = if was_in_sync {
+        UpOutcome::AlreadyRunning
+    } else {
+        UpOutcome::Reconciled {
+            created,
+            changed,
+            tasks_run,
+        }
+    };
+    Ok(UpReport {
+        outcome,
+        tasks,
+        focused,
+        blocked_destructive,
+    })
+}
+
+/// Splits the plan's applied actions into a created count and a changed count
+/// for the summary line. Only [`Outcome::Applied`] actions count; a skipped,
+/// unsupported, task, detach, or conflict action does not.
+fn count_applied(plan: &Plan, outcomes: &[(String, Outcome)]) -> (usize, usize) {
+    let mut created = 0;
+    let mut changed = 0;
+    for (action, (_, outcome)) in plan.actions.iter().zip(outcomes) {
+        if *outcome != Outcome::Applied {
+            continue;
+        }
+        match action.kind {
+            Action::Core(CoreAction::CreateWorkspace | CoreAction::CreatePane)
+            | Action::Herdr(
+                HerdrAction::CreateTab | HerdrAction::SplitPane | HerdrAction::StartAgent,
+            ) => created += 1,
+            Action::Core(
+                CoreAction::RenameWorkspace
+                | CoreAction::RenamePane
+                | CoreAction::RestartCommand
+                | CoreAction::ClosePane
+                | CoreAction::PromptAgent,
+            )
+            | Action::Herdr(HerdrAction::RenameTab | HerdrAction::SetRatio) => changed += 1,
+            _ => {}
+        }
+    }
+    (created, changed)
+}
+
+/// Brings the profile's target workspace to the front through
+/// `workspace.focus` (D43 step 4). The workspace's backend id comes from what
+/// this run just created, else from what a previous run recorded in local
+/// state (the already-in-sync case). A flavorless backend has no
+/// `focus_workspace` verb, so this is a no-op there.
+fn focus_first_workspace(
+    backend: &dyn Backend,
+    state: &LocalState,
+    profile: &str,
+    applied: &ApplyState,
+    workspace: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(name) = workspace else {
+        return Ok(None);
+    };
+    let Some(ext) = backend.herdr() else {
+        return Ok(None);
+    };
+    let backend_id = applied
+        .workspace_ids
+        .get(name)
+        .cloned()
+        .or_else(|| {
+            state
+                .profile(profile)
+                .and_then(|managed| managed.resources.get(name))
+                .map(|resource| resource.backend_id.clone())
+        })
+        .filter(|id| !id.is_empty());
+    let Some(backend_id) = backend_id else {
+        return Ok(None);
+    };
+    ext.focus_workspace(&backend_id)?;
+    Ok(Some(backend_id))
+}
+
+/// Records ownership of the resources a plan just applied, so the next
+/// `build_plan` sees them as owned and converged. The backend id comes from
+/// what this apply created, else the action's own backend id (a rename or
+/// restart of an already-known resource), else what local state already held.
+/// A `Detach` drops the resource; an `AdoptPane` records the caller pane even
+/// though no backend verb ran (D24).
+fn record_ownership(
+    state: &mut LocalState,
+    profile: &str,
+    ir: &Ir,
+    plan: &Plan,
+    outcomes: &[(String, Outcome)],
+    applied: &ApplyState,
+) -> Result<()> {
+    enum Change {
+        Upsert(String, ManagedResource),
+        Remove(String),
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    let existing = state.profile(profile).cloned().unwrap_or_default();
+
+    let resolve = |name: &str, ids: &BTreeMap<String, String>, own: Option<&str>| -> String {
+        ids.get(name)
+            .cloned()
+            .or_else(|| own.map(str::to_owned))
+            .or_else(|| {
+                existing
+                    .resources
+                    .get(name)
+                    .map(|resource| resource.backend_id.clone())
+            })
+            .unwrap_or_default()
+    };
+
+    for (action, (_, outcome)) in plan.actions.iter().zip(outcomes) {
+        let address = action.address.as_str();
+        match action.kind {
+            Action::Core(CoreAction::AdoptPane) => {
+                if let (Ok(digest), Ok(parent)) =
+                    (digest_of(ir, "pane", address), pane_group_id(ir, address))
+                {
+                    let backend_id =
+                        resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "pane".into(),
+                            backend_id,
+                            parent: Some(parent),
+                            digest: digest.to_owned(),
+                            adopted: Some(true),
+                            last_outcome: None,
+                        },
+                    ));
+                }
+                continue;
+            }
+            Action::Core(CoreAction::Detach) => {
+                changes.push(Change::Remove(address.to_owned()));
+                continue;
+            }
+            _ => {}
+        }
+
+        if *outcome != Outcome::Applied {
+            continue;
+        }
+
+        match action.kind {
+            Action::Core(CoreAction::CreateWorkspace | CoreAction::RenameWorkspace) => {
+                if let Ok(digest) = digest_of(ir, "workspace", address) {
+                    let backend_id = resolve(
+                        address,
+                        &applied.workspace_ids,
+                        action.backend_id.as_deref(),
+                    );
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "workspace".into(),
+                            backend_id,
+                            parent: None,
+                            digest: digest.to_owned(),
+                            adopted: None,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            Action::Herdr(
+                HerdrAction::CreateTab | HerdrAction::RenameTab | HerdrAction::SetRatio,
+            ) => {
+                if let (Some(digest), Some(workspace)) = (
+                    group_topology_digest(ir, address),
+                    group_workspace(ir, address),
+                ) {
+                    let backend_id =
+                        resolve(address, &applied.group_ids, action.backend_id.as_deref());
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "placement".into(),
+                            backend_id,
+                            parent: Some(workspace.to_owned()),
+                            digest: digest.to_owned(),
+                            adopted: None,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            Action::Core(
+                CoreAction::CreatePane | CoreAction::RenamePane | CoreAction::RestartCommand,
+            )
+            | Action::Herdr(HerdrAction::SplitPane) => {
+                if let (Ok(digest), Ok(parent)) =
+                    (digest_of(ir, "pane", address), pane_group_id(ir, address))
+                {
+                    let backend_id =
+                        resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+                    let adopted = existing
+                        .resources
+                        .get(address)
+                        .and_then(|resource| resource.adopted);
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "pane".into(),
+                            backend_id,
+                            parent: Some(parent),
+                            digest: digest.to_owned(),
+                            adopted,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            Action::Herdr(HerdrAction::StartAgent) | Action::Core(CoreAction::PromptAgent) => {
+                if let (Ok(digest), Ok(pane)) =
+                    (digest_of(ir, "agent", address), agent_parent(ir, address))
+                {
+                    let backend_id =
+                        resolve(&pane, &applied.pane_ids, action.backend_id.as_deref());
+                    changes.push(Change::Upsert(
+                        address.to_owned(),
+                        ManagedResource {
+                            kind: "agent".into(),
+                            backend_id,
+                            parent: Some(pane),
+                            digest: digest.to_owned(),
+                            adopted: None,
+                            last_outcome: None,
+                        },
+                    ));
+                }
+            }
+            // A topology-change `ClosePane` is immediately followed by a
+            // `SplitPane` in the same plan that re-records the pane under its
+            // new group, so there is nothing to remove here.
+            _ => {}
+        }
+    }
+
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let managed = state.profile_mut(profile);
+    for change in changes {
+        match change {
+            Change::Upsert(id, resource) => {
+                managed.resources.insert(id, resource);
+            }
+            Change::Remove(id) => {
+                managed.resources.remove(&id);
+            }
+        }
+    }
+    state.save()
+}
+
+fn group_topology_digest<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
+    ir.placements
+        .iter()
+        .find(|group| group.id == id)
+        .map(|group| group.topology_digest.as_str())
+}
+
+fn group_workspace<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
+    ir.placements
+        .iter()
+        .find(|group| group.id == id)
+        .map(|group| group.workspace.as_str())
 }
 
 /// Routes one planned action to the backend through a single exhaustive
@@ -1320,6 +1699,362 @@ mod tests {
             }
         }
         // No `herdr()` override: it inherits the default `None`.
+    }
+
+    /// A fake Herdr for the `up` flow (D43): it hands out backend ids for
+    /// every workspace, Herdr tab and pane it is asked to create, records the
+    /// verbs it receives, and answers `ensure_session` with a state the test
+    /// sets.
+    struct RecordingHerdr {
+        session: SessionState,
+        calls: Mutex<Vec<String>>,
+        next_id: Mutex<u32>,
+    }
+
+    impl RecordingHerdr {
+        fn running() -> Self {
+            Self {
+                session: SessionState::Running,
+                calls: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+
+        fn cannot_start(hint: &str) -> Self {
+            Self {
+                session: SessionState::CannotStart { hint: hint.into() },
+                calls: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+
+        fn id(&self, prefix: &str) -> String {
+            let mut next = self.next_id.lock().expect("id lock");
+            let id = format!("{prefix}{next}");
+            *next += 1;
+            id
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().expect("calls lock").push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl Backend for RecordingHerdr {
+        fn snapshot(&self) -> Result<crate::backend::herdr::SessionSnapshot> {
+            Ok(Default::default())
+        }
+        fn caller_pane_id(&self) -> Option<String> {
+            None
+        }
+        fn create_workspace(&self, label: &str, _cwd: &Path) -> Result<String> {
+            self.record(format!("create_workspace:{label}"));
+            Ok(self.id("w"))
+        }
+        fn rename_workspace(&self, id: &str, label: &str) -> Result<()> {
+            self.record(format!("rename_workspace:{id}:{label}"));
+            Ok(())
+        }
+        fn create_pane(&self, workspace_id: &str, spec: &PaneSpec) -> Result<String> {
+            let label = spec.label.clone().unwrap_or_default();
+            self.record(format!("create_pane:{workspace_id}:{label}"));
+            Ok(self.id("p"))
+        }
+        fn close_pane(&self, id: &str) -> Result<()> {
+            self.record(format!("close_pane:{id}"));
+            Ok(())
+        }
+        fn rename_pane(&self, id: &str, label: &str) -> Result<()> {
+            self.record(format!("rename_pane:{id}:{label}"));
+            Ok(())
+        }
+        fn restart_command(&self, id: &str, _argv: &[String]) -> Result<()> {
+            self.record(format!("restart_command:{id}"));
+            Ok(())
+        }
+        fn prompt_agent(&self, id: &str, _prompt: &str) -> Result<()> {
+            self.record(format!("prompt_agent:{id}"));
+            Ok(())
+        }
+        fn process_info(&self, _id: &str) -> Result<Option<crate::backend::ProcessInfo>> {
+            Ok(None)
+        }
+        fn report_tokens(&self, _address: &str, _tokens: &BTreeMap<String, String>) -> Result<()> {
+            Ok(())
+        }
+        fn output(&self, _id: &str, _timeout: std::time::Duration) -> Result<String> {
+            Ok(String::new())
+        }
+        fn capabilities(&self) -> crate::backend::Capabilities {
+            crate::backend::Capabilities {
+                workspace_env: true,
+                pane_command_at_create: true,
+                metadata_tokens: true,
+                process_info: true,
+                events: true,
+                readiness_output: true,
+            }
+        }
+        fn herdr(&self) -> Option<&dyn crate::backend::HerdrExt> {
+            Some(self)
+        }
+    }
+
+    impl crate::backend::HerdrExt for RecordingHerdr {
+        fn create_tab(
+            &self,
+            workspace_id: &str,
+            label: &str,
+            _split: crate::backend::Split,
+            _ratios: &[f64],
+        ) -> Result<String> {
+            self.record(format!("create_tab:{workspace_id}:{label}"));
+            Ok(self.id("t"))
+        }
+        fn split_pane(
+            &self,
+            tab_id: &str,
+            spec: &PaneSpec,
+            _split: crate::backend::Split,
+        ) -> Result<String> {
+            let label = spec.label.clone().unwrap_or_default();
+            self.record(format!("split_pane:{tab_id}:{label}"));
+            Ok(self.id("p"))
+        }
+        fn set_ratio(&self, tab_id: &str, _ratios: &[f64]) -> Result<()> {
+            self.record(format!("set_ratio:{tab_id}"));
+            Ok(())
+        }
+        fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+            self.record(format!("rename_tab:{tab_id}:{label}"));
+            Ok(())
+        }
+        fn start_agent(
+            &self,
+            pane_id: &str,
+            name: &str,
+            _kind: &str,
+            _args: &[String],
+        ) -> Result<()> {
+            self.record(format!("start_agent:{pane_id}:{name}"));
+            Ok(())
+        }
+        fn focus_workspace(&self, id: &str) -> Result<()> {
+            self.record(format!("focus:{id}"));
+            Ok(())
+        }
+        fn ensure_session(&self, _name: &str) -> Result<SessionState> {
+            Ok(self.session.clone())
+        }
+    }
+
+    fn up_profile() -> Profile {
+        profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "editor", "serve": [["bash"]]}]}]
+            }]
+        }))
+    }
+
+    fn up_plan(kinds: &[(Action, &str)]) -> Plan {
+        use crate::planner::SyncStatus;
+        Plan {
+            profile: "default".into(),
+            desired_digest: String::new(),
+            status: SyncStatus::OutOfSync,
+            adopted: BTreeMap::new(),
+            actions: kinds
+                .iter()
+                .map(|(kind, address)| PlannedAction {
+                    kind: *kind,
+                    address: (*address).to_owned(),
+                    backend_id: None,
+                    destructive: false,
+                    reason: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn up_applies_workspace_and_pane_then_focuses_the_first_workspace() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreatePane), "editor"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c == "create_workspace:dev"),
+            "workspace must be created: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_pane:")),
+            "pane must be created: {calls:?}"
+        );
+        // The first workspace is brought to the front with the id its create
+        // returned.
+        assert_eq!(report.focused.as_deref(), Some("w1"));
+        assert!(
+            calls.iter().any(|c| c == "focus:w1"),
+            "the first workspace must be focused: {calls:?}"
+        );
+        assert_eq!(
+            report.outcome,
+            UpOutcome::Reconciled {
+                created: 2,
+                changed: 0,
+                tasks_run: 0
+            }
+        );
+        // Ownership is recorded so the next run sees the resources in sync.
+        assert!(
+            state
+                .profile("default")
+                .expect("profile recorded")
+                .resources
+                .contains_key("dev")
+        );
+    }
+
+    #[test]
+    fn up_with_no_focus_applies_but_never_focuses() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreatePane), "editor"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            false,
+        )
+        .expect("up");
+
+        assert_eq!(report.focused, None);
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("focus:")),
+            "--no-focus must not focus anything: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn up_already_in_sync_brings_the_workspace_to_the_front() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        // A previous run recorded the workspace's backend id; nothing is out
+        // of sync now.
+        state.profile_mut("default").resources.insert(
+            "dev".to_owned(),
+            ManagedResource {
+                kind: "workspace".into(),
+                backend_id: "w1".into(),
+                parent: None,
+                digest: "any".into(),
+                adopted: None,
+                last_outcome: None,
+            },
+        );
+        let plan = up_plan(&[]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        assert_eq!(report.outcome, UpOutcome::AlreadyRunning);
+        assert_eq!(report.focused.as_deref(), Some("w1"));
+        let calls = backend.calls();
+        assert_eq!(calls, vec!["focus:w1".to_owned()], "only focus, no creates");
+    }
+
+    #[test]
+    fn up_reports_the_hint_when_the_session_cannot_be_started() {
+        let (mut state, _dir) = temp_state();
+        let profile = up_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[(Action::Core(CoreAction::CreateWorkspace), "dev")]);
+        let backend = RecordingHerdr::cannot_start("herdr --session dev-session");
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        assert_eq!(
+            report.outcome,
+            UpOutcome::CannotStart {
+                hint: "herdr --session dev-session".to_owned()
+            }
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "an unstartable session applies nothing and focuses nothing"
+        );
     }
 
     #[test]
