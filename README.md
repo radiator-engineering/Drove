@@ -44,7 +44,8 @@ cargo install --path .
 ```
 
 Every [GitHub release](https://github.com/radiator-engineering/Drove/releases)
-also carries the raw binaries and their SHA256 checksums.
+also carries the raw binaries and their SHA256 checksums. See
+[docs/releasing.md](docs/releasing.md) for how a release is cut.
 
 ## Quick start
 
