@@ -1,0 +1,19 @@
+src/cli.rs
+  s_954b9b03d05b96::t_cb587789b84546 1697
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "dd6436bd6fa04907a341c509c819f3bb98337c2a",
+  "prompts": {},
+  "sessions": {
+    "s_954b9b03d05b96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "669b1a3d-9949-4369-98f9-8a4dd600bcda",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
