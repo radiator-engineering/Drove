@@ -1,0 +1,19 @@
+.context/handoffs/drove-publication-worker.md
+  s_e4f8921a7ce56d::t_ad3906d4ff9b1c 1-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "1105b3dfe33788e62e68973da0cb93b42199ac27",
+  "prompts": {},
+  "sessions": {
+    "s_e4f8921a7ce56d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07c46-b6e2-7d90-a0a4-8093c266dc05",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
