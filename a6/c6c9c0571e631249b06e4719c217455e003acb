@@ -24,6 +24,9 @@ src/ir.rs
 src/cli.rs
   s_e94bdc75c06cee::t_a2ead31d35d211 350-351
   s_e94bdc75c06cee::t_d72daa1b139d29 747,752
+  s_e94bdc75c06cee::t_bd7d8b01123c1f 798-805
+  s_e94bdc75c06cee::t_a99dda0eb02214 352-356,358-362
+  s_e94bdc75c06cee::t_9b2bd915f4eed4 744-746,748-751
 CHANGELOG.md
   s_e94bdc75c06cee::t_f7caafdbb0874f 28-37
 tests/examples.rs
@@ -33,6 +36,7 @@ tests/cli.rs
   s_e94bdc75c06cee::t_4a0b346b758437 2069
   s_e94bdc75c06cee::t_f5e287863f8fea 1510,1940-2068,2070-2136
   s_e94bdc75c06cee::t_07a414b6b48daa 1575
+  s_e94bdc75c06cee::t_5e329873ac9742 1939
 docs/drovefile.md
   s_e94bdc75c06cee::t_df221d33e4e4cb 134-148
   s_e94bdc75c06cee::t_ac35fd789b9165 220-221
