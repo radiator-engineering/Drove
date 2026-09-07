@@ -1,0 +1,21 @@
+.context/DECISIONS.md
+  s_e4f8921a7ce56d::t_e3cb91c6f9ef03 123-129
+.context/reports/drove-consumer-repair.md
+  s_e4f8921a7ce56d::t_ce9221dc4a8d82 3-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3170fb150ca63f186a512e4b105f7e487ae7898f",
+  "prompts": {},
+  "sessions": {
+    "s_e4f8921a7ce56d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07c46-b6e2-7d90-a0a4-8093c266dc05",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
