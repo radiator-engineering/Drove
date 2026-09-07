@@ -1,0 +1,38 @@
+src/planner.rs
+  s_e94bdc75c06cee::t_9b38eaeb69c54e 723,728
+  s_e94bdc75c06cee::t_fc496b8d2ba5c7 555-558,560,2196-2197,2365-2380,2447,2452-2453
+  s_e94bdc75c06cee::t_7af3b10381212f 730,2194,2199-2200,2382-2383,2450,2458-2460
+  s_e94bdc75c06cee::t_57e95b92ba0b1f 562-563,568
+  s_e94bdc75c06cee::t_9052ead220d379 778,796
+  s_e94bdc75c06cee::t_216a847dcb8e82 383-386,392
+  s_e94bdc75c06cee::t_f98cdfd1a66fb1 700-708
+  s_e94bdc75c06cee::t_e4200bdbeb21e4 2195,2209-2211,2217-2258,2301-2302,2312-2333,2336-2337,2339-2349,2353,2355-2356,2400-2401,2408-2435,2437,2442-2444
+  s_e94bdc75c06cee::t_b54049c6888c75 351-356,364,463,546-554,561,565-567,571,576-581,586,590-599,729,755-765,2193,2198,2201-2208,2212-2216,2259,2283-2300,2303-2311,2334-2335,2338,2350-2352,2354,2357-2364,2381,2384-2399,2402-2407,2436,2438-2441,2445-2446,2448-2449,2451,2454-2457
+src/cli.rs
+  s_e94bdc75c06cee::t_9c174551be8736 738
+  s_9c53b9f663fd37::t_87b70ef9ad4d72 344-354,733-735,737,739-740
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "94f8851be5d4d6a1d281fa5c07eac3b524d6e358",
+  "prompts": {},
+  "sessions": {
+    "s_9c53b9f663fd37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "595170ec-924f-4801-9cbc-e36bbf2bf3f4",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_e94bdc75c06cee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ba795ae-8700-4ee8-83eb-6782b659456c",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
