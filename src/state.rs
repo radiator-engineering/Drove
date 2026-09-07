@@ -112,6 +112,26 @@ impl LocalState {
         self.save()
     }
 
+    /// Journal entries an apply began but never finished (D52 point 4): a
+    /// `run`/hook killed mid-execution, surfaced instead of silently
+    /// retried. `(action, digest)` pairs, in journal order.
+    pub fn interrupted(&self) -> Vec<(&str, &str)> {
+        self.journal
+            .iter()
+            .filter(|entry| !entry.completed)
+            .map(|entry| (entry.action.as_str(), entry.digest.as_str()))
+            .collect()
+    }
+
+    /// Whether `action` (e.g. `task:scaffold`) has an unfinished journal
+    /// entry: the previous run started it but never recorded completion
+    /// (D52 point 4).
+    pub fn has_interrupted(&self, action: &str) -> bool {
+        self.journal
+            .iter()
+            .any(|entry| entry.action == action && !entry.completed)
+    }
+
     fn trim_journal(&mut self) {
         const MAX_ENTRIES: usize = 100;
         if self.journal.len() > MAX_ENTRIES {
@@ -449,6 +469,36 @@ mod tests {
         assert!(pruned.resources.contains_key("core"));
         assert!(pruned.resources.contains_key("core/main"));
         assert!(!pruned.resources.contains_key("review"));
+    }
+
+    #[test]
+    fn interrupted_reports_only_unfinished_journal_entries() {
+        let state = LocalState {
+            schema_version: 1,
+            repo_root: PathBuf::from("/repo"),
+            profiles: BTreeMap::new(),
+            approvals: BTreeSet::new(),
+            journal: vec![
+                JournalEntry {
+                    action: "task:scaffold".into(),
+                    digest: "digest-1".into(),
+                    completed: false,
+                    success: None,
+                },
+                JournalEntry {
+                    action: "task:build".into(),
+                    digest: "digest-2".into(),
+                    completed: true,
+                    success: Some(true),
+                },
+            ],
+            path: PathBuf::new(),
+        };
+
+        assert_eq!(state.interrupted(), vec![("task:scaffold", "digest-1")]);
+        assert!(state.has_interrupted("task:scaffold"));
+        assert!(!state.has_interrupted("task:build"));
+        assert!(!state.has_interrupted("task:unknown"));
     }
 
     #[test]

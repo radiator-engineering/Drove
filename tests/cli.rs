@@ -941,6 +941,99 @@ fn write_state_with_stale_workspace(state_home: &Path, repo_root: &Path) {
     .expect("write state file");
 }
 
+/// A state file with one unfinished journal entry: an earlier `run` began
+/// (`begin_action`) but never recorded completion, the shape a killed
+/// process leaves behind (D52 point 4).
+fn write_state_with_interrupted_journal_entry(state_home: &Path, repo_root: &Path, task: &str) {
+    let state_path = state_file_path(state_home, repo_root);
+    fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
+    let state = json!({
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "profiles": {},
+        "approvals": [],
+        "journal": [
+            {
+                "action": format!("task:{task}"),
+                "digest": "interrupted-digest",
+                "completed": false,
+                "success": null,
+            }
+        ],
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state file");
+}
+
+#[test]
+fn status_reports_an_interrupted_journal_entry() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(&drovefile, "profile(name = \"default\")").expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_interrupted_journal_entry(&state_home, directory.path(), "scaffold");
+
+    let socket = directory.path().join("herdr-interrupted.sock");
+    let server = serve_one_snapshot(
+        socket.clone(),
+        json!({"version": "0.8.2", "protocol": 1, "workspaces": [], "tabs": [], "panes": [], "agents": []}),
+    );
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "status",
+        ])
+        .assert()
+        .stdout(predicate::str::contains(
+            "interrupted task:scaffold (interrupted-digest)",
+        ));
+    server.join().expect("fake Herdr server thread");
+}
+
+#[test]
+fn run_of_a_task_with_an_interrupted_journal_entry_warns_before_rerunning() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    tasks = [task(name = "scaffold", run = ["true"])],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    write_state_with_interrupted_journal_entry(&state_home, directory.path(), "scaffold");
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "run",
+            "scaffold",
+            "--yes",
+        ])
+        .assert()
+        .stdout(predicate::str::contains(
+            "previous run of scaffold did not finish; rerunning",
+        ));
+}
+
 #[test]
 fn status_reports_recreate_for_a_workspace_the_live_session_no_longer_has() {
     let directory = tempfile::tempdir().expect("tempdir");

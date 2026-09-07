@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `drove up` now records ownership and saves state after each action
+  succeeds, rather than only after the whole plan finishes, so a failure
+  partway through no longer loses track of what already landed. A failed
+  action no longer aborts the plan: independent actions still apply, actions
+  that depend on the failed one are skipped and reported as
+  `skipped: ID: depends on PARENT`, and `up` exits 1 after printing
+  `failed: ID: ERROR`/`skipped: ...` lines for everything affected. The next
+  `up` plans only what's still missing. `drove status` now reports a journal
+  entry an apply began but never finished as `interrupted ACTION (DIGEST)`,
+  and `drove run` warns `previous run of NAME did not finish; rerunning`
+  before rerunning that task.
 - `drove down --purge` no longer aborts when the session has already lost a
   resource it recorded: the pane, tab, or workspace is pruned from local
   state instead of aborting on `pane_not_found`, and a `close_pane` failure

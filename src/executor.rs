@@ -20,7 +20,7 @@ use crate::{
     ir::{Ir, Resource},
     model::{Profile, Task, canonical_digest},
     planner::{Action, CoreAction, HerdrAction, Plan, PlannedAction},
-    state::{LocalState, ManagedResource},
+    state::{LocalState, ManagedProfile, ManagedResource},
 };
 
 /// Runs host argv. A real [`HostCommandRunner`] shells out; tests substitute
@@ -511,13 +511,32 @@ fn teardown_order(managed: &BTreeMap<String, ManagedResource>, ir: &Ir) -> Vec<S
     order
 }
 
-/// What became of one planned action when applied to a backend (D29).
+/// One backend call inside an apply loop that failed; collected instead of
+/// aborting so independent actions still apply and dependents can be skipped
+/// (D52 point 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedAction {
+    pub address: String,
+    pub error: String,
+}
+
+/// One action left unattempted because an action it structurally depends on
+/// (its placement group, its workspace, its pane) failed or was itself
+/// skipped earlier in the same apply (D52 point 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedAction {
+    pub address: String,
+    pub depends_on: String,
+}
+
+/// What became of one planned action when applied to a backend (D29, D52).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The verb ran against the backend.
     Applied,
     /// The action is recorded/handled outside the backend apply loop (a task
-    /// run, a detach, a task conflict report).
+    /// run, a detach, a task conflict report), or held back for want of
+    /// `--yes` (a destructive action, D22).
     Skipped,
     /// A flavor action whose flavor this backend does not implement. `drove
     /// plan` prints it and `drove status` counts it; it is never dropped.
@@ -525,6 +544,12 @@ pub enum Outcome {
         flavor: &'static str,
         action: Action,
     },
+    /// The backend call for this action failed; the error is also collected
+    /// into the apply's `failed` list. The loop does not abort (D52 point 2).
+    Failed(String),
+    /// Not attempted: it depends on an action that failed or was itself
+    /// skipped this run (D52 point 2).
+    DependencySkipped { depends_on: String },
 }
 
 /// Running backend ids gathered while a plan applies: creating a workspace,
@@ -563,31 +588,93 @@ impl ApplyState {
     }
 }
 
+/// Every id this action's target structurally depends on, nearest first: a
+/// pane's placement group and that group's workspace, a group's workspace, an
+/// agent's pane and that pane's group and workspace. Reuses the same
+/// parent relations [`record_action_ownership`] already reads off the IR
+/// (D52 point 2) instead of building a new graph.
+fn action_dependencies(ir: &Ir, action: &PlannedAction) -> Vec<String> {
+    match action.kind {
+        Action::Herdr(HerdrAction::CreateTab | HerdrAction::RenameTab | HerdrAction::SetRatio) => {
+            group_workspace(ir, &action.address)
+                .map(|workspace| vec![workspace.to_owned()])
+                .unwrap_or_default()
+        }
+        Action::Core(
+            CoreAction::CreatePane | CoreAction::RenamePane | CoreAction::RestartCommand,
+        )
+        | Action::Herdr(HerdrAction::SplitPane) => {
+            let Ok(group) = pane_group_id(ir, &action.address) else {
+                return Vec::new();
+            };
+            let mut chain = vec![group.clone()];
+            if let Some(workspace) = group_workspace(ir, &group) {
+                chain.push(workspace.to_owned());
+            }
+            chain
+        }
+        Action::Herdr(HerdrAction::StartAgent) | Action::Core(CoreAction::PromptAgent) => {
+            let Ok(pane) = agent_parent(ir, &action.address) else {
+                return Vec::new();
+            };
+            let mut chain = vec![pane.clone()];
+            if let Ok(group) = pane_group_id(ir, &pane) {
+                chain.push(group.clone());
+                if let Some(workspace) = group_workspace(ir, &group) {
+                    chain.push(workspace.to_owned());
+                }
+            }
+            chain
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Applies every action in `plan` against `backend`, resolving each verb's
 /// concrete arguments from `ir`, and returns each action's [`Outcome`] in
 /// order. A flavor action on a backend without that flavor is surfaced as
 /// [`Outcome::Unsupported`] and the loop continues, so core resources in the
 /// same plan are still created (D29). Destructive actions are always applied;
 /// [`up`] uses `apply_plan_gated` instead to hold them behind `--yes`.
-pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Result<Vec<(String, Outcome)>> {
-    Ok(apply_plan_gated(backend, ir, plan, true, ApplyState::default())?.0)
+pub fn apply_plan(backend: &dyn Backend, ir: &Ir, plan: &Plan) -> Vec<(String, Outcome)> {
+    apply_plan_gated(backend, ir, plan, true, ApplyState::default(), |_, _, _| {}).0
 }
 
 /// Like [`apply_plan`], but when `approve` is false every destructive action
 /// (a topology-change `ClosePane`, D22) is left unapplied and reported as
 /// [`Outcome::Skipped`] — the same `--yes` gate a task's `run` sits behind.
-/// Returns the per-action outcomes together with the backend ids created
-/// along the way, so a caller can record ownership from what actually ran.
+///
+/// A failing action's error is collected into the returned `failed` list
+/// instead of aborting the loop (D52 point 2): every other independent
+/// action still applies. An action that depends on one that failed, or was
+/// itself skipped this run, is reported as [`Outcome::DependencySkipped`] and
+/// collected into `skipped` rather than attempted. `on_action` runs with each
+/// action's outcome and the backend ids accumulated so far, right before the
+/// next action starts — a caller that saves state there (`up` does) leaves a
+/// killed process describing exactly what succeeded (D52 point 1).
+/// Every action's outcome, the backend ids created along the way, and what
+/// failed or was skipped — [`apply_plan_gated`]'s result.
+type ApplyPlanResult = (
+    Vec<(String, Outcome)>,
+    ApplyState,
+    Vec<FailedAction>,
+    Vec<SkippedAction>,
+);
+
 fn apply_plan_gated(
     backend: &dyn Backend,
     ir: &Ir,
     plan: &Plan,
     approve: bool,
     seed: ApplyState,
-) -> Result<(Vec<(String, Outcome)>, ApplyState)> {
+    mut on_action: impl FnMut(&PlannedAction, &Outcome, &ApplyState),
+) -> ApplyPlanResult {
     let mut state = seed;
     let mut outcomes: Vec<Option<(String, Outcome)>> =
         (0..plan.actions.len()).map(|_| None).collect();
+    let mut failed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
 
     // A `SetRatio` addresses a split gap, so it must run after the panes that
     // create the group's gaps. The plan orders every Herdr tab action ahead of
@@ -610,11 +697,37 @@ fn apply_plan_gated(
         );
 
     for (index, action) in order {
+        let blocking_dependency = action_dependencies(ir, action)
+            .into_iter()
+            .find(|id| blocked.contains(id));
         let outcome = if action.destructive && !approve {
             Outcome::Skipped
+        } else if let Some(depends_on) = blocking_dependency {
+            skipped.push(SkippedAction {
+                address: action.address.clone(),
+                depends_on: depends_on.clone(),
+            });
+            Outcome::DependencySkipped { depends_on }
         } else {
-            apply_action(backend, ir, &mut state, action)?
+            match apply_action(backend, ir, &mut state, action) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let message = error.to_string();
+                    failed.push(FailedAction {
+                        address: action.address.clone(),
+                        error: message.clone(),
+                    });
+                    Outcome::Failed(message)
+                }
+            }
         };
+        if matches!(
+            outcome,
+            Outcome::Failed(_) | Outcome::DependencySkipped { .. }
+        ) {
+            blocked.insert(action.address.clone());
+        }
+        on_action(action, &outcome, &state);
         outcomes[index] = Some((action.address.clone(), outcome));
     }
 
@@ -622,7 +735,7 @@ fn apply_plan_gated(
         .into_iter()
         .map(|outcome| outcome.expect("every action applied exactly once"))
         .collect();
-    Ok((outcomes, state))
+    (outcomes, state, failed, skipped)
 }
 
 /// What `drove up` did, reported as one summary line (D43 step 5).
@@ -652,6 +765,12 @@ pub struct UpReport {
     pub focused: Option<String>,
     /// A destructive action was left unapplied for want of `--yes` (D22).
     pub blocked_destructive: bool,
+    /// Backend actions whose call failed (D52 point 2); `up` exits 1 when
+    /// this is non-empty.
+    pub failed: Vec<FailedAction>,
+    /// Actions left unattempted because an action they depend on failed or
+    /// was itself skipped this run (D52 point 2).
+    pub skipped: Vec<SkippedAction>,
 }
 
 /// `drove up` end to end (D43): ensure the session is reachable, run the
@@ -684,19 +803,44 @@ pub fn up(
             tasks: Vec::new(),
             focused: None,
             blocked_destructive: false,
+            failed: Vec::new(),
+            skipped: Vec::new(),
         });
     }
 
     let was_in_sync = plan.actions.is_empty();
 
-    // Step 3: run the plan's tasks, then apply its backend actions and record
-    // the resources that came into being so the next run sees them in sync.
+    // Step 3: run the plan's tasks, then apply its backend actions, recording
+    // ownership and saving state right after each action succeeds (D52
+    // point 1): a killed process leaves state describing exactly what was
+    // created, instead of discarding it the way a single end-of-loop
+    // `record_ownership` pass would.
     let tasks = execute_plan_tasks(profile, plan, ctx, state, approve)?;
     // Seed the resolver with what a previous run recorded, so an action
     // against a parent that already converged still finds its backend id.
     let seed = ApplyState::seeded_from(state.profile(ctx.profile));
-    let (outcomes, applied) = apply_plan_gated(backend, ir, plan, approve, seed)?;
-    record_ownership(state, ctx.profile, ir, plan, &outcomes, &applied)?;
+    let existing = state.profile(ctx.profile).cloned().unwrap_or_default();
+    let mut save_error: Option<anyhow::Error> = None;
+    let (outcomes, applied, failed, skipped) = apply_plan_gated(
+        backend,
+        ir,
+        plan,
+        approve,
+        seed,
+        |action, outcome, applied| {
+            if save_error.is_some() {
+                return;
+            }
+            let managed = state.profile_mut(ctx.profile);
+            let changed = record_action_ownership(managed, &existing, ir, action, outcome, applied);
+            if changed && let Err(error) = state.save() {
+                save_error = Some(error);
+            }
+        },
+    );
+    if let Some(error) = save_error {
+        return Err(error);
+    }
 
     let blocked_destructive = !approve && plan.has_destructive_actions();
     let (created, changed) = count_applied(plan, &outcomes);
@@ -726,6 +870,8 @@ pub fn up(
         tasks,
         focused,
         blocked_destructive,
+        failed,
+        skipped,
     })
 }
 
@@ -794,27 +940,26 @@ fn focus_first_workspace(
     Ok(Some(backend_id))
 }
 
-/// Records ownership of the resources a plan just applied, so the next
-/// `build_plan` sees them as owned and converged. The backend id comes from
-/// what this apply created, else the action's own backend id (a rename or
-/// restart of an already-known resource), else what local state already held.
-/// A `Detach` drops the resource; an `AdoptPane` records the caller pane even
-/// though no backend verb ran (D24).
-fn record_ownership(
-    state: &mut LocalState,
-    profile: &str,
+/// Records one applied action's ownership into `managed.resources` — the
+/// per-action split of the old whole-plan pass (D52 point 1), called right
+/// after each action's outcome is known so a save right after leaves state
+/// describing exactly what succeeded. The backend id comes from what this
+/// action's own apply created (`applied`), else the action's own already-known
+/// backend id (a rename or restart of an already-known resource), else what
+/// local state already held (`existing`, a snapshot from before this apply
+/// started). A `Detach` drops the resource; an `AdoptPane` records the caller
+/// pane even though no backend verb ran (D24) — both regardless of `outcome`,
+/// since neither ever touches the backend. Returns whether `managed` actually
+/// changed, so the caller only pays for a `state.save()` when there is
+/// something to save.
+fn record_action_ownership(
+    managed: &mut ManagedProfile,
+    existing: &ManagedProfile,
     ir: &Ir,
-    plan: &Plan,
-    outcomes: &[(String, Outcome)],
+    action: &PlannedAction,
+    outcome: &Outcome,
     applied: &ApplyState,
-) -> Result<()> {
-    enum Change {
-        Upsert(String, ManagedResource),
-        Remove(String),
-    }
-    let mut changes: Vec<Change> = Vec::new();
-    let existing = state.profile(profile).cloned().unwrap_or_default();
-
+) -> bool {
     let resolve = |name: &str, ids: &BTreeMap<String, String>, own: Option<&str>| -> String {
         ids.get(name)
             .cloned()
@@ -828,174 +973,160 @@ fn record_ownership(
             .unwrap_or_default()
     };
 
-    for (action, (_, outcome)) in plan.actions.iter().zip(outcomes) {
-        let address = action.address.as_str();
-        match action.kind {
-            Action::Core(CoreAction::AdoptPane) => {
-                if let (Ok(digest), Ok(parent)) =
-                    (digest_of(ir, "pane", address), pane_group_id(ir, address))
-                {
-                    let backend_id =
-                        resolve(address, &applied.pane_ids, action.backend_id.as_deref());
-                    changes.push(Change::Upsert(
-                        address.to_owned(),
-                        ManagedResource {
-                            kind: "pane".into(),
-                            backend_id,
-                            parent: Some(parent),
-                            digest: digest.to_owned(),
-                            adopted: Some(true),
-                            last_outcome: None,
-                        },
-                    ));
-                }
-                continue;
-            }
-            Action::Core(CoreAction::Detach) => {
-                changes.push(Change::Remove(address.to_owned()));
-                continue;
-            }
-            _ => {}
+    let address = action.address.as_str();
+    match action.kind {
+        Action::Core(CoreAction::AdoptPane) => {
+            let (Ok(digest), Ok(parent)) =
+                (digest_of(ir, "pane", address), pane_group_id(ir, address))
+            else {
+                return false;
+            };
+            let backend_id = resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+            managed.resources.insert(
+                address.to_owned(),
+                ManagedResource {
+                    kind: "pane".into(),
+                    backend_id,
+                    parent: Some(parent),
+                    digest: digest.to_owned(),
+                    adopted: Some(true),
+                    last_outcome: None,
+                },
+            );
+            return true;
         }
-
-        if *outcome != Outcome::Applied {
-            continue;
+        Action::Core(CoreAction::Detach) => {
+            return managed.resources.remove(address).is_some();
         }
+        _ => {}
+    }
 
-        match action.kind {
-            Action::Core(CoreAction::CreateWorkspace | CoreAction::RenameWorkspace) => {
-                if let Ok(digest) = digest_of(ir, "workspace", address) {
-                    let backend_id = resolve(
-                        address,
-                        &applied.workspace_ids,
-                        action.backend_id.as_deref(),
-                    );
-                    changes.push(Change::Upsert(
-                        address.to_owned(),
-                        ManagedResource {
-                            kind: "workspace".into(),
-                            backend_id,
-                            parent: None,
-                            digest: digest.to_owned(),
-                            adopted: None,
-                            last_outcome: None,
-                        },
-                    ));
-                }
+    if *outcome != Outcome::Applied {
+        return false;
+    }
+
+    match action.kind {
+        Action::Core(CoreAction::CreateWorkspace | CoreAction::RenameWorkspace) => {
+            let Ok(digest) = digest_of(ir, "workspace", address) else {
+                return false;
+            };
+            let backend_id = resolve(
+                address,
+                &applied.workspace_ids,
+                action.backend_id.as_deref(),
+            );
+            managed.resources.insert(
+                address.to_owned(),
+                ManagedResource {
+                    kind: "workspace".into(),
+                    backend_id,
+                    parent: None,
+                    digest: digest.to_owned(),
+                    adopted: None,
+                    last_outcome: None,
+                },
+            );
+            true
+        }
+        Action::Herdr(HerdrAction::CreateTab | HerdrAction::RenameTab | HerdrAction::SetRatio) => {
+            let mut changed = false;
+            if let (Some(digest), Some(workspace)) = (
+                group_topology_digest(ir, address),
+                group_workspace(ir, address),
+            ) {
+                let backend_id = resolve(address, &applied.group_ids, action.backend_id.as_deref());
+                managed.resources.insert(
+                    address.to_owned(),
+                    ManagedResource {
+                        kind: "placement".into(),
+                        backend_id,
+                        parent: Some(workspace.to_owned()),
+                        digest: digest.to_owned(),
+                        adopted: None,
+                        last_outcome: None,
+                    },
+                );
+                changed = true;
             }
-            Action::Herdr(
-                HerdrAction::CreateTab | HerdrAction::RenameTab | HerdrAction::SetRatio,
-            ) => {
-                if let (Some(digest), Some(workspace)) = (
-                    group_topology_digest(ir, address),
-                    group_workspace(ir, address),
-                ) {
-                    let backend_id =
-                        resolve(address, &applied.group_ids, action.backend_id.as_deref());
-                    changes.push(Change::Upsert(
-                        address.to_owned(),
-                        ManagedResource {
-                            kind: "placement".into(),
-                            backend_id,
-                            parent: Some(workspace.to_owned()),
-                            digest: digest.to_owned(),
-                            adopted: None,
-                            last_outcome: None,
-                        },
-                    ));
-                }
-                // A fresh `CreateTab` builds every pane in the group with no
-                // per-pane action, so record each one here (its parent is the
-                // group) — otherwise the next run would see them unobserved
-                // and split them in again.
-                if action.kind == Action::Herdr(HerdrAction::CreateTab)
-                    && let Ok(group) = placement_group(ir, address)
-                {
-                    for pane in &group.panes {
-                        if let Ok(digest) = digest_of(ir, "pane", pane) {
-                            let backend_id = resolve(pane, &applied.pane_ids, None);
-                            changes.push(Change::Upsert(
-                                pane.clone(),
-                                ManagedResource {
-                                    kind: "pane".into(),
-                                    backend_id,
-                                    parent: Some(address.to_owned()),
-                                    digest: digest.to_owned(),
-                                    adopted: None,
-                                    last_outcome: None,
-                                },
-                            ));
-                        }
+            // A fresh `CreateTab` builds every pane in the group with no
+            // per-pane action, so record each one here (its parent is the
+            // group) — otherwise the next run would see them unobserved and
+            // split them in again.
+            if action.kind == Action::Herdr(HerdrAction::CreateTab)
+                && let Ok(group) = placement_group(ir, address)
+            {
+                for pane in &group.panes {
+                    if let Ok(digest) = digest_of(ir, "pane", pane) {
+                        let backend_id = resolve(pane, &applied.pane_ids, None);
+                        managed.resources.insert(
+                            pane.clone(),
+                            ManagedResource {
+                                kind: "pane".into(),
+                                backend_id,
+                                parent: Some(address.to_owned()),
+                                digest: digest.to_owned(),
+                                adopted: None,
+                                last_outcome: None,
+                            },
+                        );
+                        changed = true;
                     }
                 }
             }
-            Action::Core(
-                CoreAction::CreatePane | CoreAction::RenamePane | CoreAction::RestartCommand,
-            )
-            | Action::Herdr(HerdrAction::SplitPane) => {
-                if let (Ok(digest), Ok(parent)) =
-                    (digest_of(ir, "pane", address), pane_group_id(ir, address))
-                {
-                    let backend_id =
-                        resolve(address, &applied.pane_ids, action.backend_id.as_deref());
-                    let adopted = existing
-                        .resources
-                        .get(address)
-                        .and_then(|resource| resource.adopted);
-                    changes.push(Change::Upsert(
-                        address.to_owned(),
-                        ManagedResource {
-                            kind: "pane".into(),
-                            backend_id,
-                            parent: Some(parent),
-                            digest: digest.to_owned(),
-                            adopted,
-                            last_outcome: None,
-                        },
-                    ));
-                }
-            }
-            Action::Herdr(HerdrAction::StartAgent) | Action::Core(CoreAction::PromptAgent) => {
-                if let (Ok(digest), Ok(pane)) =
-                    (digest_of(ir, "agent", address), agent_parent(ir, address))
-                {
-                    let backend_id =
-                        resolve(&pane, &applied.pane_ids, action.backend_id.as_deref());
-                    changes.push(Change::Upsert(
-                        address.to_owned(),
-                        ManagedResource {
-                            kind: "agent".into(),
-                            backend_id,
-                            parent: Some(pane),
-                            digest: digest.to_owned(),
-                            adopted: None,
-                            last_outcome: None,
-                        },
-                    ));
-                }
-            }
-            // A topology-change `ClosePane` is immediately followed by a
-            // `SplitPane` in the same plan that re-records the pane under its
-            // new group, so there is nothing to remove here.
-            _ => {}
+            changed
         }
-    }
-
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let managed = state.profile_mut(profile);
-    for change in changes {
-        match change {
-            Change::Upsert(id, resource) => {
-                managed.resources.insert(id, resource);
-            }
-            Change::Remove(id) => {
-                managed.resources.remove(&id);
-            }
+        Action::Core(
+            CoreAction::CreatePane | CoreAction::RenamePane | CoreAction::RestartCommand,
+        )
+        | Action::Herdr(HerdrAction::SplitPane) => {
+            let (Ok(digest), Ok(parent)) =
+                (digest_of(ir, "pane", address), pane_group_id(ir, address))
+            else {
+                return false;
+            };
+            let backend_id = resolve(address, &applied.pane_ids, action.backend_id.as_deref());
+            let adopted = existing
+                .resources
+                .get(address)
+                .and_then(|resource| resource.adopted);
+            managed.resources.insert(
+                address.to_owned(),
+                ManagedResource {
+                    kind: "pane".into(),
+                    backend_id,
+                    parent: Some(parent),
+                    digest: digest.to_owned(),
+                    adopted,
+                    last_outcome: None,
+                },
+            );
+            true
         }
+        Action::Herdr(HerdrAction::StartAgent) | Action::Core(CoreAction::PromptAgent) => {
+            let (Ok(digest), Ok(pane)) =
+                (digest_of(ir, "agent", address), agent_parent(ir, address))
+            else {
+                return false;
+            };
+            let backend_id = resolve(&pane, &applied.pane_ids, action.backend_id.as_deref());
+            managed.resources.insert(
+                address.to_owned(),
+                ManagedResource {
+                    kind: "agent".into(),
+                    backend_id,
+                    parent: Some(pane),
+                    digest: digest.to_owned(),
+                    adopted: None,
+                    last_outcome: None,
+                },
+            );
+            true
+        }
+        // A topology-change `ClosePane` is immediately followed by a
+        // `SplitPane` in the same plan that re-records the pane under its new
+        // group, so there is nothing to remove here.
+        _ => false,
     }
-    state.save()
 }
 
 fn group_topology_digest<'a>(ir: &'a Ir, id: &str) -> Option<&'a str> {
@@ -1934,6 +2065,10 @@ mod tests {
         /// `workspace.create` always returns alongside it (D49).
         auto_root_tab: bool,
         root_tabs: Mutex<BTreeMap<String, String>>,
+        /// Calls (matched against the same string [`RecordingHerdr::record`]
+        /// logs) that fail instead of succeeding, so a test can prove `up`
+        /// collects one action's error and keeps applying the rest (D52).
+        fail_calls: BTreeSet<&'static str>,
     }
 
     impl RecordingHerdr {
@@ -1944,6 +2079,18 @@ mod tests {
                 next_id: Mutex::new(1),
                 auto_root_tab: false,
                 root_tabs: Mutex::new(BTreeMap::new()),
+                fail_calls: BTreeSet::new(),
+            }
+        }
+
+        /// Like [`RecordingHerdr::running`], but the given calls fail
+        /// instead of succeeding (D52). A failing `create_workspace`/
+        /// `create_tab` still records the call and consumes an id, matching
+        /// what recording-then-failing looks like against a real backend.
+        fn running_failing(fail_calls: &[&'static str]) -> Self {
+            Self {
+                fail_calls: fail_calls.iter().copied().collect(),
+                ..Self::running()
             }
         }
 
@@ -1964,6 +2111,7 @@ mod tests {
                 next_id: Mutex::new(1),
                 auto_root_tab: false,
                 root_tabs: Mutex::new(BTreeMap::new()),
+                fail_calls: BTreeSet::new(),
             }
         }
 
@@ -1991,7 +2139,11 @@ mod tests {
             None
         }
         fn create_workspace(&self, label: &str, _cwd: &Path) -> Result<String> {
-            self.record(format!("create_workspace:{label}"));
+            let call = format!("create_workspace:{label}");
+            self.record(call.clone());
+            if self.fail_calls.contains(call.as_str()) {
+                bail!("boom: {call}");
+            }
             let workspace_id = self.id("w");
             if self.auto_root_tab {
                 self.root_tabs
@@ -2063,6 +2215,10 @@ mod tests {
             self.record(format!(
                 "create_tab:{workspace_id}:{label}:existing={existing_tab:?}"
             ));
+            let fail_key = format!("create_tab:{label}");
+            if self.fail_calls.contains(fail_key.as_str()) {
+                bail!("boom: {fail_key}");
+            }
             let tab_id = existing_tab.map_or_else(|| self.id("t"), ToOwned::to_owned);
             let pane_ids = panes
                 .iter()
@@ -2414,6 +2570,189 @@ mod tests {
         );
     }
 
+    /// Two independent workspaces, each with one Herdr tab and one pane — the
+    /// shape D52's repro needs: three create-style backend calls
+    /// (`CreateWorkspace(dev)`, `CreateWorkspace(ops)`, `CreateTab(dev/main)`)
+    /// where the second can be made to fail without touching the third.
+    fn two_workspace_profile() -> Profile {
+        profile_from(json!({
+            "name": "default",
+            "workspaces": [
+                {"name": "dev", "tabs": [{"name": "main", "panes": [{"name": "editor"}]}]},
+                {"name": "ops", "tabs": [{"name": "main", "panes": [{"name": "shell"}]}]},
+            ]
+        }))
+    }
+
+    #[test]
+    fn up_records_the_first_action_and_still_applies_an_independent_third_past_a_failed_second() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = two_workspace_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreateWorkspace), "ops"),
+            (Action::Herdr(HerdrAction::CreateTab), "dev/main"),
+        ]);
+        let backend = RecordingHerdr::running_failing(&["create_workspace:ops"]);
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            None,
+            false,
+        )
+        .expect("up does not abort on a single failed action");
+
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "the second action must be reported failed"
+        );
+        assert_eq!(report.failed[0].address, "ops");
+        assert!(report.failed[0].error.contains("boom"));
+        assert!(
+            report.skipped.is_empty(),
+            "the third action does not depend on `ops`, so nothing is skipped: {:?}",
+            report.skipped
+        );
+
+        // The independent third action still ran, despite the second one
+        // failing (D52 point 2, audit finding 1).
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_tab:")),
+            "the independent CreateTab must still apply: {calls:?}"
+        );
+
+        // The first action's ownership was recorded (D52 point 1): a killed
+        // process after the failure would leave `dev` and `dev/main`
+        // describing exactly what succeeded.
+        let managed = state.profile("default").expect("profile recorded");
+        assert!(managed.resources.contains_key("dev"), "dev recorded");
+        assert!(
+            managed.resources.contains_key("dev/main"),
+            "dev/main recorded"
+        );
+        assert!(managed.resources.contains_key("editor"), "editor recorded");
+        assert!(
+            !managed.resources.contains_key("ops"),
+            "the failed workspace must not be recorded"
+        );
+    }
+
+    #[test]
+    fn up_skips_an_action_that_depends_on_one_that_failed() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = two_workspace_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "ops"),
+            (Action::Herdr(HerdrAction::CreateTab), "ops/main"),
+        ]);
+        let backend = RecordingHerdr::running_failing(&["create_workspace:ops"]);
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            None,
+            false,
+        )
+        .expect("up");
+
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].address, "ops");
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "the dependent Herdr tab must be skipped"
+        );
+        assert_eq!(report.skipped[0].address, "ops/main");
+        assert_eq!(report.skipped[0].depends_on, "ops");
+
+        // The skipped action never touched the backend at all.
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create_tab:")),
+            "a dependency-skipped action must never call the backend: {calls:?}"
+        );
+        assert!(
+            state
+                .profile("default")
+                .map(|managed| managed.resources.is_empty())
+                .unwrap_or(true),
+            "neither the failed nor the skipped resource is recorded"
+        );
+    }
+
+    #[test]
+    fn a_rerun_after_a_partial_failure_plans_only_what_is_still_missing() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = two_workspace_profile();
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Core(CoreAction::CreateWorkspace), "ops"),
+            (Action::Herdr(HerdrAction::CreateTab), "dev/main"),
+        ]);
+        let backend = RecordingHerdr::running_failing(&["create_workspace:ops"]);
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            None,
+            false,
+        )
+        .expect("up");
+
+        // The next `build_plan` sees `dev` and its Herdr tab as owned and
+        // converged, and proposes only what actually failed last time.
+        let managed = state.profile("default").cloned().unwrap_or_default();
+        let snapshot = managed.to_snapshot("default", None);
+        let rerun = build_plan(&profile, &snapshot).expect("plan");
+
+        let addresses: Vec<&str> = rerun
+            .actions
+            .iter()
+            .map(|action| action.address.as_str())
+            .collect();
+        assert_eq!(
+            addresses,
+            vec!["ops", "ops/main"],
+            "only the failed workspace (and what depends on it) is replanned: {addresses:?}"
+        );
+    }
+
     #[test]
     fn up_reuses_the_freshly_created_workspaces_root_tab_for_its_first_tab_only() {
         use crate::planner::HerdrAction;
@@ -2710,7 +3049,7 @@ mod tests {
         };
 
         let backend = FlavorlessBackend::default();
-        let outcomes = apply_plan(&backend, &ir, &plan).expect("apply");
+        let outcomes = apply_plan(&backend, &ir, &plan);
 
         assert_eq!(outcomes[0].1, Outcome::Applied);
         assert_eq!(
