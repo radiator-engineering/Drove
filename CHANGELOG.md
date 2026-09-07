@@ -16,10 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that depend on the failed one are skipped and reported as
   `skipped: ID: depends on PARENT`, and `up` exits 1 after printing
   `failed: ID: ERROR`/`skipped: ...` lines for everything affected. The next
-  `up` plans only what's still missing. `drove status` now reports a journal
-  entry an apply began but never finished as `interrupted ACTION (DIGEST)`,
-  and `drove run` warns `previous run of NAME did not finish; rerunning`
-  before rerunning that task.
+  `up` plans only what's still missing. A task whose `after` names one that
+  failed (or was itself skipped) is no longer run either: it's reported the
+  same way, and `drove run`'s per-task output gains a matching outcome.
+  `drove status` now reports a journal entry an apply began but never
+  finished as `interrupted ACTION (DIGEST)`, and `drove run` warns
+  `previous run of NAME did not finish; rerunning` before rerunning that
+  task. A partial apply's summary line and `--json` `"status"` no longer
+  claim `in_sync`; a `state.save()` failure now stops `up` from applying
+  further actions it would have no record of.
 - `drove down --purge` no longer aborts when the session has already lost a
   resource it recorded: the pane, tab, or workspace is pruned from local
   state instead of aborting on `pane_not_found`, and a `close_pane` failure

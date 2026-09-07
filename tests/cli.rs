@@ -910,6 +910,57 @@ fn serve_snapshot_then_ping(path: PathBuf, snapshot: Value) -> thread::JoinHandl
     })
 }
 
+/// Answers `session.snapshot`, `ping`, then one `workspace.create` per
+/// label in `labels`, in order: every label failing `workspace.create`
+/// returns a Herdr API error instead of a `workspace_id` (D52: a real
+/// backend-call failure, not a task or an in-process fake, exercised through
+/// `drove up` end to end). One connection per request, matching every other
+/// fake Herdr server here.
+fn serve_up_with_failing_workspaces(
+    path: PathBuf,
+    labels: &'static [&'static str],
+    fail: &'static [&'static str],
+) -> thread::JoinHandle<()> {
+    let listener = bind_fake_herdr(&path).expect("bind fake Herdr socket");
+    thread::spawn(move || {
+        let mut next_workspace_id = 1;
+        let mut label_index = 0;
+        loop {
+            let stream = listener.accept().expect("accept fake Herdr connection");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read request");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = match request["method"].as_str().expect("method") {
+                "session.snapshot" => {
+                    json!({"id": request["id"], "result": {"snapshot": {
+                        "version": "0.8.2", "protocol": 1,
+                        "workspaces": [], "tabs": [], "panes": [], "agents": [],
+                    }}})
+                }
+                "ping" => json!({"id": request["id"], "result": {"type": "pong"}}),
+                "workspace.create" => {
+                    let label = labels[label_index];
+                    label_index += 1;
+                    if fail.contains(&label) {
+                        json!({"id": request["id"], "error": {"code": "boom", "message": "boom"}})
+                    } else {
+                        let workspace_id = format!("w{next_workspace_id}");
+                        next_workspace_id += 1;
+                        json!({"id": request["id"], "result": {"workspace_id": workspace_id}})
+                    }
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            serde_json::to_writer(stream.get_mut(), &response).expect("write response");
+            stream.get_mut().write_all(b"\n").expect("newline");
+            if label_index == labels.len() {
+                break;
+            }
+        }
+    })
+}
+
 fn write_state_with_stale_workspace(state_home: &Path, repo_root: &Path) {
     let state_path = state_file_path(state_home, repo_root);
     fs::create_dir_all(state_path.parent().expect("state dir")).expect("create state dir");
@@ -1275,5 +1326,70 @@ fn up_saves_the_pruned_managed_set_before_applying() {
             .expect("resources object")
             .is_empty(),
         "up should have saved the pruned (now empty) resource set: {saved}"
+    );
+}
+
+#[test]
+fn up_reports_a_failed_backend_call_and_still_applies_an_independent_workspace() {
+    // D52 points 2-3, exercised through the real CLI against a fake Herdr
+    // that answers `workspace.create` for `ops` with an API error: `up`
+    // must still create the independent `dev` workspace, print one `failed`
+    // line for `ops`, and exit 1.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let drovefile = directory.path().join("Drovefile");
+    fs::write(
+        &drovefile,
+        r#"
+profile(
+    name = "default",
+    workspaces = [
+        workspace(name = "dev"),
+        workspace(name = "ops"),
+    ],
+)
+"#,
+    )
+    .expect("Drovefile");
+
+    let state_home = directory.path().join("state");
+    let socket = directory.path().join("herdr-up-failing.sock");
+    let server = serve_up_with_failing_workspaces(socket.clone(), &["dev", "ops"], &["ops"]);
+
+    let mut command = Command::cargo_bin("drove").expect("binary");
+    command
+        .env("DROVE_STATE_HOME", &state_home)
+        .args([
+            "--file",
+            drovefile.to_str().expect("UTF-8 path"),
+            "--socket",
+            socket.to_str().expect("UTF-8 socket"),
+            "up",
+            "--no-focus",
+            "--yes",
+        ])
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("partial failure")
+                .and(predicate::str::contains(
+                    "failed: ops: Herdr API error boom: boom",
+                ))
+                .and(predicate::str::contains("skipped:").not()),
+        );
+    server.join().expect("fake Herdr server thread");
+
+    let state_path = state_file_path(&state_home, directory.path());
+    let saved: Value = serde_json::from_slice(&fs::read(&state_path).expect("read state after up"))
+        .expect("state JSON");
+    let resources = saved["profiles"]["default"]["resources"]
+        .as_object()
+        .expect("resources object");
+    assert!(
+        resources.contains_key("dev"),
+        "the independent, successful workspace must still be recorded: {saved}"
+    );
+    assert!(
+        !resources.contains_key("ops"),
+        "the failed workspace must not be recorded: {saved}"
     );
 }

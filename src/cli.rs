@@ -776,10 +776,12 @@ fn up_command(
 
     let blocked = report.blocked_destructive
         || !report.failed.is_empty()
-        || report
-            .tasks
-            .iter()
-            .any(|(_, outcome)| matches!(outcome, TaskOutcome::Blocked | TaskOutcome::Ran(false)));
+        || report.tasks.iter().any(|(_, outcome)| {
+            matches!(
+                outcome,
+                TaskOutcome::Blocked | TaskOutcome::Ran(false) | TaskOutcome::DependencySkipped
+            )
+        });
     if blocked {
         if report.blocked_destructive {
             eprintln!(
@@ -924,7 +926,7 @@ fn report_task_outcomes(results: &[(String, TaskOutcome)], json: bool) -> Result
     for (_, outcome) in results {
         match outcome {
             TaskOutcome::Blocked => blocked = true,
-            TaskOutcome::Ran(false) => failed = true,
+            TaskOutcome::Ran(false) | TaskOutcome::DependencySkipped => failed = true,
             _ => {}
         }
     }
@@ -954,6 +956,7 @@ fn outcome_label(outcome: TaskOutcome) -> &'static str {
         TaskOutcome::Ran(true) => "ran",
         TaskOutcome::Ran(false) => "failed",
         TaskOutcome::Blocked => "blocked",
+        TaskOutcome::DependencySkipped => "dependency_skipped",
     }
 }
 
@@ -964,6 +967,9 @@ fn describe_outcome(name: &str, outcome: TaskOutcome) -> String {
         TaskOutcome::Ran(false) => format!("{name}: failed"),
         TaskOutcome::Blocked => {
             format!("{name}: blocked (needs approval; re-run with --yes)")
+        }
+        TaskOutcome::DependencySkipped => {
+            format!("{name}: skipped (an `after` prerequisite did not succeed)")
         }
     }
 }

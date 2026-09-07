@@ -57,6 +57,9 @@ pub enum TaskOutcome {
     Ran(bool),
     /// `run` needed approval that isn't recorded yet.
     Blocked,
+    /// Never attempted: an `after` prerequisite failed or was blocked (D52
+    /// point 2 — a task after a failed task is skipped, not run anyway).
+    DependencySkipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,10 +281,22 @@ pub fn run_named_task(
 
     let ir = profile.to_ir();
     let mut results = Vec::new();
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
     for name in order {
         let task = tasks_by_name[name.as_str()];
+        // A prerequisite that failed or was itself blocked means this task
+        // never runs either (D52 point 2): running it anyway would build on
+        // a state its own `after` says isn't ready.
+        if task.after.iter().any(|dep| blocked.contains(dep.as_str())) {
+            blocked.insert(name.clone());
+            results.push((name, TaskOutcome::DependencySkipped));
+            continue;
+        }
         let digest = digest_of(&ir, "task", &name)?;
         let outcome = run_task(task, digest, ctx, state, approve)?;
+        if matches!(outcome, TaskOutcome::Ran(false) | TaskOutcome::Blocked) {
+            blocked.insert(name.clone());
+        }
         results.push((name, outcome));
     }
     Ok(results)
@@ -290,13 +305,21 @@ pub fn run_named_task(
 /// Runs every `RunTask` action a [`Plan`] proposes, in the plan's own
 /// (already `after`-ordered) order. Every other action kind is left for a
 /// future PR once the `Backend` methods it needs (PR 3/5) exist.
+///
+/// A task whose `after` names one that failed or was itself blocked is never
+/// run: it's reported as [`TaskOutcome::DependencySkipped`] in the returned
+/// task list and collected into the returned [`SkippedAction`] list (D52
+/// point 2), the same shape `apply_plan_gated` uses for a skipped backend
+/// action.
+type PlanTaskResults = (Vec<(String, TaskOutcome)>, Vec<SkippedAction>);
+
 pub fn execute_plan_tasks(
     profile: &Profile,
     plan: &Plan,
     ctx: &ExecutionContext<'_>,
     state: &mut LocalState,
     approve: bool,
-) -> Result<Vec<(String, TaskOutcome)>> {
+) -> Result<PlanTaskResults> {
     let tasks_by_name: BTreeMap<&str, &Task> = profile
         .tasks
         .iter()
@@ -304,6 +327,8 @@ pub fn execute_plan_tasks(
         .collect();
     let ir = profile.to_ir();
     let mut results = Vec::new();
+    let mut skipped = Vec::new();
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
     for action in &plan.actions {
         if action.kind != Action::Core(CoreAction::RunTask) {
             continue;
@@ -311,11 +336,24 @@ pub fn execute_plan_tasks(
         let Some(task) = tasks_by_name.get(action.address.as_str()) else {
             continue;
         };
+        let blocking_dependency = task.after.iter().find(|dep| blocked.contains(dep.as_str()));
+        if let Some(depends_on) = blocking_dependency {
+            skipped.push(SkippedAction {
+                address: action.address.clone(),
+                depends_on: depends_on.clone(),
+            });
+            blocked.insert(action.address.clone());
+            results.push((action.address.clone(), TaskOutcome::DependencySkipped));
+            continue;
+        }
         let digest = digest_of(&ir, "task", &action.address)?;
         let outcome = run_task(task, digest, ctx, state, approve)?;
+        if matches!(outcome, TaskOutcome::Ran(false) | TaskOutcome::Blocked) {
+            blocked.insert(action.address.clone());
+        }
         results.push((action.address.clone(), outcome));
     }
-    Ok(results)
+    Ok((results, skipped))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -824,13 +862,13 @@ pub fn up(
     // point 1): a killed process leaves state describing exactly what was
     // created, instead of discarding it the way a single end-of-loop
     // `record_ownership` pass would.
-    let tasks = execute_plan_tasks(profile, plan, ctx, state, approve)?;
+    let (tasks, task_skipped) = execute_plan_tasks(profile, plan, ctx, state, approve)?;
     // Seed the resolver with what a previous run recorded, so an action
     // against a parent that already converged still finds its backend id.
     let seed = ApplyState::seeded_from(state.profile(ctx.profile));
     let existing = state.profile(ctx.profile).cloned().unwrap_or_default();
     let mut save_error: Option<anyhow::Error> = None;
-    let (outcomes, applied, failed, skipped) = apply_plan_gated(
+    let (outcomes, applied, failed, backend_skipped) = apply_plan_gated(
         backend,
         ir,
         plan,
@@ -849,6 +887,8 @@ pub fn up(
     if let Some(error) = save_error {
         return Err(error);
     }
+    let mut skipped = task_skipped;
+    skipped.extend(backend_skipped);
 
     let blocked_destructive = !approve && plan.has_destructive_actions();
     let (created, changed) = count_applied(plan, &outcomes);
@@ -1751,6 +1791,32 @@ mod tests {
     }
 
     #[test]
+    fn run_named_task_skips_a_task_whose_prerequisite_failed() {
+        let (mut state, _dir) = temp_state();
+        let runner = FakeRunner::default().fail(&["run-a"]);
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [
+                {"name": "a", "run": ["run-a"]},
+                {"name": "b", "run": ["run-b"], "after": ["a"]}
+            ]
+        }));
+        let root = PathBuf::from("/repo");
+        let results =
+            run_named_task(&profile, "b", &ctx(&root, &runner), &mut state, true).expect("run");
+
+        assert_eq!(
+            results,
+            vec![
+                ("a".to_owned(), TaskOutcome::Ran(false)),
+                ("b".to_owned(), TaskOutcome::DependencySkipped),
+            ]
+        );
+        // `b`'s own `run` must never have been invoked.
+        assert_eq!(runner.calls(), vec![vec!["run-a".to_owned()]]);
+    }
+
+    #[test]
     fn list_tasks_reports_last_outcome() {
         let (mut state, _dir) = temp_state();
         let runner = FakeRunner::default();
@@ -1780,12 +1846,46 @@ mod tests {
         }));
         let plan = build_plan(&profile, &Snapshot::default()).expect("plan");
         let root = PathBuf::from("/repo");
-        let results = execute_plan_tasks(&profile, &plan, &ctx(&root, &runner), &mut state, true)
-            .expect("execute");
+        let (results, skipped) =
+            execute_plan_tasks(&profile, &plan, &ctx(&root, &runner), &mut state, true)
+                .expect("execute");
         assert_eq!(
             results,
             vec![("scaffold".to_owned(), TaskOutcome::Ran(true))]
         );
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn execute_plan_tasks_skips_a_task_after_a_failed_prerequisite() {
+        let (mut state, _dir) = temp_state();
+        let runner = FakeRunner::default().fail(&["run-a"]);
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [
+                {"name": "a", "run": ["run-a"]},
+                {"name": "b", "run": ["run-b"], "after": ["a"]}
+            ]
+        }));
+        let plan = build_plan(&profile, &Snapshot::default()).expect("plan");
+        let root = PathBuf::from("/repo");
+
+        let (results, skipped) =
+            execute_plan_tasks(&profile, &plan, &ctx(&root, &runner), &mut state, true)
+                .expect("execute");
+
+        assert_eq!(
+            results,
+            vec![
+                ("a".to_owned(), TaskOutcome::Ran(false)),
+                ("b".to_owned(), TaskOutcome::DependencySkipped),
+            ]
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].address, "b");
+        assert_eq!(skipped[0].depends_on, "a");
+        // `b`'s own `run` must never have been invoked.
+        assert_eq!(runner.calls(), vec![vec!["run-a".to_owned()]]);
     }
 
     fn down_test_profile() -> Profile {
@@ -2811,6 +2911,53 @@ mod tests {
             !calls.iter().any(|c| c == "create_workspace:ops"),
             "no action after the save failure may reach the backend: {calls:?}"
         );
+    }
+
+    #[test]
+    fn up_skips_a_task_that_depends_on_one_that_failed() {
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "tasks": [
+                {"name": "a", "run": ["run-a"]},
+                {"name": "b", "run": ["run-b"], "after": ["a"]}
+            ]
+        }));
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::RunTask), "a"),
+            (Action::Core(CoreAction::RunTask), "b"),
+        ]);
+        let backend = RecordingHerdr::running();
+        let runner = FakeRunner::default().fail(&["run-a"]);
+        let root = PathBuf::from("/repo");
+
+        let report = up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            None,
+            false,
+        )
+        .expect("up does not abort on a failed task");
+
+        assert_eq!(
+            report.tasks,
+            vec![
+                ("a".to_owned(), TaskOutcome::Ran(false)),
+                ("b".to_owned(), TaskOutcome::DependencySkipped),
+            ],
+            "a task after a failed task must not run (D52 point 2)"
+        );
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].address, "b");
+        assert_eq!(report.skipped[0].depends_on, "a");
+        assert_eq!(runner.calls(), vec![vec!["run-a".to_owned()]]);
     }
 
     #[test]
