@@ -1,0 +1,36 @@
+src/cli.rs
+  s_cf015b23b0b94d::t_ba208f33c35bfe 607-610
+  s_cf015b23b0b94d::t_ee56bb7e268e1c 520-522,527-535,552-570,574-579,583-586
+CHANGELOG.md
+  s_cf015b23b0b94d::t_fc9d512a915e59 10-17
+src/executor.rs
+  s_cf015b23b0b94d::t_85ecfd50f30b9d 1825-1923
+  s_cf015b23b0b94d::t_fce2a1712823b9 327-331
+  s_cf015b23b0b94d::t_7fba76a8ed6c8e 339-341
+  s_cf015b23b0b94d::t_0f46cd68fa45fd 381,383
+  s_cf015b23b0b94d::t_6d36a760c0a250 1296
+tests/cli.rs
+  s_cf015b23b0b94d::t_2e6aa1cbeae6f7 591-597
+  s_cf015b23b0b94d::t_5be52aec783acf 558-562
+  s_cf015b23b0b94d::t_d726416fffef07 528-542
+  s_cf015b23b0b94d::t_ce475cdeb5cc90 555-557
+  s_cf015b23b0b94d::t_247fe38ca82fc5 667-832
+docs/drovefile.md
+  s_cf015b23b0b94d::t_c6910eee3ca2ee 211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f32531e39da13ebcdcd45156352778fc56cd45db",
+  "prompts": {},
+  "sessions": {
+    "s_cf015b23b0b94d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "49625872-7e40-4ef9-93de-c0c821c6357a",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
