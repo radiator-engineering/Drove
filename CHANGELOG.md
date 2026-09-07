@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task. A partial apply's summary line and `--json` `"status"` no longer
   claim `in_sync`; a `state.save()` failure now stops `up` from applying
   further actions it would have no record of.
+- The planner never reports success for an edit it can't apply in place: a
+  pane's `cwd` or `env` change now closes and re-splits the pane
+  (`[destructive]`) instead of a no-op rename, a workspace's `cwd`/`env`
+  change cascades the same recreation to every pane that inherits it, and
+  reordering panes or changing a tab's split direction is a `Conflict`
+  instead of silently misapplying ratios to the wrong pane (#33).
+- `plan`/`status`/`up` detect command drift: a `serve` pane whose backend
+  reports a different running command than the one declared — or nothing
+  running at all — is planned as `RestartCommand`, independent of whether
+  the recorded digest still matches (#33).
 - `drove down --purge` no longer aborts when the session has already lost a
   resource it recorded: the pane, tab, or workspace is pruned from local
   state instead of aborting on `pane_not_found`, and a `close_pane` failure

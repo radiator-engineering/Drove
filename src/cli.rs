@@ -17,6 +17,7 @@ use crate::{
         ExecutionContext, HostCommandRunner, TaskOutcome, UpOutcome, down, list_tasks,
         run_named_task, up,
     },
+    ir::Ir,
     model::{DroveConfig, Profile},
     planner::{Action, CoreAction, Plan, SyncStatus, build_plan},
     state::LocalState,
@@ -347,7 +348,19 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
     let caller_pane_id = client
         .caller_pane_id()
         .filter(|id| live_snapshot.panes.iter().any(|pane| &pane.pane_id == id));
+    // D54: fold the live snapshot's per-pane `process_info` in so the
+    // planner can compare what's actually running to what's declared, not
+    // only the declared state to itself. Only when the backend actually
+    // reports the capability: Radiator sets a pane's `process_info` to
+    // `None` both when nothing is running and when the hub simply omitted
+    // it, and merging that unconditionally would read an unreported process
+    // as idle and plan a spurious `RestartCommand`.
     let snapshot = pruned.to_snapshot(&profile.name, caller_pane_id);
+    let snapshot = if client.capabilities().process_info {
+        snapshot.merge_process_info(&live_snapshot)
+    } else {
+        snapshot
+    };
     let plan = build_plan(profile, &snapshot)?;
 
     // Only `status` and `plan` reach here: Render/Run/Down/Lint/Ls returned
@@ -679,6 +692,39 @@ fn down_command(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Rewrites every workspace, pane, and placement digest in `managed` still
+/// recorded under the pre-D53 single-hash format to the resource's current
+/// composite digest, when that resource is still declared in `ir` — so the
+/// D53 migration amnesty (`crate::planner::is_legacy_digest`) ends after one
+/// `up` instead of persisting forever. A resource no longer declared is left
+/// alone; the normal detach/prune path handles it. Returns whether anything
+/// changed, so the caller knows whether to save.
+fn restamp_legacy_digests(managed: &mut crate::state::ManagedProfile, ir: &Ir) -> bool {
+    let mut changed = false;
+    for (id, resource) in &mut managed.resources {
+        if !crate::planner::is_legacy_digest(&resource.digest) {
+            continue;
+        }
+        let fresh = match resource.kind.as_str() {
+            "placement" => ir
+                .placements
+                .iter()
+                .find(|group| &group.id == id)
+                .map(|group| group.topology_digest.clone()),
+            kind => ir
+                .resources
+                .iter()
+                .find(|candidate| candidate.kind == kind && &candidate.name == id)
+                .map(|candidate| candidate.digest.clone()),
+        };
+        if let Some(fresh) = fresh {
+            resource.digest = fresh;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// `drove up` / `drove [PROFILE]` (D43): start the session if it is not
 /// running, apply the plan (tasks and backend actions), bring the target
 /// workspace to the front, and — from a terminal outside Herdr — attach to the
@@ -707,11 +753,21 @@ fn up_command(
     // session and applies against local state as recorded, unchanged from
     // today. The same probe result is reused for the Radiator reachability
     // check below, rather than reaching the backend a second time.
+    let ir = profile.to_ir();
     let live_snapshot = client.snapshot();
     if let Ok(live_snapshot) = &live_snapshot {
         let managed = state.profile(profile_arg).cloned().unwrap_or_default();
-        let (pruned, dropped) = crate::state::prune_missing(&managed, live_snapshot);
-        if !dropped.is_empty() {
+        let (mut pruned, dropped) = crate::state::prune_missing(&managed, live_snapshot);
+        // D53 migration: a resource confirmed still live (it survived the
+        // prune above) but still recorded under the pre-D53 single-hash
+        // digest can't be diffed by category, so the planner treats it as
+        // converged (`planner::is_legacy_digest`) rather than guessing what
+        // changed from a format that carries no field breakdown at all. That
+        // has to end after one `up`, not stay true forever, so re-stamp the
+        // fresh composite digest here — outside the plan entirely, so it
+        // never shows up as an edit.
+        let restamped = restamp_legacy_digests(&mut pruned, &ir);
+        if !dropped.is_empty() || restamped {
             state.profiles.insert(profile_arg.to_owned(), pruned);
             state.save()?;
         }
@@ -729,6 +785,15 @@ fn up_command(
         .profile(profile_arg)
         .map(|managed| managed.to_snapshot(profile_arg, caller_pane_id))
         .unwrap_or_default();
+    // D54: same live `process_info` merge as `plan`/`status`, gated the same
+    // way on the backend's capability, when the target was reachable for
+    // the D48 prune above.
+    let snapshot = match &live_snapshot {
+        Ok(live_snapshot) if client.capabilities().process_info => {
+            snapshot.merge_process_info(live_snapshot)
+        }
+        _ => snapshot,
+    };
     let mut plan = build_plan(profile, &snapshot)?;
 
     let is_herdr = backend_id == select::HERDR_BACKEND;
@@ -774,6 +839,14 @@ fn up_command(
                 .profile(profile_arg)
                 .map(|managed| managed.to_snapshot(profile_arg, caller_pane_id))
                 .unwrap_or_default();
+            // D54: same capability-gated `process_info` merge as above,
+            // against the snapshot just fetched from the now-started
+            // session.
+            let snapshot = if client.capabilities().process_info {
+                snapshot.merge_process_info(&live)
+            } else {
+                snapshot
+            };
             plan = build_plan(profile, &snapshot)?;
         }
     }
@@ -822,7 +895,7 @@ fn up_command(
     let report = up(
         client.as_ref(),
         profile,
-        &profile.to_ir(),
+        &ir,
         &plan,
         &ctx,
         &mut state,

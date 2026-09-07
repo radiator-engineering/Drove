@@ -116,6 +116,14 @@ mod tests {
     /// `normalize_for_digest` renders the same way as the unnormalized
     /// `PathBuf` did. Digests recorded from `src/ir.rs` with the two `cwd`
     /// call sites reverted to the raw `PathBuf` field, on this same base.
+    ///
+    /// D53 changed a resource's `digest` from one hash of its whole content
+    /// to a composite JSON object of per-category hashes (`label`, `cwd`,
+    /// `env`, ...), so the planner can tell which category changed since the
+    /// last apply instead of only that something did. The category hashes
+    /// below are pinned the same way the old single hash was; each one is
+    /// still exactly the pre-D53 `content_digest` of its own category, so
+    /// this test still catches `normalize_for_digest` drift.
     #[test]
     fn examples_basic_digest_is_unchanged_by_cwd_normalization() {
         let compiled = crate::dsl::compile(Path::new("examples/basic/Drovefile"))
@@ -136,15 +144,15 @@ mod tests {
             vec![
                 (
                     "development",
-                    "195d182808ab3bcbfe0f098ab4159b2dff2635a8433070c7e03f0967155ce01a"
+                    "{\"children\":\"d14289f9153a213c9478c2ae0e0c1bf605bb0a5f9ba5042b20878ebbb3edc8cd\",\"cwd\":\"c6957470f233389737b86d8e27886a0f7e39b5da5a35a98e58ee28675e064a52\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\"}"
                 ),
                 (
                     "editor",
-                    "999810892ca9ffcf59d6e38630d7291fc4a7968d6e844da5f2f3f2b1a33e423a"
+                    "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"728c981e3aad62fd5b893e8a2ab14c0d7dde019d6dcef6d0d71248d5a3225ceb\"}"
                 ),
                 (
                     "tests",
-                    "999810892ca9ffcf59d6e38630d7291fc4a7968d6e844da5f2f3f2b1a33e423a"
+                    "{\"cwd\":\"59911c573c6d7f60fac16b5a657027e3355ba9758f0e74f12bff2ea7e5601b99\",\"env\":\"460e3a1e3343b944d6c45008cf5c70047a11ce4396ff1f399d426ba392fcf442\",\"label\":\"f86921faad5a509c7866edc54ace4be6e5e54d9f36d0af208204a81dc4ddf962\",\"on_start\":\"0a3aba4b6279d8dd2f5186753b99d6f38925ba859d64cf683f7f435a312cbbc0\",\"other\":\"2d008dd52867a5dd6c3c6cf09c7fa56b722e448094db894417f2cd3a5ce689c2\",\"serve\":\"728c981e3aad62fd5b893e8a2ab14c0d7dde019d6dcef6d0d71248d5a3225ceb\"}"
                 ),
             ]
         );

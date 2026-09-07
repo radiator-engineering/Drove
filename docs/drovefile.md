@@ -131,6 +131,21 @@ workspace(name = "control", was = "coordination")
 
 When the backend holds a live resource whose ownership token equals `old-name` and no live resource is named `new-name`, the plan renames it in place instead of detaching the old resource and creating a new one — the same identity, carried forward, with no `Detach`. After one successful apply the declaration is inert; a `was` that matches nothing live is a `drove lint` warning, not an error.
 
+## Editing a running layout
+
+`drove plan`/`drove status`/`drove up` never report an edit as applied unless a backend verb can actually do it in place. No Herdr verb re-`cd`s a live shell or re-injects its environment, so:
+
+- Changing a pane's `cwd` or `env` closes and re-splits the pane — `[destructive]` — even for a `serve` pane; no `run_command` verb accepts a working directory either.
+- Changing a workspace's `cwd` or `env` renames the workspace and cascades the same close-and-split to every pane in it that has no `cwd` of its own (a pane that declares its own `cwd` keeps it and is left alone).
+- Changing `on_start` alone needs no backend action; it's recorded and takes effect the next time the pane is created.
+- Changing only `label` renames the pane or workspace in place.
+- Changing `serve`, `ready`, or `agent` restarts the command in place (`RestartCommand`) rather than recreating the pane.
+- Any other field change (`after`, `adopt`, `on_stop`) is a `Conflict`: remove and re-add the pane instead.
+
+Reordering panes within a tab, or changing its `split` direction, while keeping the same panes is also a `Conflict` — there is no verb to re-lay-out a tab in place, and silently reassigning ratios to the new order would apply them to the wrong physical pane. Adding or removing a pane still goes through the existing `RenameTab` + `SetRatio` pair.
+
+A `serve` pane is also checked against what the backend actually reports running, independent of whether anything in the Drovefile changed: if the live command doesn't match the declared `serve` argv (after trimming whitespace and unwrapping a `sh -c "..."`/`bash -c "..."`/`zsh -c "..."` wrapper), or nothing is running at all, `plan`/`status`/`up` reports `RestartCommand` with a reason starting `drifted: `.
+
 ## Agents
 
 An agent is a property of its pane:
@@ -201,6 +216,8 @@ drove ls     [--json]
 `drove render` prints the compiled intermediate representation (IR schema version 3): a flat, deterministically ordered list of typed resources, each carrying a content digest, plus a topology digest per placement group (`was` renames and moving a pane between tabs change the topology digest, never the content one). Given a v2 Drovefile, it also prints every deprecation warning and the file's v3 form. It performs no backend I/O.
 
 `drove lint` warns on a `was` that matches nothing live and on a task with no `check`; it always exits `0`.
+
+`drove status`/`drove plan` never say a resource is in sync when applying the plan would still change it. Beyond the create/detach/topology reasons `drove render`'s digest already implies, the reason text on an action names why that verb, and not a lighter one, had to be used — see "Editing a running layout" above for the full set (destructive `cwd`/`env` recreation, `Conflict` on a reordered or unsupported change, `RestartCommand` on drift).
 
 `drove up` takes you from nothing to a running, focused session in one step:
 
