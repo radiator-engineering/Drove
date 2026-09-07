@@ -402,6 +402,112 @@ mod tests {
     }
 
     #[test]
+    fn profile_backend_wins_over_file_but_loses_to_env_and_cli() {
+        let profile = ProfileInputs {
+            backend: Some("radiator"),
+            ..Default::default()
+        };
+
+        let (backend, _) = resolve(
+            CliInputs::default(),
+            &EnvInputs::default(),
+            profile,
+            Some("herdr"),
+            &BackendTargets::default(),
+        );
+        assert_eq!(backend, "radiator");
+
+        let env = EnvInputs {
+            drove_backend: Some("herdr".to_owned()),
+            ..Default::default()
+        };
+        let (backend, _) = resolve(
+            CliInputs::default(),
+            &env,
+            profile,
+            Some("herdr"),
+            &BackendTargets::default(),
+        );
+        assert_eq!(backend, "herdr");
+
+        let cli = CliInputs {
+            backend: Some("herdr"),
+            ..Default::default()
+        };
+        let (backend, _) = resolve(
+            cli,
+            &EnvInputs::default(),
+            profile,
+            Some("herdr"),
+            &BackendTargets::default(),
+        );
+        assert_eq!(backend, "herdr");
+    }
+
+    #[test]
+    fn profile_session_wins_over_file_but_loses_to_env_and_cli_for_herdr() {
+        let file = targets(Some("file-session"), None);
+        let profile = ProfileInputs {
+            session: Some("profile-session"),
+            ..Default::default()
+        };
+
+        let (_, target) = resolve(
+            CliInputs::default(),
+            &EnvInputs::default(),
+            profile,
+            Some("herdr"),
+            &file,
+        );
+        assert_eq!(target.name.as_deref(), Some("profile-session"));
+
+        let env = EnvInputs {
+            herdr_session: Some("env-session".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(CliInputs::default(), &env, profile, Some("herdr"), &file);
+        assert_eq!(target.name.as_deref(), Some("env-session"));
+
+        let cli = CliInputs {
+            target: Some("cli-target"),
+            ..Default::default()
+        };
+        let (_, target) = resolve(cli, &EnvInputs::default(), profile, Some("herdr"), &file);
+        assert_eq!(target.name.as_deref(), Some("cli-target"));
+    }
+
+    #[test]
+    fn profile_session_wins_over_file_but_loses_to_env_and_cli_for_radiator() {
+        let file = targets(None, Some("file-hub"));
+        let profile = ProfileInputs {
+            session: Some("profile-hub"),
+            ..Default::default()
+        };
+        let cli_radiator = CliInputs {
+            backend: Some("radiator"),
+            ..Default::default()
+        };
+
+        let (_, target) = resolve(cli_radiator, &EnvInputs::default(), profile, None, &file);
+        assert_eq!(target.name.as_deref(), Some("profile-hub"));
+
+        let env = EnvInputs {
+            radiator_hub: Some("env-hub".to_owned()),
+            ..Default::default()
+        };
+        let (_, target) = resolve(cli_radiator, &env, profile, None, &file);
+        assert_eq!(target.name.as_deref(), Some("env-hub"));
+
+        let cli_with_target = CliInputs {
+            backend: Some("radiator"),
+            target: Some("cli-hub"),
+            ..Default::default()
+        };
+        let (_, target) = resolve(cli_with_target, &EnvInputs::default(), profile, None, &file);
+        assert_eq!(target.name.as_deref(), Some("cli-hub"));
+    }
+
+    #[test]
     fn explicit_socket_is_carried_through_regardless_of_target_name() {
         let cli = CliInputs {
             socket: Some(Path::new("/tmp/explicit.sock")),
