@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Herdr backend: the first declared tab of a workspace Drove creates now
+  reuses the root tab Herdr's `workspace.create` always hands back, instead
+  of opening a new tab and leaving that root tab stray (#25).
+
 ## [0.1.0] - 2026-09-07
 
 First release.

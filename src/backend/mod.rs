@@ -146,6 +146,12 @@ pub trait HerdrExt {
     /// applied only after every split gap exists (a fresh group plans one
     /// `CreateTab`, never per-pane splits). Returns the Herdr tab and pane
     /// backend ids (D29).
+    ///
+    /// `existing_tab`, when set, is the id of a Herdr tab to apply this
+    /// layout onto instead of opening a new Herdr tab. It is the root
+    /// Herdr tab that Herdr handed back from `create_workspace`, for the
+    /// first Herdr tab of a workspace this same apply created (D49),
+    /// renamed afterward to `label`.
     fn create_tab(
         &self,
         workspace_id: &str,
@@ -153,7 +159,19 @@ pub trait HerdrExt {
         split: Split,
         ratios: &[f64],
         panes: &[PaneSpec],
+        existing_tab: Option<&str>,
     ) -> Result<TabLayout>;
+
+    /// Takes (and clears) the root Herdr tab id captured for `workspace_id`
+    /// by a `create_workspace` call earlier in this same apply, if any
+    /// (D49). A workspace this apply adopted or found already present
+    /// never has an entry, so this returns `None` for it. Consuming the id
+    /// on the first call means only the first `create_tab` for a freshly
+    /// created workspace ever sees it.
+    fn take_root_tab(&self, workspace_id: &str) -> Option<String> {
+        let _ = workspace_id;
+        None
+    }
 
     fn split_pane(&self, tab_id: &str, spec: &PaneSpec, split: Split) -> Result<String>;
 

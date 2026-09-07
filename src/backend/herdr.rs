@@ -1,11 +1,13 @@
 //! Minimal typed client for Herdr's public NDJSON socket API.
 
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
     sync::atomic::{AtomicU64, Ordering},
     sync::mpsc,
     thread,
@@ -29,14 +31,22 @@ const SESSION_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HerdrClient {
     socket_path: PathBuf,
+    /// Root tab ids captured from `workspace.create` responses, keyed by
+    /// workspace id, for workspaces this client created (D49). Taken (and
+    /// cleared) by [`HerdrClient::take_root_tab`] the first time the first
+    /// declared tab of that workspace is applied.
+    created_root_tabs: Mutex<HashMap<String, String>>,
 }
 
 impl HerdrClient {
     pub fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+        Self {
+            socket_path,
+            created_root_tabs: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn discover(explicit_socket: Option<&Path>, session: Option<&str>) -> Self {
@@ -122,14 +132,36 @@ impl HerdrClient {
         serde_json::from_value(layout).context("invalid Herdr layout export")
     }
 
+    /// Creates a workspace and captures the root tab Herdr always returns
+    /// with it (`root_pane.tab_id`, or `tab.tab_id`), so the first declared
+    /// tab of this workspace can reuse it instead of opening a stray extra
+    /// tab (D49, issue 25). Retrieve it with
+    /// [`HerdrClient::take_root_tab`].
     pub fn create_workspace(&self, label: &str, cwd: &Path) -> Result<String> {
         let result = self.request(
             "workspace.create",
             json!({"label": label, "cwd": cwd, "focus": false}),
         )?;
-        find_string(&result, "workspace_id")
+        let workspace_id = find_string(&result, "workspace_id")
             .map(ToOwned::to_owned)
-            .context("workspace.create response omitted workspace_id")
+            .context("workspace.create response omitted workspace_id")?;
+        if let Some(tab_id) = find_string(&result, "tab_id") {
+            self.created_root_tabs
+                .lock()
+                .expect("root tab lock poisoned")
+                .insert(workspace_id.clone(), tab_id.to_owned());
+        }
+        Ok(workspace_id)
+    }
+
+    /// Takes (and clears) the root tab id captured for `workspace_id` by
+    /// [`HerdrClient::create_workspace`], if this client created it earlier
+    /// in the current process (D49).
+    pub fn take_root_tab(&self, workspace_id: &str) -> Option<String> {
+        self.created_root_tabs
+            .lock()
+            .expect("root tab lock poisoned")
+            .remove(workspace_id)
     }
 
     pub fn apply_layout(
@@ -519,6 +551,7 @@ impl HerdrExt for HerdrClient {
         split: Split,
         ratios: &[f64],
         panes: &[PaneSpec],
+        existing_tab: Option<&str>,
     ) -> Result<TabLayout> {
         let first = panes.first();
         let first_label = first
@@ -531,9 +564,13 @@ impl HerdrExt for HerdrClient {
         if let Some(cwd) = first.and_then(|spec| spec.cwd.as_ref()) {
             leaf["cwd"] = json!(cwd);
         }
-        let layout = HerdrClient::apply_layout(self, workspace_id, None, label, leaf)?;
+        let layout = HerdrClient::apply_layout(self, workspace_id, existing_tab, label, leaf)?;
         let mut pane_ids = layout.pane_ids_preorder();
         let tab_id = layout.tab_id;
+
+        if existing_tab.is_some() {
+            HerdrClient::rename_tab(self, &tab_id, label)?;
+        }
 
         for spec in panes.iter().skip(1) {
             let pane_id = <Self as HerdrExt>::split_pane(self, &tab_id, spec, split)?;
@@ -569,6 +606,10 @@ impl HerdrExt for HerdrClient {
 
     fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
         HerdrClient::rename_tab(self, tab_id, label)
+    }
+
+    fn take_root_tab(&self, workspace_id: &str) -> Option<String> {
+        HerdrClient::take_root_tab(self, workspace_id)
     }
 
     fn start_agent(&self, pane_id: &str, name: &str, kind: &str, args: &[String]) -> Result<()> {
@@ -1121,6 +1162,7 @@ mod tests {
             SplitDirection::Right,
             &[0.67],
             &panes,
+            None,
         )
         .expect("create tab");
 
@@ -1149,6 +1191,167 @@ mod tests {
             ratio_at > split_at,
             "ratios must be applied after the split exists: {methods:?}"
         );
+    }
+
+    #[test]
+    fn create_workspace_captures_the_root_tab_id_from_root_pane() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory
+            .path()
+            .join("herdr-create-workspace-root-pane.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({
+                "id": request["id"],
+                "result": {
+                    "workspace_id": "w9",
+                    "root_pane": {"pane_id": "w9:p1", "tab_id": "w9:t1"},
+                }
+            });
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+        });
+
+        let client = HerdrClient::new(path);
+        let workspace_id = client
+            .create_workspace("dev", Path::new("."))
+            .expect("create workspace");
+        assert_eq!(workspace_id, "w9");
+        assert_eq!(client.take_root_tab("w9"), Some("w9:t1".to_owned()));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn create_workspace_captures_the_root_tab_id_from_tab() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-create-workspace-tab.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({
+                "id": request["id"],
+                "result": {
+                    "workspace_id": "w9",
+                    "tab": {"tab_id": "w9:t1", "label": "1"},
+                }
+            });
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+        });
+
+        let client = HerdrClient::new(path);
+        let workspace_id = client
+            .create_workspace("dev", Path::new("."))
+            .expect("create workspace");
+        assert_eq!(
+            client.take_root_tab(&workspace_id),
+            Some("w9:t1".to_owned())
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn take_root_tab_returns_it_only_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-take-root-tab-once.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let response = json!({
+                "id": request["id"],
+                "result": {
+                    "workspace_id": "w9",
+                    "root_pane": {"tab_id": "w9:t1"},
+                }
+            });
+            serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+            stream.get_mut().write_all(b"\n").expect("newline");
+        });
+
+        let client = HerdrClient::new(path);
+        client
+            .create_workspace("dev", Path::new("."))
+            .expect("create workspace");
+        assert_eq!(client.take_root_tab("w9"), Some("w9:t1".to_owned()));
+        assert_eq!(client.take_root_tab("w9"), None);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn create_tab_applies_onto_an_existing_tab_and_renames_it_instead_of_opening_a_new_one() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr-createtab-existing.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            // layout.apply, tab.rename.
+            for _ in 0..2 {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let result = match request["method"].as_str().expect("method") {
+                    "layout.apply" => json!({
+                        "layout": {
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t1",
+                            "root": {"type": "pane", "pane_id": "w1:p1"},
+                        }
+                    }),
+                    "tab.rename" => json!({"type": "ok"}),
+                    other => panic!("unexpected method {other}"),
+                };
+                let response = json!({"id": request["id"], "result": result});
+                serde_json::to_writer(stream.get_mut(), &response).expect("write JSON");
+                stream.get_mut().write_all(b"\n").expect("newline");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let panes = [PaneSpec {
+            label: Some("editor".into()),
+            ..PaneSpec::default()
+        }];
+        let layout = HerdrExt::create_tab(
+            &HerdrClient::new(path),
+            "w1",
+            "main",
+            SplitDirection::Right,
+            &[],
+            &panes,
+            Some("w1:t1"),
+        )
+        .expect("create tab onto existing tab");
+
+        assert_eq!(layout.tab_id, "w1:t1");
+        assert_eq!(layout.pane_ids, ["w1:p1"]);
+
+        let requests = server.join().expect("server thread");
+        assert_eq!(requests[0]["method"], "layout.apply");
+        assert_eq!(requests[0]["params"]["tab_id"], "w1:t1");
+        assert!(
+            requests[0]["params"].get("workspace_id").is_none(),
+            "reusing an existing tab must not also address the workspace: {:?}",
+            requests[0]
+        );
+        assert_eq!(requests[1]["method"], "tab.rename");
+        assert_eq!(requests[1]["params"]["tab_id"], "w1:t1");
+        assert_eq!(requests[1]["params"]["label"], "main");
     }
 
     #[test]

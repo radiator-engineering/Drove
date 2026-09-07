@@ -1112,12 +1112,18 @@ fn apply_herdr(
                 .iter()
                 .map(|pane| pane_spec(ir, pane))
                 .collect::<Result<Vec<_>>>()?;
+            // The root Herdr tab id is only ever present for a workspace
+            // this same apply created, and only until the first `CreateTab`
+            // for it consumes it (D49) — an adopted or pre-existing
+            // workspace never has one.
+            let existing_tab = ext.take_root_tab(&workspace_id);
             let layout = ext.create_tab(
                 &workspace_id,
                 &group.label,
                 group.split,
                 &group.ratios,
                 &specs,
+                existing_tab.as_deref(),
             )?;
             state
                 .group_ids
@@ -1815,6 +1821,11 @@ mod tests {
         session: SessionState,
         calls: Mutex<Vec<String>>,
         next_id: Mutex<u32>,
+        /// When set, every workspace this fake creates is given a root
+        /// Herdr tab id (`<workspace>-root`), simulating what a real
+        /// `workspace.create` always returns alongside it (D49).
+        auto_root_tab: bool,
+        root_tabs: Mutex<BTreeMap<String, String>>,
     }
 
     impl RecordingHerdr {
@@ -1823,6 +1834,18 @@ mod tests {
                 session: SessionState::Running,
                 calls: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                auto_root_tab: false,
+                root_tabs: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        /// Like [`RecordingHerdr::running`], but simulates Herdr's own
+        /// behavior of always returning a root Herdr tab alongside a
+        /// freshly created workspace (D49).
+        fn running_with_root_tabs() -> Self {
+            Self {
+                auto_root_tab: true,
+                ..Self::running()
             }
         }
 
@@ -1831,6 +1854,8 @@ mod tests {
                 session: SessionState::CannotStart { hint: hint.into() },
                 calls: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                auto_root_tab: false,
+                root_tabs: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -1859,7 +1884,14 @@ mod tests {
         }
         fn create_workspace(&self, label: &str, _cwd: &Path) -> Result<String> {
             self.record(format!("create_workspace:{label}"));
-            Ok(self.id("w"))
+            let workspace_id = self.id("w");
+            if self.auto_root_tab {
+                self.root_tabs
+                    .lock()
+                    .expect("root tabs lock")
+                    .insert(workspace_id.clone(), format!("{workspace_id}-root"));
+            }
+            Ok(workspace_id)
         }
         fn rename_workspace(&self, id: &str, label: &str) -> Result<()> {
             self.record(format!("rename_workspace:{id}:{label}"));
@@ -1918,9 +1950,12 @@ mod tests {
             _split: crate::backend::Split,
             ratios: &[f64],
             panes: &[PaneSpec],
+            existing_tab: Option<&str>,
         ) -> Result<crate::backend::TabLayout> {
-            self.record(format!("create_tab:{workspace_id}:{label}"));
-            let tab_id = self.id("t");
+            self.record(format!(
+                "create_tab:{workspace_id}:{label}:existing={existing_tab:?}"
+            ));
+            let tab_id = existing_tab.map_or_else(|| self.id("t"), ToOwned::to_owned);
             let pane_ids = panes
                 .iter()
                 .map(|spec| {
@@ -1933,6 +1968,13 @@ mod tests {
                 self.record(format!("set_ratio:{tab_id}"));
             }
             Ok(crate::backend::TabLayout { tab_id, pane_ids })
+        }
+
+        fn take_root_tab(&self, workspace_id: &str) -> Option<String> {
+            self.root_tabs
+                .lock()
+                .expect("root tabs lock")
+                .remove(workspace_id)
         }
         fn split_pane(
             &self,
@@ -2254,6 +2296,118 @@ mod tests {
                 changed: 0,
                 tasks_run: 0
             }
+        );
+    }
+
+    #[test]
+    fn up_reuses_the_freshly_created_workspaces_root_tab_for_its_first_tab_only() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [
+                    {"name": "main", "panes": [{"name": "editor"}]},
+                    {"name": "second", "panes": [{"name": "logs"}]},
+                ]
+            }]
+        }));
+        let ir = profile.to_ir();
+        let plan = up_plan(&[
+            (Action::Core(CoreAction::CreateWorkspace), "dev"),
+            (Action::Herdr(HerdrAction::CreateTab), "dev/main"),
+            (Action::Herdr(HerdrAction::CreateTab), "dev/second"),
+        ]);
+        let backend = RecordingHerdr::running_with_root_tabs();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_tab:")
+                && c.contains(":main:")
+                && c.contains("existing=Some")),
+            "the workspace's own root tab must be reused for its first declared tab: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_tab:")
+                && c.contains(":second:")
+                && c.contains("existing=None")),
+            "only the first declared tab may reuse the root tab: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn up_never_reuses_a_root_tab_for_an_adopted_or_pre_existing_workspace() {
+        use crate::planner::HerdrAction;
+
+        let (mut state, _dir) = temp_state();
+        let profile = profile_from(json!({
+            "name": "default",
+            "workspaces": [{
+                "name": "dev",
+                "tabs": [{"name": "main", "panes": [{"name": "editor"}]}]
+            }]
+        }));
+        let ir = profile.to_ir();
+        // The workspace already exists from a previous run, so this plan has
+        // no `CreateWorkspace` action for it — only the Herdr tab is being
+        // added.
+        {
+            let managed = state.profile_mut("default");
+            managed.resources.insert(
+                "dev".to_owned(),
+                ManagedResource {
+                    kind: "workspace".into(),
+                    backend_id: "w1".into(),
+                    parent: None,
+                    digest: "d".into(),
+                    adopted: None,
+                    last_outcome: None,
+                },
+            );
+        }
+        let plan = up_plan(&[(Action::Herdr(HerdrAction::CreateTab), "dev/main")]);
+        let backend = RecordingHerdr::running_with_root_tabs();
+        let runner = FakeRunner::default();
+        let root = PathBuf::from("/repo");
+
+        up(
+            &backend,
+            &profile,
+            &ir,
+            &plan,
+            &ctx(&root, &runner),
+            &mut state,
+            true,
+            "dev-session",
+            Some("dev"),
+            true,
+        )
+        .expect("up");
+
+        let calls = backend.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("create_tab:") && c.contains("existing=None")),
+            "an adopted or pre-existing workspace must never reuse a root tab: {calls:?}"
         );
     }
 

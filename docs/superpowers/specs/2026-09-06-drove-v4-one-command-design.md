@@ -109,3 +109,40 @@ ambient Radiator detection) > built-in. The precedence-table test gains
 the ambient layer for both backends; a test shows a profile with
 `session = "drove-mon"` resolving to `drove-mon` while `HERDR_SESSION=drove`
 is set, and `DROVE_SESSION=x` still winning over the profile.
+
+## 6. Amendment: `down` stops and deletes a named session (D47)
+
+`drove up` starts the Herdr session a profile names (D43, D44), but
+`drove down` left it running: after the hooks and the detach the user still
+had to run `herdr session stop NAME` and `herdr session delete NAME` by
+hand. Herdr's socket API has no session verbs; only its CLI has them.
+
+**D47.** After running every `on_stop` hook and detaching every owned
+resource, `drove down` on the Herdr backend stops and deletes the session
+it targets, when that session is a named one. The name is the resolved
+target (D46 precedence: `--session`/`--target` > `DROVE_SESSION` >
+`herdr.session(...)` > `HERDR_SESSION` when not `default`). With no named
+target, or when the target is `default`, `down` never touches the session:
+`default` is the user's persistent session, not one Drove created.
+
+`HerdrExt` gains `stop_session(name) -> Result<SessionStop>`, the mirror of
+`ensure_session`: it shells out to the `herdr` binary (`HERDR_BIN_PATH`,
+else `herdr` on `PATH`) as `herdr session stop NAME` then
+`herdr session delete NAME`. A stop that fails because the session is not
+running is not an error; delete still runs. `SessionStop { stopped: bool,
+deleted: bool }` is reported. A missing binary or a failed delete is an
+error, raised only after the detach has been saved to local state, so a
+retry of `down` is idempotent.
+
+Output: one more line, `stopped session NAME` (or `deleted session NAME`
+when it was already stopped), and the JSON report gains
+`"session": {"name", "stopped", "deleted"}` (absent when no named session).
+Run from inside the session being stopped, the caller's own pane dies with
+it; that is what stop means, so there is no confirmation. The Radiator
+backend is unchanged.
+
+Tests (fake `herdr` script on `HERDR_BIN_PATH` that records its argv):
+a named session is stopped then deleted, in that order, after the hooks and
+detach; `default` and an unnamed target are never touched and the report
+carries no `session`; a session that is already stopped is still deleted;
+a missing binary is an error and the resources are still detached.
