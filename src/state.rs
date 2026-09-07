@@ -110,6 +110,44 @@ impl LocalState {
         self.profiles.entry(name.to_owned()).or_default()
     }
 
+    /// D55 point 1: stamps `profile`'s [`ManagedProfile::target`] with the
+    /// resolved backend/session for this run, resetting the profile first if
+    /// it was last saved against a different one. A profile with no stamp
+    /// yet (a legacy file, or the profile's first run) is stamped without
+    /// touching its resources. Returns the `state recorded for <old>;
+    /// starting fresh for <new>` line to print when a reset happened.
+    pub fn reset_stale_target(
+        &mut self,
+        profile: &str,
+        backend_id: &str,
+        session: Option<&str>,
+    ) -> Option<String> {
+        let new_target = StoredTarget {
+            backend: backend_id.to_owned(),
+            session: session.map(str::to_owned),
+        };
+        let managed = self.profile_mut(profile);
+        match managed.target.clone() {
+            None => {
+                managed.target = Some(new_target);
+                None
+            }
+            Some(old) if old == new_target => None,
+            Some(old) => {
+                let message = format!(
+                    "state recorded for {}; starting fresh for {}",
+                    old.describe(),
+                    new_target.describe()
+                );
+                *managed = ManagedProfile {
+                    target: Some(new_target),
+                    ..Default::default()
+                };
+                Some(message)
+            }
+        }
+    }
+
     /// Records a `was =` rename (D34): moves a managed resource's entry from
     /// its old identity to its new one, keeping the same backend id, parent
     /// and digest. After this, the next `drove up`/`plan`/`status` sees the
@@ -196,12 +234,37 @@ impl LocalState {
 pub struct ManagedProfile {
     #[serde(default)]
     pub desired_digest: String,
+    /// The backend/session this profile's `resources` were last saved
+    /// against (D55 point 1). Herdr's ids are small and session-scoped, so
+    /// the same repo used against two sessions can easily see the same id
+    /// string mean two different resources; recording the target lets a
+    /// mismatched load reset the profile instead of trusting stale ids.
+    #[serde(default)]
+    pub target: Option<StoredTarget>,
     /// One entry per resource identity (D5: a plain name; a Herdr placement
     /// group's identity is `workspace/<name>` and its digest is the group's
     /// topology digest, D30), the source of ownership `to_snapshot` reads back
     /// (spec §5: "observed digest at apply time, runtime ids").
     #[serde(default)]
     pub resources: BTreeMap<String, ManagedResource>,
+}
+
+/// The backend id and session name a [`ManagedProfile`] was last saved
+/// against (D55 point 1). `session: None` is an unnamed/default session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTarget {
+    pub backend: String,
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+impl StoredTarget {
+    fn describe(&self) -> String {
+        match &self.session {
+            Some(session) => format!("{}:{session}", self.backend),
+            None => self.backend.clone(),
+        }
+    }
 }
 
 impl ManagedProfile {
@@ -231,88 +294,168 @@ impl ManagedProfile {
     }
 }
 
-/// Prunes a managed profile against the live backend snapshot (D48): a
-/// `workspace`, `placement` or `pane` resource whose recorded `backend_id`
-/// is absent from the snapshot's matching id set is gone, and is dropped
-/// from the returned copy together with what it carried. A missing
-/// workspace also drops every placement and pane whose `backend_id` is
-/// namespaced under it (Herdr ids nest `<workspace>:t1`, `<workspace>:p1`
-/// directly off the workspace id, not off the tab); a missing placement
-/// drops the panes recorded under it by identity (`ManagedResource::parent`
-/// holds the placement's identity, not its backend id, so cascading here
-/// cannot use the same prefix trick). `agent` and `task` resources are left
-/// alone: their own `backend_id`/`parent` are not part of this workspace
-/// tree (a task has no `backend_id` at all), so they are out of scope for
-/// this prune. Returns the pruned profile and the dropped identities,
-/// sorted.
+/// Why [`prune_missing`] dropped a recorded resource (D55 point 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneReason {
+    /// The recorded `backend_id` is not in the live snapshot at all — the
+    /// resource was closed, or its whole session was wiped and restarted
+    /// (D48).
+    NotInSession,
+    /// The recorded `backend_id` is live, but what's there no longer
+    /// matches what Drove itself last recorded (a workspace/tab label, or a
+    /// pane's `cwd`) — Herdr reused the id for a different resource.
+    IdReused,
+}
+
+impl PruneReason {
+    /// The word printed in `pruned <id> (<detail>)` (`down`) and `recreate
+    /// <identity>: <detail>; recreating` (`status`/`plan`, where
+    /// `NotInSession` keeps its original longer wording for backward
+    /// compatibility).
+    pub fn detail(&self) -> &'static str {
+        match self {
+            PruneReason::NotInSession => "not in session",
+            PruneReason::IdReused => "id reused",
+        }
+    }
+
+    /// The longer wording `status`/`plan` used before this reason existed,
+    /// kept for `NotInSession` so existing output is unchanged.
+    pub fn recreate_detail(&self) -> &'static str {
+        match self {
+            PruneReason::NotInSession => "backend id no longer exists",
+            PruneReason::IdReused => "id reused",
+        }
+    }
+}
+
+/// Prunes a managed profile against the live backend snapshot (D48, D55
+/// point 2): a `workspace`, `placement` or `pane` resource whose recorded
+/// `backend_id` is absent from the snapshot's matching id set is gone, and
+/// is dropped from the returned copy together with what it carried. A
+/// workspace or placement whose `backend_id` is live but whose recorded
+/// label (D55 point 2: `Some` only once this build has recorded one) no
+/// longer matches what's live is dropped too, and so is a pane whose
+/// recorded `cwd` no longer matches — Herdr reused the id for an unrelated
+/// resource. A record with no `label`/`cwd` yet (saved before this field
+/// existed) is not compared, since there is nothing to compare against; see
+/// `docs/drovefile.md` for the reasoning. A missing or reused workspace
+/// also drops every placement and pane whose `backend_id` is namespaced
+/// under it (Herdr ids nest `<workspace>:t1`, `<workspace>:p1` directly off
+/// the workspace id, not off the tab); a missing or reused placement drops
+/// the panes recorded under it by identity (`ManagedResource::parent` holds
+/// the placement's identity, not its backend id, so cascading here cannot
+/// use the same prefix trick). `agent` and `task` resources are left alone:
+/// their own `backend_id`/`parent` are not part of this workspace tree (a
+/// task has no `backend_id` at all), so they are out of scope for this
+/// prune. Returns the pruned profile and the dropped identities with their
+/// reason, sorted by identity.
 pub fn prune_missing(
     managed: &ManagedProfile,
     snapshot: &crate::backend::herdr::SessionSnapshot,
-) -> (ManagedProfile, Vec<String>) {
-    let workspace_ids: BTreeSet<&str> = snapshot
+) -> (ManagedProfile, Vec<(String, PruneReason)>) {
+    let workspace_labels: BTreeMap<&str, &str> = snapshot
         .workspaces
         .iter()
-        .map(|workspace| workspace.workspace_id.as_str())
+        .map(|workspace| (workspace.workspace_id.as_str(), workspace.label.as_str()))
         .collect();
-    let tab_ids: BTreeSet<&str> = snapshot
+    let tab_labels: BTreeMap<&str, &str> = snapshot
         .tabs
         .iter()
-        .map(|tab| tab.tab_id.as_str())
+        .map(|tab| (tab.tab_id.as_str(), tab.label.as_str()))
         .collect();
-    let pane_ids: BTreeSet<&str> = snapshot
+    let pane_cwds: BTreeMap<&str, Option<&str>> = snapshot
         .panes
         .iter()
-        .map(|pane| pane.pane_id.as_str())
+        .map(|pane| {
+            (
+                pane.pane_id.as_str(),
+                pane.cwd.as_deref().and_then(|cwd| cwd.to_str()),
+            )
+        })
         .collect();
 
-    let mut dropped = BTreeSet::new();
-    let mut missing_workspace_backend_ids = BTreeSet::new();
-    let mut missing_placement_identities = BTreeSet::new();
+    let mut dropped: BTreeMap<String, PruneReason> = BTreeMap::new();
+    let mut missing_workspace_backend_ids: BTreeMap<String, PruneReason> = BTreeMap::new();
+    let mut missing_placement_identities: BTreeMap<String, PruneReason> = BTreeMap::new();
 
     for (identity, resource) in &managed.resources {
         match resource.kind.as_str() {
-            "workspace" if !workspace_ids.contains(resource.backend_id.as_str()) => {
-                missing_workspace_backend_ids.insert(resource.backend_id.clone());
-                dropped.insert(identity.clone());
-            }
-            "placement" if !tab_ids.contains(resource.backend_id.as_str()) => {
-                missing_placement_identities.insert(identity.clone());
-                dropped.insert(identity.clone());
-            }
-            "pane" if !pane_ids.contains(resource.backend_id.as_str()) => {
-                dropped.insert(identity.clone());
-            }
+            "workspace" => match workspace_labels.get(resource.backend_id.as_str()) {
+                None => {
+                    missing_workspace_backend_ids
+                        .insert(resource.backend_id.clone(), PruneReason::NotInSession);
+                    dropped.insert(identity.clone(), PruneReason::NotInSession);
+                }
+                Some(live_label) => {
+                    if let Some(recorded_label) = &resource.label
+                        && *live_label != recorded_label.as_str()
+                    {
+                        missing_workspace_backend_ids
+                            .insert(resource.backend_id.clone(), PruneReason::IdReused);
+                        dropped.insert(identity.clone(), PruneReason::IdReused);
+                    }
+                }
+            },
+            "placement" => match tab_labels.get(resource.backend_id.as_str()) {
+                None => {
+                    missing_placement_identities
+                        .insert(identity.clone(), PruneReason::NotInSession);
+                    dropped.insert(identity.clone(), PruneReason::NotInSession);
+                }
+                Some(live_label) => {
+                    if let Some(recorded_label) = &resource.label
+                        && *live_label != recorded_label.as_str()
+                    {
+                        missing_placement_identities
+                            .insert(identity.clone(), PruneReason::IdReused);
+                        dropped.insert(identity.clone(), PruneReason::IdReused);
+                    }
+                }
+            },
+            "pane" => match pane_cwds.get(resource.backend_id.as_str()) {
+                None => {
+                    dropped.insert(identity.clone(), PruneReason::NotInSession);
+                }
+                Some(&live_cwd) => {
+                    if let Some(recorded_cwd) = &resource.cwd
+                        && live_cwd.is_some_and(|cwd| cwd != recorded_cwd.as_str())
+                    {
+                        dropped.insert(identity.clone(), PruneReason::IdReused);
+                    }
+                }
+            },
             _ => {}
         }
     }
 
     for (identity, resource) in &managed.resources {
-        match resource.kind.as_str() {
-            "placement" | "pane" => {
-                let under_missing_workspace = missing_workspace_backend_ids.iter().any(|ws| {
-                    resource
-                        .backend_id
-                        .strip_prefix(ws.as_str())
-                        .is_some_and(|rest| rest.starts_with(':'))
-                });
-                if under_missing_workspace {
-                    dropped.insert(identity.clone());
-                }
-            }
-            _ => {}
+        if dropped.contains_key(identity) {
+            continue;
+        }
+        if matches!(resource.kind.as_str(), "placement" | "pane")
+            && let Some((_, reason)) = missing_workspace_backend_ids.iter().find(|(ws, _)| {
+                resource
+                    .backend_id
+                    .strip_prefix(ws.as_str())
+                    .is_some_and(|rest| rest.starts_with(':'))
+            })
+        {
+            dropped.insert(identity.clone(), *reason);
+            continue;
         }
         if resource.kind == "pane"
             && let Some(parent) = &resource.parent
-            && missing_placement_identities.contains(parent)
+            && let Some(reason) = missing_placement_identities.get(parent)
         {
-            dropped.insert(identity.clone());
+            dropped.insert(identity.clone(), *reason);
         }
     }
 
     let mut pruned = managed.clone();
     pruned
         .resources
-        .retain(|identity, _| !dropped.contains(identity));
+        .retain(|identity, _| !dropped.contains_key(identity));
 
     (pruned, dropped.into_iter().collect())
 }
@@ -326,6 +469,16 @@ pub struct ManagedResource {
     #[serde(default)]
     pub parent: Option<String>,
     pub digest: String,
+    /// The workspace/tab label Drove sent at apply time (D55 point 2): a
+    /// workspace or placement only. `None` for a pane/agent/task, and for a
+    /// record saved before this field existed.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The pane's declared `cwd` at apply time (D55 point 2): a pane only.
+    /// `None` for every other kind, and for a record saved before this field
+    /// existed.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Set only for a pane declaring `adopt = "caller"` (D24).
     #[serde(default)]
     pub adopted: Option<bool>,
@@ -420,6 +573,8 @@ mod tests {
             backend_id: backend_id.into(),
             parent: parent.map(str::to_owned),
             digest: "digest".into(),
+            label: None,
+            cwd: None,
             adopted: None,
             last_outcome: None,
         }
@@ -521,7 +676,14 @@ mod tests {
 
         let (pruned, dropped) = prune_missing(&managed, &snapshot);
 
-        assert_eq!(dropped, vec!["core", "core/main", "review"]);
+        assert_eq!(
+            dropped,
+            vec![
+                ("core".to_owned(), PruneReason::NotInSession),
+                ("core/main".to_owned(), PruneReason::NotInSession),
+                ("review".to_owned(), PruneReason::NotInSession),
+            ]
+        );
         assert!(!pruned.resources.contains_key("core"));
         assert!(!pruned.resources.contains_key("core/main"));
         assert!(!pruned.resources.contains_key("review"));
@@ -539,7 +701,13 @@ mod tests {
 
         let (pruned, dropped) = prune_missing(&managed, &snapshot);
 
-        assert_eq!(dropped, vec!["core/main", "review"]);
+        assert_eq!(
+            dropped,
+            vec![
+                ("core/main".to_owned(), PruneReason::NotInSession),
+                ("review".to_owned(), PruneReason::NotInSession),
+            ]
+        );
         assert!(pruned.resources.contains_key("core"));
         assert!(!pruned.resources.contains_key("core/main"));
         assert!(!pruned.resources.contains_key("review"));
@@ -554,10 +722,200 @@ mod tests {
 
         let (pruned, dropped) = prune_missing(&managed, &snapshot);
 
-        assert_eq!(dropped, vec!["review"]);
+        assert_eq!(
+            dropped,
+            vec![("review".to_owned(), PruneReason::NotInSession)]
+        );
         assert!(pruned.resources.contains_key("core"));
         assert!(pruned.resources.contains_key("core/main"));
         assert!(!pruned.resources.contains_key("review"));
+    }
+
+    // D55 point 2: a live id whose label/cwd no longer matches what Drove
+    // recorded is a reused id, not the resource Drove created.
+
+    #[test]
+    fn prune_missing_drops_a_same_id_workspace_whose_live_label_changed() {
+        let mut managed = full_managed();
+        managed.resources.insert(
+            "core".into(),
+            ManagedResource {
+                label: Some("control".into()),
+                ..resource("workspace", "w1", None)
+            },
+        );
+        let mut snapshot = full_snapshot();
+        snapshot.workspaces[0].label = "other".into();
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(
+            dropped,
+            vec![
+                ("core".to_owned(), PruneReason::IdReused),
+                ("core/main".to_owned(), PruneReason::IdReused),
+                ("review".to_owned(), PruneReason::IdReused),
+            ]
+        );
+        assert!(!pruned.resources.contains_key("core"));
+        // The workspace's own tree is dropped with it, same as a missing id.
+        assert!(!pruned.resources.contains_key("core/main"));
+        assert!(!pruned.resources.contains_key("review"));
+    }
+
+    #[test]
+    fn prune_missing_keeps_a_same_id_workspace_whose_live_label_still_matches() {
+        let mut managed = full_managed();
+        managed.resources.insert(
+            "core".into(),
+            ManagedResource {
+                label: Some("control".into()),
+                ..resource("workspace", "w1", None)
+            },
+        );
+        let mut snapshot = full_snapshot();
+        snapshot.workspaces[0].label = "control".into();
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert!(dropped.is_empty());
+        assert!(pruned.resources.contains_key("core"));
+    }
+
+    #[test]
+    fn prune_missing_ignores_label_when_none_was_ever_recorded() {
+        // A record saved before D55 (label: None) has nothing to compare a
+        // live label against, so it is not pruned just because they differ.
+        let managed = full_managed();
+        let mut snapshot = full_snapshot();
+        snapshot.workspaces[0].label = "renamed-outside-drove".into();
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert!(dropped.is_empty());
+        assert!(pruned.resources.contains_key("core"));
+    }
+
+    #[test]
+    fn prune_missing_drops_a_pane_whose_live_cwd_changed() {
+        let mut managed = full_managed();
+        managed.resources.insert(
+            "review".into(),
+            ManagedResource {
+                cwd: Some("/repo".into()),
+                ..resource("pane", "w1:p1", Some("core/main"))
+            },
+        );
+        let mut snapshot = full_snapshot();
+        snapshot.panes[0].cwd = Some("/elsewhere".into());
+
+        let (pruned, dropped) = prune_missing(&managed, &snapshot);
+
+        assert_eq!(dropped, vec![("review".to_owned(), PruneReason::IdReused)]);
+        assert!(!pruned.resources.contains_key("review"));
+        assert!(pruned.resources.contains_key("core"));
+    }
+
+    #[test]
+    fn reset_stale_target_stamps_a_profile_with_no_prior_target() {
+        let mut state = LocalState {
+            schema_version: 1,
+            repo_root: PathBuf::from("/repo"),
+            profiles: BTreeMap::new(),
+            approvals: BTreeSet::new(),
+            journal: Vec::new(),
+            path: PathBuf::new(),
+        };
+        state
+            .profile_mut("default")
+            .resources
+            .insert("core".into(), resource("workspace", "w1", None));
+
+        let message = state.reset_stale_target("default", "herdr", Some("a"));
+
+        assert_eq!(message, None);
+        assert!(
+            state
+                .profile("default")
+                .expect("profile")
+                .resources
+                .contains_key("core"),
+            "a legacy profile's resources are untouched on first stamp"
+        );
+        assert_eq!(
+            state.profile("default").expect("profile").target,
+            Some(StoredTarget {
+                backend: "herdr".into(),
+                session: Some("a".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn reset_stale_target_resets_when_the_stamped_target_differs() {
+        let mut state = LocalState {
+            schema_version: 1,
+            repo_root: PathBuf::from("/repo"),
+            profiles: BTreeMap::new(),
+            approvals: BTreeSet::new(),
+            journal: Vec::new(),
+            path: PathBuf::new(),
+        };
+        state
+            .profile_mut("default")
+            .resources
+            .insert("core".into(), resource("workspace", "w1", None));
+        state.reset_stale_target("default", "herdr", Some("a"));
+
+        let message = state.reset_stale_target("default", "herdr", Some("b"));
+
+        assert_eq!(
+            message,
+            Some("state recorded for herdr:a; starting fresh for herdr:b".to_owned())
+        );
+        assert!(
+            !state
+                .profile("default")
+                .expect("profile")
+                .resources
+                .contains_key("core"),
+            "a profile stamped for a different target is treated as empty"
+        );
+        assert_eq!(
+            state.profile("default").expect("profile").target,
+            Some(StoredTarget {
+                backend: "herdr".into(),
+                session: Some("b".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn reset_stale_target_is_a_no_op_when_the_target_is_unchanged() {
+        let mut state = LocalState {
+            schema_version: 1,
+            repo_root: PathBuf::from("/repo"),
+            profiles: BTreeMap::new(),
+            approvals: BTreeSet::new(),
+            journal: Vec::new(),
+            path: PathBuf::new(),
+        };
+        state
+            .profile_mut("default")
+            .resources
+            .insert("core".into(), resource("workspace", "w1", None));
+        state.reset_stale_target("default", "herdr", None);
+
+        let message = state.reset_stale_target("default", "herdr", None);
+
+        assert_eq!(message, None);
+        assert!(
+            state
+                .profile("default")
+                .expect("profile")
+                .resources
+                .contains_key("core")
+        );
     }
 
     #[test]
@@ -657,6 +1015,8 @@ mod tests {
                 backend_id: "w1:p1".into(),
                 parent: Some("dev/main".into()),
                 digest: "digest-1".into(),
+                label: None,
+                cwd: None,
                 adopted: None,
                 last_outcome: None,
             },

@@ -20,7 +20,7 @@ use crate::{
     ir::Ir,
     model::{DroveConfig, Profile},
     planner::{Action, CoreAction, Plan, SyncStatus, build_plan},
-    state::LocalState,
+    state::{LocalState, PruneReason},
 };
 
 #[derive(Debug, Parser)]
@@ -329,7 +329,17 @@ fn run_with(mut cli: Cli) -> Result<ExitCode> {
         }
     };
 
-    let state = LocalState::load(&repo_root)?;
+    let mut state = LocalState::load(&repo_root)?;
+    // D55 point 1: a profile last saved against a different backend/session
+    // is treated as empty for this run — Herdr's ids are session-scoped, so
+    // trusting them across sessions risks colliding with an unrelated
+    // session's own ids. `plan`/`status` never save, so this reset is only
+    // ever in memory for them.
+    if let Some(message) =
+        state.reset_stale_target(&profile.name, &backend_id, target.name.as_deref())
+    {
+        eprintln!("{message}");
+    }
     // Backends cannot read ownership tokens back yet (PR 3), so a resource's
     // observed state comes from local state's own record of the last apply
     // (D16's declared fallback), pruned against the live snapshot first
@@ -507,7 +517,13 @@ fn lint_command(
     repo_root: &Path,
     json: bool,
 ) -> Result<ExitCode> {
-    let state = LocalState::load(repo_root)?;
+    let mut state = LocalState::load(repo_root)?;
+    // D55 point 1: see the same reset in the `status`/`plan` path above.
+    if let Some(message) =
+        state.reset_stale_target(&profile.name, backend_id, target.name.as_deref())
+    {
+        eprintln!("{message}");
+    }
     let managed = state.profile(&profile.name).cloned().unwrap_or_default();
     let client = select::open(backend_id, target)?;
     // An unreachable backend leaves nothing pruned-in as live, the same
@@ -602,6 +618,12 @@ fn down_command(
     json: bool,
 ) -> Result<ExitCode> {
     let mut state = LocalState::load(repo_root)?;
+    // D55 point 1: see the same reset in the `status`/`plan` path above.
+    if let Some(message) =
+        state.reset_stale_target(&profile.name, backend_id, target.name.as_deref())
+    {
+        eprintln!("{message}");
+    }
     let client = select::open(backend_id, target)?;
     let ctx = ExecutionContext {
         repo_root,
@@ -611,7 +633,7 @@ fn down_command(
 
     let live_snapshot = client.snapshot();
     let session_unreachable = live_snapshot.is_err();
-    let mut pruned: Vec<String> = Vec::new();
+    let mut pruned: Vec<(String, PruneReason)> = Vec::new();
     if let Ok(live_snapshot) = &live_snapshot {
         let managed = state.profile(&profile.name).cloned().unwrap_or_default();
         let (pruned_profile, dropped) = crate::state::prune_missing(&managed, live_snapshot);
@@ -638,8 +660,8 @@ fn down_command(
             };
             println!("warning: {target_word} not reachable; detaching without closing panes");
         }
-        for id in &pruned {
-            println!("pruned {id} (not in session)");
+        for (id, reason) in &pruned {
+            println!("pruned {id} ({})", reason.detail());
         }
         for id in &report.detached {
             println!("detached {id}");
@@ -668,7 +690,7 @@ fn down_command(
             "hooks_run": report.hooks_run.iter().map(|(name, success)| {
                 serde_json::json!({"resource": name, "success": success})
             }).collect::<Vec<_>>(),
-            "pruned": pruned,
+            "pruned": pruned.iter().map(|(id, _)| id).collect::<Vec<_>>(),
             "close_failed": report.close_failed.iter().map(|(id, error)| {
                 serde_json::json!({"id": id, "error": error})
             }).collect::<Vec<_>>(),
@@ -743,6 +765,14 @@ fn up_command(
 ) -> Result<ExitCode> {
     let client = select::open(backend_id, target)?;
     let mut state = LocalState::load(repo_root)?;
+    // D55 point 1: a profile last saved against a different backend/session
+    // is treated as empty for this run before anything else reads it, so
+    // the prune below and every `state.profile(profile_arg)` after it see a
+    // fresh profile rather than another session's ids.
+    if let Some(message) = state.reset_stale_target(profile_arg, backend_id, target.name.as_deref())
+    {
+        eprintln!("{message}");
+    }
     // D48: probe the target once, up front. When it is already reachable,
     // prune local state against its live snapshot and save the pruned set
     // before anything is applied, so a resource whose backend id the
@@ -1193,7 +1223,7 @@ fn backend_socket_display(backend_id: &str, target: &select::Target) -> PathBuf 
 fn print_plan(
     plan: &Plan,
     json: bool,
-    pruned: Option<&[String]>,
+    pruned: Option<&[(String, PruneReason)]>,
     interrupted: Option<&[(&str, &str)]>,
     process_info_unavailable: Option<&[String]>,
 ) -> Result<()> {
@@ -1201,7 +1231,8 @@ fn print_plan(
         let mut value = serde_json::to_value(plan)?;
         if let Some(object) = value.as_object_mut() {
             if let Some(pruned) = pruned {
-                object.insert("pruned".into(), serde_json::json!(pruned));
+                let ids: Vec<&str> = pruned.iter().map(|(id, _)| id.as_str()).collect();
+                object.insert("pruned".into(), serde_json::json!(ids));
             }
             if let Some(interrupted) = interrupted {
                 let rows: Vec<_> = interrupted
@@ -1220,8 +1251,11 @@ fn print_plan(
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
-    for identity in pruned.unwrap_or_default() {
-        println!("recreate {identity}: backend id no longer exists; recreating");
+    for (identity, reason) in pruned.unwrap_or_default() {
+        println!(
+            "recreate {identity}: {}; recreating",
+            reason.recreate_detail()
+        );
     }
     // D52 point 4: a journal entry an earlier apply began but never finished
     // (a killed `run`/hook) is surfaced here instead of silently retried.

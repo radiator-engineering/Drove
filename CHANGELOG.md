@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Local state now checks a recorded resource's identity, not just whether
+  its backend id string still exists. A profile last saved against a
+  different backend/session is treated as empty for this run (`state
+  recorded for OLD; starting fresh for NEW`) instead of matching another
+  session's ids by coincidence. Within one session, a workspace or tab whose
+  live label no longer matches what Drove recorded, or a pane whose live
+  `cwd` no longer matches, is pruned and reported as `id reused` (instead of
+  `not in session`) and planned as a fresh create — Herdr restarting its id
+  counter no longer risks a rename or a close-and-recreate landing on an
+  unrelated live resource that happens to share the old id.
 - `drove up` now records ownership and saves state after each action
   succeeds, rather than only after the whole plan finishes, so a failure
   partway through no longer loses track of what already landed. A failed
