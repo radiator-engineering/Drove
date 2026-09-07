@@ -606,17 +606,20 @@ fn up_command(
 ) -> Result<ExitCode> {
     let client = select::open(backend_id, target)?;
     let mut state = LocalState::load(repo_root)?;
-    // D48: when the target is already reachable, prune local state against
-    // its live snapshot and save the pruned set before anything is applied,
-    // so a resource whose backend id the session no longer has (stopped and
-    // restarted, wiping Herdr's workspaces and id counter) is planned as a
-    // fresh create instead of trusted as already there. When the target
-    // isn't reachable yet (first start), there is nothing live to prune
-    // against; `up` below starts the session and applies against local
-    // state as recorded, unchanged from today.
-    if let Ok(live_snapshot) = client.snapshot() {
+    // D48: probe the target once, up front. When it is already reachable,
+    // prune local state against its live snapshot and save the pruned set
+    // before anything is applied, so a resource whose backend id the
+    // session no longer has (stopped and restarted, wiping Herdr's
+    // workspaces and id counter) is planned as a fresh create instead of
+    // trusted as already there. When the target isn't reachable yet (first
+    // start), there is nothing live to prune against; `up` below starts the
+    // session and applies against local state as recorded, unchanged from
+    // today. The same probe result is reused for the Radiator reachability
+    // check below, rather than reaching the backend a second time.
+    let live_snapshot = client.snapshot();
+    if let Ok(live_snapshot) = &live_snapshot {
         let managed = state.profile(profile_arg).cloned().unwrap_or_default();
-        let (pruned, dropped) = crate::state::prune_missing(&managed, &live_snapshot);
+        let (pruned, dropped) = crate::state::prune_missing(&managed, live_snapshot);
         if !dropped.is_empty() {
             state.profiles.insert(profile_arg.to_owned(), pruned);
             state.save()?;
@@ -641,7 +644,7 @@ fn up_command(
     let is_herdr = backend_id == select::HERDR_BACKEND;
     // A Radiator hub has no headless-start verb (D37): if it is unreachable,
     // fail with the hub name rather than applying against a dead socket.
-    if !is_herdr && client.snapshot().is_err() {
+    if !is_herdr && live_snapshot.is_err() {
         let hub = target.name.as_deref().unwrap_or(radiator::DEFAULT_HUB_NAME);
         if json {
             println!(
