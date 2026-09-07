@@ -82,7 +82,7 @@ monitoring: backend=herdr target=drove-mon reachable=false
 control = workspace("control", panes = [
     herdr.tab("coordinator", split = herdr.DOWN, ratios = [0.5], panes = [
         caller_pane("controller"),
-        pane("eventlog", serve = ["eventlog-view.sh", "-f"]),
+        pane("eventlog", serve = ["eventlog", "view", "--follow"]),
     ]),
     herdr.tab("monitor", panes = [pane("agentmon", serve = ["htop"])]),
 ])
@@ -118,7 +118,7 @@ pane(
 
 Readiness gates `after`: `output("watching")` matches pane output, `port(8080)` probes a TCP port, `cmd(["curl", "-f", "..."])` runs a command. The reconciler is planned to re-check readiness on every reconcile, not just at start; this PR only compiles readiness into the IR.
 
-`on_start` and `on_stop` are argv hooks Drove runs once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and (when known) `DROVE_BACKEND_ID` in the environment. `task()` hooks run around `run`: `on_start` fires once `run` has executed, whether or not it succeeded. Pane hooks fire once pane reconciliation against a live backend exists; today `on_start` on a pane is parsed and carried into the IR but not yet run, and `on_stop` on a pane runs only from `drove down`. Every hook argv is approval-gated the same way a task's `run` is (`drove run --yes` / `drove up --yes` / `drove down --yes` to approve on the spot).
+`on_start` and `on_stop` are argv hooks Drove runs once per actual start or stop, in the repository root, with `DROVE_RESOURCE` and (when known) `DROVE_BACKEND_ID` in the environment. `task()` hooks run around `run`: `on_start` fires once `run` has executed, whether or not it succeeded. A pane's `on_start` runs before Drove creates, splits, or restarts that pane, so the hook can act before the pane's `serve` command starts; on a restart, `DROVE_BACKEND_ID` is set. `on_stop` on a pane still runs only from `drove down`. A failed or unapproved pane `on_start` blocks that pane's own startup and every action that depends on it, and keeps its place in the plan so a rerun retries it. Every hook argv is approval-gated the same way a task's `run` is (`drove run --yes` / `drove up --yes` / `drove down --yes` to approve on the spot).
 
 ## Renaming without loss: `was`
 
@@ -145,6 +145,8 @@ When the backend holds a live resource whose ownership token equals `old-name` a
 Reordering panes within a tab, or changing its `split` direction, while keeping the same panes is also a `Conflict` — there is no verb to re-lay-out a tab in place, and silently reassigning ratios to the new order would apply them to the wrong physical pane. Adding or removing a pane still goes through the existing `RenameTab` + `SetRatio` pair.
 
 A `serve` pane is also checked against what the backend actually reports running, independent of whether anything in the Drovefile changed: if the live command doesn't match the declared `serve` argv (after trimming whitespace and unwrapping a `sh -c "..."`/`bash -c "..."`/`zsh -c "..."` wrapper), or nothing is running at all, `plan`/`status`/`up` reports `RestartCommand` with a reason starting `drifted: `.
+
+On the Herdr backend, applying `RestartCommand` never types into a pane that is still busy. It interrupts the pane's foreground job once (`ctrl+c`) and polls until the pane reports back to its own shell. Only then does it send the replacement command, in one atomic step. If the pane hasn't returned to a shell within 10 seconds, the old command keeps running and the apply fails with "did not return to its shell after interrupt; command not sent". If the pane's foreground process is a program running directly in place of a shell, the apply fails immediately with "cannot restart in place" instead of interrupting it. A restart needs a shell to return to, so `create_pane` and `create_tab` always open a pane with an interactive shell first, then type its `command`, if any, into that shell — rather than starting the pane with the command already in place.
 
 ## Agents
 

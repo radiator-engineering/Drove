@@ -1,0 +1,13 @@
+# Brief: audit-planner (read-only auditor, Sonnet)
+
+You were spawned by the Drove controller as a read-only auditor of `~/Development/Drove` (branch `main`, commit ca1a3e2). Do NOT edit, create, commit, push, or run anything that writes to the repo, the log, or any Herdr session; you may read files and run `cargo test`. Do not start subagents. Do not append to the log. Recent bugs #20, #22, #24, #25, #29 all had the shape "Drove trusted a recorded id or an assumption about the live Herdr session that was false at that moment, and aborted instead of reconciling". The user is tired of patching these one at a time and wants every remaining hole of that kind found in one pass. Prefer fewer confirmed findings over many guesses; read whole code paths, not grep hits. Write your report to the file named below, then end your turn with the single line `AUDIT DONE: <path>`.
+
+Report file: `.context/reports/audit-planner.md` (create the directory; this is the one write you may make).
+
+## Dimension: editing a Drovefile against a running session, and drift
+
+The user's words: "I am also finding it hard to update current layouts in place. how do I do that????" and "drove should have some way of checking this and fixing it, like ooops this isn't to spec, let's restart it with the correct command". Read the Starlark loader, model, `src/planner.rs`, `src/executor.rs`, `src/state.rs` and the planner and `tests/cli.rs` tests. Take a running layout and, for each edit, trace what `drove plan`/`up`/`status` does today: change a pane's command; change its cwd; add a pane to an existing tab; remove a pane; reorder panes; change split ratios; rename a tab; rename a workspace; add/remove a tab; add/remove a workspace; change `caller_pane`; change a task's argv (approval digest); change the session name; change `on_start`. For each: right action, unsafe action (destroying a pane running the user's agent), or nothing (silently in sync)? Is a pane's running command ever compared to the declared one? What does `status` say? Can the user force a pane to restart with the correct command today? Also check label adoption collisions (duplicate labels, user-renamed tabs, the D49 root tab) and how the planner treats resources it did not create.
+
+## Report shape
+
+(A) A table of the edit cases: edit, what happens today, correct?, evidence (file:line or test name). (B) Ranked list of at most 10 findings: title, file:line anchors, trigger, wrong behaviour, smallest fix, confidence. (C) Under 200 words: a design sketch for command drift, how Drove could detect a pane running something other than its declared command and restart it in place, given what the Herdr snapshot exposes (foreground_cwd, agent_status, and what it does not). (D) "Already fine".

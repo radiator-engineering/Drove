@@ -83,6 +83,12 @@ pub trait Backend {
 
     fn rename_pane(&self, id: &str, label: &str) -> Result<()>;
 
+    /// Starts a command in an already-created pane. Backends that do not
+    /// distinguish initial launch from restart can use their restart path.
+    fn start_command(&self, id: &str, argv: &[String]) -> Result<()> {
+        self.restart_command(id, argv)
+    }
+
     /// Restarts the command running in an existing pane in place (D22).
     fn restart_command(&self, id: &str, argv: &[String]) -> Result<()>;
 

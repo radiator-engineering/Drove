@@ -6,7 +6,8 @@ coordination facts, and points at bigger artifacts by path.
 
 ## Rules
 - **Single writer.** Only the controller/driver appends, and only via
-  `append-event.sh`. Workers report back; the controller records.
+  `eventlog append`. Sanctioned reactors use `eventlog append --as <identity>`.
+  Workers report back; the controller records.
 - **Append-only.** Lines are never edited or deleted. "The log up to event N"
   is exactly what the system knew at event N — that is what makes it replayable
   and auditable.
@@ -22,7 +23,7 @@ Every line has `seq` (monotonic), `ts` (UTC), `type`, plus type-specific fields:
 | `prompt`   | agent, ref                                        | a delegation packet was sent     |
 | `message`  | from, to, subject, ref                            | inter-agent routing              |
 | `drain`    | agent                                             | inbox/turn processed             |
-| `result`   | agent, ref, verdict                               | worker reported; artifact at ref |
+| `result`   | agent, ref, paths, summary, verdict                               | worker reported; artifact at ref |
 | `decision` | key, value, ref                                   | a choice others must follow      |
 | `escalate` | subject, ref                                      | queued for human approval        |
 | `approval` | subject, by, decision                             | human decided                    |
@@ -42,12 +43,13 @@ Any line the controller did not write carries `by=<agent>`; only writers named
 in a `decision key=log-writers` may set it. A reactor (a process that acts on
 events, e.g. a committer) resumes from its own `ack` lines, never a side file.
 
-Extend with new `type`s freely; keep fields flat and small.
+Use `eventlog vocab` for the installed vocabulary. Declare custom types and
+fields in `.context/eventlog.toml` before using them; keep fields flat and small.
 
 ## Read it
-    eventlog-view.sh -f                           # live, colored, aligned (for a pane)
+    eventlog view --follow                           # live, colored, aligned (for a pane)
     tail -f .context/events.jsonl                 # raw
     jq -c 'select(.type=="decision")' .context/events.jsonl
     jq -c 'select(.agent=="reviewer")' .context/events.jsonl
     jq -r 'select(.type=="claim") | "\(.agent)\t\(.paths)"' .context/events.jsonl   # who owns what
-    check-claims.sh reviewer feature/base            # did the worker stay inside its claim?
+    eventlog claims reviewer feature/base            # did the worker stay inside its claim?

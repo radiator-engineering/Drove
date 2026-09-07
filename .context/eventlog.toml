@@ -1,0 +1,15 @@
+[log]
+path = ".context/events.jsonl"
+fsync = false
+
+[view]
+columns = ["seq", "type", "agent", "summary", "ref"]
+
+[view.colors]
+result = "1;36"
+
+[keys]
+filter = "/"
+follow = "f"
+open = "o"
+panes = "tab"

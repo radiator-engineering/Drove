@@ -29,6 +29,8 @@ use crate::model::SplitDirection;
 /// How long [`HerdrExt::ensure_session`] waits for a just-started session's
 /// socket to answer `ping` before giving up (D43 step 2).
 const SESSION_START_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_START_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -329,21 +331,98 @@ impl HerdrClient {
 
     /// Types a command into an empty shell pane and submits it. `pane.split`
     /// has no `command` param (API report §"Command in pane vs starting a
-    /// pane with a command"); Herdr only accepts argv at pane creation via
-    /// `layout.apply`.
+    /// pane with a command"). Use Herdr's atomic `pane.send_input`, also used
+    /// by its `pane run` CLI, after shell creation or verified interruption.
     pub fn run_command(&self, pane_id: &str, command: &[String]) -> Result<()> {
+        self.run_command_after_shell_ready(pane_id, command, COMMAND_START_TIMEOUT)
+    }
+
+    fn run_command_after_shell_ready(
+        &self,
+        pane_id: &str,
+        command: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
         if command.is_empty() {
             return Ok(());
         }
+        let shell = self.wait_for_idle_shell(pane_id, timeout, BusyPanePolicy::WaitOnly)?;
+        self.run_command_in_shell(pane_id, &shell, command)
+    }
+
+    fn run_command_in_shell(&self, pane_id: &str, shell: &str, command: &[String]) -> Result<()> {
+        let text = shell_command_text(shell, command)?;
         self.request(
-            "pane.send_text",
-            json!({"pane_id": pane_id, "text": shell_join(command)}),
-        )?;
-        self.request(
-            "pane.send_keys",
-            json!({"pane_id": pane_id, "keys": ["Enter"]}),
+            "pane.send_input",
+            json!({"pane_id": pane_id, "text": text, "keys": ["Enter"]}),
         )?;
         Ok(())
+    }
+
+    /// Interrupt the existing foreground job and wait for the shell before
+    /// submitting a replacement. Typing into a running TUI is not a restart.
+    fn restart_pane_command(
+        &self,
+        pane_id: &str,
+        argv: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        if argv.is_empty() {
+            return Ok(());
+        }
+        let shell = self.wait_for_idle_shell(pane_id, timeout, BusyPanePolicy::InterruptOnce)?;
+        self.run_command_in_shell(pane_id, &shell, argv)
+    }
+
+    fn wait_for_idle_shell(
+        &self,
+        pane_id: &str,
+        timeout: Duration,
+        policy: BusyPanePolicy,
+    ) -> Result<String> {
+        let deadline = Instant::now() + timeout;
+        let mut interrupted = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let message = match policy {
+                    BusyPanePolicy::WaitOnly => {
+                        format!("pane {pane_id} did not become idle; command not sent")
+                    }
+                    BusyPanePolicy::InterruptOnce => {
+                        format!(
+                            "pane {pane_id} did not return to its shell after interrupt; command not sent"
+                        )
+                    }
+                };
+                bail!(message);
+            }
+            let result = self.request_with_timeout(
+                "pane.process_info",
+                json!({"pane_id": pane_id}),
+                Some(remaining),
+            )?;
+            let info: RawPaneProcessInfo = serde_json::from_value(
+                result
+                    .get("process_info")
+                    .cloned()
+                    .context("missing pane process info")?,
+            )?;
+            match idle_shell_name(pane_id, &info)? {
+                ShellReadiness::Idle(shell) => return Ok(shell),
+                ShellReadiness::Busy => {
+                    if policy == BusyPanePolicy::InterruptOnce && !interrupted {
+                        self.request_with_timeout(
+                            "pane.send_keys",
+                            json!({"pane_id": pane_id, "keys": ["ctrl+c"]}),
+                            Some(remaining),
+                        )?;
+                        interrupted = true;
+                    }
+                    thread::sleep(COMMAND_POLL_INTERVAL.min(remaining));
+                }
+            }
+        }
     }
 
     pub fn close_pane(&self, pane_id: &str) -> Result<()> {
@@ -431,15 +510,164 @@ fn is_pane_id(address: &str) -> bool {
 
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', r"'\''")))
+        .map(|arg| posix_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn shell_command_text(shell: &str, argv: &[String]) -> Result<String> {
+    match shell_syntax(shell)? {
+        ShellSyntax::Posix => Ok(shell_join(argv)),
+        ShellSyntax::PowerShell => Ok(powershell_command_text(argv)),
+        ShellSyntax::Cmd => Ok(format!(
+            "powershell.exe -NoProfile -EncodedCommand {}",
+            encoded_powershell_command(argv)
+        )),
+    }
+}
+
+fn posix_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+fn powershell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "''"))
+}
+
+fn powershell_command_text(argv: &[String]) -> String {
+    format!(
+        "& {}",
+        argv.iter()
+            .map(|arg| powershell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn encoded_powershell_command(argv: &[String]) -> String {
+    let script = powershell_command_text(argv);
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for code_unit in script.encode_utf16() {
+        bytes.extend_from_slice(&code_unit.to_le_bytes());
+    }
+    base64_encode(&bytes)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyPanePolicy {
+    WaitOnly,
+    InterruptOnce,
+}
+
+enum ShellReadiness {
+    Idle(String),
+    Busy,
+}
+
+fn idle_shell_name(pane_id: &str, info: &RawPaneProcessInfo) -> Result<ShellReadiness> {
+    let shell = info
+        .shell_pid
+        .context("cannot restart pane without a known shell pid")?;
+    if info
+        .foreground_process_group_id
+        .is_some_and(|pid| pid != shell)
+        || !info
+            .foreground_processes
+            .iter()
+            .all(|process| process.pid == shell)
+        || info.foreground_processes.is_empty()
+    {
+        return Ok(ShellReadiness::Busy);
+    }
+    let root = info
+        .foreground_processes
+        .iter()
+        .find(|process| process.pid == shell)
+        .context("cannot verify pane shell executable; command not sent")?;
+    let name = Path::new(&root.name)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(&root.name)
+        .trim_start_matches('-')
+        .to_owned();
+    let configured_shell = env::var("SHELL").ok().and_then(|shell| {
+        Path::new(&shell)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(str::to_owned)
+    });
+    if !is_known_shell(&name) && configured_shell.as_deref() != Some(name.as_str()) {
+        bail!(
+            "pane {pane_id} directly runs {name}, not a shell; cannot restart in place; command not sent"
+        );
+    }
+    Ok(ShellReadiness::Idle(name))
+}
+
+fn is_known_shell(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ksh"
+            | "nu"
+            | "elvish"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "pwsh.exe"
+            | "powershell.exe"
+            | "cmd.exe"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellSyntax {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+fn shell_syntax(shell: &str) -> Result<ShellSyntax> {
+    match shell.to_ascii_lowercase().as_str() {
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" => Ok(ShellSyntax::Posix),
+        "pwsh" | "powershell" | "pwsh.exe" | "powershell.exe" => Ok(ShellSyntax::PowerShell),
+        "cmd" | "cmd.exe" => Ok(ShellSyntax::Cmd),
+        other => bail!("shell {other} command launch is not supported yet; command not sent"),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawPaneProcessInfo {
     #[serde(default)]
     shell_pid: Option<u32>,
+    #[serde(default)]
+    foreground_process_group_id: Option<u32>,
     #[serde(default)]
     foreground_processes: Vec<RawPaneProcess>,
 }
@@ -453,8 +681,17 @@ struct RawPaneProcess {
 }
 
 impl RawPaneProcessInfo {
-    fn into_process_info(self) -> Option<ProcessInfo> {
-        if let Some(process) = self.foreground_processes.into_iter().next() {
+    fn into_process_info(mut self) -> Option<ProcessInfo> {
+        // Herdr may list a short-lived child before the actual foreground job.
+        // Prefer its process-group leader so e.g. lazygit's Git calls do not
+        // produce spurious command drift and destructive restarts.
+        let leader = self
+            .foreground_processes
+            .iter()
+            .position(|process| Some(process.pid) == self.foreground_process_group_id)
+            .unwrap_or(0);
+        if !self.foreground_processes.is_empty() {
+            let process = self.foreground_processes.remove(leader);
             let command = process.argv.unwrap_or_else(|| vec![process.name]);
             return Some(ProcessInfo {
                 command,
@@ -506,22 +743,24 @@ impl Backend for HerdrClient {
     /// Opens a pane with no placement by applying a single-pane layout to
     /// `workspace_id`, which Herdr places in the workspace's first tab
     /// (spec §3). A Herdr placement is applied afterwards through
-    /// [`HerdrExt`].
+    /// [`HerdrExt`]. Commands run in the resulting shell, matching split panes,
+    /// so a later restart can return to that shell without replacing the pane.
     fn create_pane(&self, workspace_id: &str, spec: &PaneSpec) -> Result<String> {
         let label = spec.label.as_deref().unwrap_or("pane");
         let mut leaf = json!({"type": "pane", "label": label});
-        if let Some(command) = &spec.command {
-            leaf["command"] = json!(command);
-        }
         if let Some(cwd) = &spec.cwd {
             leaf["cwd"] = json!(cwd);
         }
         let layout = HerdrClient::apply_layout(self, workspace_id, None, label, leaf)?;
-        layout
+        let pane_id = layout
             .pane_ids_preorder()
             .into_iter()
             .next()
-            .context("layout.apply for create_pane returned no pane")
+            .context("layout.apply for create_pane returned no pane")?;
+        if let Some(command) = &spec.command {
+            self.run_command(&pane_id, command)?;
+        }
+        Ok(pane_id)
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<()> {
@@ -532,8 +771,12 @@ impl Backend for HerdrClient {
         HerdrClient::rename_pane(self, pane_id, label)
     }
 
+    fn start_command(&self, pane_id: &str, argv: &[String]) -> Result<()> {
+        self.run_command(pane_id, argv)
+    }
+
     fn restart_command(&self, pane_id: &str, argv: &[String]) -> Result<()> {
-        HerdrClient::run_command(self, pane_id, argv)
+        self.restart_pane_command(pane_id, argv, Duration::from_secs(10))
     }
 
     fn prompt_agent(&self, pane_id: &str, prompt: &str) -> Result<()> {
@@ -564,7 +807,7 @@ impl Backend for HerdrClient {
 impl HerdrExt for HerdrClient {
     /// Builds a fresh tab holding every pane in `panes`. Herdr has no empty
     /// tab, so the first pane opens the tab (through `layout.apply`, which
-    /// honors the leaf's command and cwd) and each remaining pane is split in
+    /// honors the leaf's cwd) and each remaining pane is split in
     /// with [`HerdrExt::split_pane`]. Ratios address split gaps, so they are
     /// applied only after every gap exists — never against the one-pane tab,
     /// which has no gap to address (D6, D29).
@@ -582,9 +825,6 @@ impl HerdrExt for HerdrClient {
             .and_then(|spec| spec.label.clone())
             .unwrap_or_else(|| label.to_owned());
         let mut leaf = json!({"type": "pane", "label": first_label});
-        if let Some(command) = first.and_then(|spec| spec.command.as_ref()) {
-            leaf["command"] = json!(command);
-        }
         if let Some(cwd) = first.and_then(|spec| spec.cwd.as_ref()) {
             leaf["cwd"] = json!(cwd);
         }
@@ -596,6 +836,12 @@ impl HerdrExt for HerdrClient {
             HerdrClient::rename_tab(self, &tab_id, label)?;
         }
 
+        if let Some(command) = first.and_then(|spec| spec.command.as_ref()) {
+            let pane_id = pane_ids
+                .first()
+                .context("layout.apply for create_tab returned no pane")?;
+            self.run_command(pane_id, command)?;
+        }
         for spec in panes.iter().skip(1) {
             let pane_id = <Self as HerdrExt>::split_pane(self, &tab_id, spec, split)?;
             pane_ids.push(pane_id);
@@ -1083,6 +1329,89 @@ mod tests {
     }
 
     #[test]
+    fn powershell_command_text_uses_call_operator_and_doubled_quotes() {
+        let command = shell_command_text(
+            "pwsh.exe",
+            &[
+                "Write-Output".into(),
+                "it's ready".into(),
+                "$(Get-ChildItem)".into(),
+            ],
+        )
+        .expect("powershell command");
+        assert_eq!(command, "& 'Write-Output' 'it''s ready' '$(Get-ChildItem)'");
+    }
+
+    #[test]
+    fn fish_keeps_the_existing_single_quoted_command_path() {
+        let command = shell_command_text("fish", &["echo".into(), "it's ready".into()])
+            .expect("fish command");
+        assert_eq!(command, r"'echo' 'it'\''s ready'");
+    }
+
+    #[test]
+    fn cmd_command_text_wraps_an_encoded_powershell_command() {
+        let command = shell_command_text(
+            "cmd.exe",
+            &["echo".into(), "50% ready!".into(), "a&b".into()],
+        )
+        .expect("cmd command");
+        assert!(command.starts_with("powershell.exe -NoProfile -EncodedCommand "));
+        assert!(!command.contains("50% ready!"));
+        assert!(!command.contains("a&b"));
+        assert_eq!(
+            command,
+            format!(
+                "powershell.exe -NoProfile -EncodedCommand {}",
+                encoded_powershell_command(&["echo".into(), "50% ready!".into(), "a&b".into()])
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_encoded_command_preserves_argv_through_a_real_subprocess() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("capture.ps1");
+        let output = directory.path().join("argv.json");
+        fs::write(
+            &script,
+            r#"
+$out = $args[0]
+$captured = @($args | Select-Object -Skip 1)
+$captured | ConvertTo-Json -Compress | Set-Content -LiteralPath $out -NoNewline -Encoding utf8
+"#,
+        )
+        .expect("write script");
+        let expected = vec![
+            "space value".to_owned(),
+            "it's ready".to_owned(),
+            "%PATH%".to_owned(),
+            "!bang!".to_owned(),
+            "^caret&pipe|redir<>".to_owned(),
+            "`backtick".to_owned(),
+        ];
+        let mut argv = vec![
+            "powershell.exe".to_owned(),
+            "-NoProfile".to_owned(),
+            "-File".to_owned(),
+            script.display().to_string(),
+            output.display().to_string(),
+        ];
+        argv.extend(expected.clone());
+        let command = shell_command_text("cmd.exe", &argv).expect("cmd command");
+        let status = Command::new("cmd.exe")
+            .args(["/D", "/C", &command])
+            .status()
+            .expect("run cmd");
+        assert!(status.success());
+        let output = fs::read_to_string(output).expect("read captured argv");
+        let output = output.strip_prefix('\u{feff}').unwrap_or(&output);
+        let captured: Vec<String> = serde_json::from_str(output).expect("captured argv JSON");
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
     fn exchanges_one_ndjson_request_with_fake_server() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("herdr.sock");
@@ -1149,7 +1478,11 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).expect("request JSON");
                 let result = match request["method"].as_str().expect("method") {
                     "pane.split" => json!({"pane": {"pane_id": "w1:p3"}}),
-                    "pane.send_text" | "pane.send_keys" => json!({"type": "ok"}),
+                    "pane.process_info" => json!({
+                        "process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+                            "foreground_processes": [{"pid": 100, "name": "zsh"}]}
+                    }),
+                    "pane.send_input" => json!({"type": "ok"}),
                     other => panic!("unexpected method {other}"),
                 };
                 let response = json!({"id": request["id"], "result": result});
@@ -1175,10 +1508,11 @@ mod tests {
         assert_eq!(requests[0]["method"], "pane.split");
         assert_eq!(requests[0]["params"]["target_pane_id"], "w1:p1");
         assert_eq!(requests[0]["params"]["direction"], "down");
-        assert_eq!(requests[1]["method"], "pane.send_text");
+        assert_eq!(requests[1]["method"], "pane.process_info");
         assert_eq!(requests[1]["params"]["pane_id"], "w1:p3");
-        assert_eq!(requests[1]["params"]["text"], "'echo' 'hi there'");
-        assert_eq!(requests[2]["method"], "pane.send_keys");
+        assert_eq!(requests[2]["method"], "pane.send_input");
+        assert_eq!(requests[2]["params"]["pane_id"], "w1:p3");
+        assert_eq!(requests[2]["params"]["text"], "'echo' 'hi there'");
         assert_eq!(requests[2]["params"]["keys"], json!(["Enter"]));
     }
 
@@ -1226,7 +1560,7 @@ mod tests {
             let mut requests = Vec::new();
             // layout.apply, layout.export, pane.split, pane.rename,
             // layout.set_split_ratio.
-            for _ in 0..5 {
+            for _ in 0..7 {
                 let stream = listener.accept().expect("accept");
                 let mut stream = BufReader::new(stream);
                 let mut line = String::new();
@@ -1247,8 +1581,12 @@ mod tests {
                             "root": {"type": "pane", "pane_id": "w1:p2"},
                         }
                     }),
+                    "pane.process_info" => json!({
+                        "process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+                            "foreground_processes": [{"pid": 100, "name": "zsh"}]}
+                    }),
                     "pane.split" => json!({"pane": {"pane_id": "w1:p3"}}),
-                    "pane.rename" => json!({"type": "ok"}),
+                    "pane.send_input" | "pane.rename" => json!({"type": "ok"}),
                     "layout.set_split_ratio" => json!({"type": "layout_split_ratio_set"}),
                     other => panic!("unexpected method {other}"),
                 };
@@ -1263,6 +1601,7 @@ mod tests {
         let panes = [
             PaneSpec {
                 label: Some("editor".into()),
+                command: Some(vec!["eventlog".into(), "view".into()]),
                 ..PaneSpec::default()
             },
             PaneSpec {
@@ -1292,6 +1631,10 @@ mod tests {
         // The first pane opens the tab; its label is the leaf label.
         assert_eq!(methods[0], "layout.apply");
         assert_eq!(requests[0]["params"]["root"]["label"], "editor");
+        assert!(requests[0]["params"]["root"].get("command").is_none());
+        assert_eq!(methods[1], "pane.process_info");
+        assert_eq!(methods[2], "pane.send_input");
+        assert_eq!(requests[2]["params"]["text"], "'eventlog' 'view'");
         // The regression guard: the ratio is set only after the split that
         // creates the gap exists, never against the one-pane tab.
         let split_at = methods
@@ -1523,6 +1866,303 @@ mod tests {
         let request = server.join().expect("server thread");
         assert_eq!(request["method"], "workspace.report_metadata");
         assert_eq!(request["params"]["workspace_id"], "w1");
+    }
+
+    fn scripted_restart(
+        responses: Vec<(&'static str, Value)>,
+    ) -> (
+        tempfile::TempDir,
+        HerdrClient,
+        thread::JoinHandle<Vec<Value>>,
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("restart.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|(method, result)| {
+                    let stream = listener.accept().expect("accept");
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).expect("read");
+                    let request: Value = serde_json::from_str(&line).expect("request JSON");
+                    assert_eq!(request["method"], method);
+                    serde_json::to_writer(
+                        stream.get_mut(),
+                        &json!({"id": request["id"], "result": result}),
+                    )
+                    .expect("write");
+                    stream.get_mut().write_all(b"\n").expect("newline");
+                    request
+                })
+                .collect()
+        });
+        (directory, HerdrClient::new(path), server)
+    }
+
+    #[test]
+    fn restart_waits_for_the_shell_before_sending_a_replacement() {
+        let running = json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 200,
+            "foreground_processes": [{"pid": 200, "name": "eventlog"}]}});
+        let shell = json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+            "foreground_processes": [{"pid": 100, "name": "zsh"}]}});
+        let (_dir, client, server) = scripted_restart(vec![
+            ("pane.process_info", running.clone()),
+            ("pane.send_keys", json!({})),
+            ("pane.process_info", running),
+            ("pane.process_info", shell),
+            ("pane.send_input", json!({})),
+        ]);
+        client
+            .restart_pane_command(
+                "w1:p2",
+                &["echo".into(), "it's ready".into()],
+                Duration::from_secs(2),
+            )
+            .expect("restart");
+        let requests = server.join().expect("server");
+        assert_eq!(requests[1]["params"]["keys"], json!(["ctrl+c"]));
+        assert_eq!(requests[4]["params"]["text"], "'echo' 'it'\\''s ready'");
+        assert_eq!(requests[4]["params"]["keys"], json!(["Enter"]));
+    }
+
+    #[test]
+    fn initial_launch_waits_for_transient_startup_to_become_idle() {
+        let starting = json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 200,
+            "foreground_processes": [{"pid": 200, "name": "fnm"}]}});
+        let partial = json!({"process_info": {"shell_pid": 100}});
+        let shell = json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+            "foreground_processes": [{"pid": 100, "name": "-zsh"}]}});
+        let (_dir, client, server) = scripted_restart(vec![
+            ("pane.process_info", starting),
+            ("pane.process_info", partial),
+            ("pane.process_info", shell),
+            ("pane.send_input", json!({})),
+        ]);
+        client
+            .run_command_after_shell_ready(
+                "w1:p2",
+                &["eventlog".into(), "reactor".into()],
+                Duration::from_secs(2),
+            )
+            .expect("initial launch");
+        let requests = server.join().expect("server");
+        assert_eq!(requests[3]["params"]["text"], "'eventlog' 'reactor'");
+        assert!(
+            !requests.iter().any(|r| r["method"] == "pane.send_keys"),
+            "initial launch must not interrupt shell startup"
+        );
+    }
+
+    #[test]
+    fn initial_launch_times_out_without_interrupting_or_sending_input() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("busy-initial-launch.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let stop = request["method"] == "test.stop";
+                let result = if request["method"] == "pane.process_info" {
+                    json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 200,
+                        "foreground_processes": [{"pid": 200, "name": "fnm"}]}})
+                } else {
+                    json!({})
+                };
+                serde_json::to_writer(
+                    stream.get_mut(),
+                    &json!({"id": request["id"], "result": result}),
+                )
+                .expect("write");
+                stream.get_mut().write_all(b"\n").expect("newline");
+                requests.push(request);
+                if stop {
+                    break;
+                }
+            }
+            requests
+        });
+        let client = HerdrClient::new(path);
+        let result = client.run_command_after_shell_ready(
+            "w1:p2",
+            &["eventlog".into()],
+            Duration::from_millis(150),
+        );
+        client
+            .request("test.stop", json!({}))
+            .expect("stop fake server");
+        let requests = server.join().expect("server");
+        assert!(
+            result
+                .expect_err("busy startup must refuse launch")
+                .to_string()
+                .contains("command not sent")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["method"] == "pane.send_keys" || r["method"] == "pane.send_input")
+        );
+    }
+
+    #[test]
+    fn restart_times_out_without_sending_replacement_to_a_busy_pane() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("busy-restart.sock");
+        let listener = bind(&path).expect("bind fake Herdr");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let stream = listener.accept().expect("accept");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                let stop = request["method"] == "test.stop";
+                let result = if request["method"] == "pane.process_info" {
+                    json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 200,
+                        "foreground_processes": [{"pid": 200, "name": "stubborn"}]}})
+                } else {
+                    json!({})
+                };
+                serde_json::to_writer(
+                    stream.get_mut(),
+                    &json!({"id": request["id"], "result": result}),
+                )
+                .expect("write");
+                stream.get_mut().write_all(b"\n").expect("newline");
+                requests.push(request);
+                if stop {
+                    break;
+                }
+            }
+            requests
+        });
+        let client = HerdrClient::new(path);
+        let result = client.restart_pane_command(
+            "w1:p2",
+            &["replacement".into()],
+            Duration::from_millis(150),
+        );
+        client
+            .request("test.stop", json!({}))
+            .expect("stop fake server");
+        let requests = server.join().expect("server");
+        assert!(
+            result
+                .expect_err("busy pane must refuse replacement")
+                .to_string()
+                .contains("command not sent")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["method"] == "pane.send_input" || r["method"] == "pane.send_text")
+        );
+        let interrupts: Vec<_> = requests
+            .iter()
+            .filter(|r| r["method"] == "pane.send_keys")
+            .collect();
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0]["params"]["keys"], json!(["ctrl+c"]));
+    }
+
+    #[test]
+    fn restart_in_an_idle_shell_does_not_interrupt_it() {
+        let (_dir, client, server) = scripted_restart(vec![
+            (
+                "pane.process_info",
+                json!({"process_info": {"shell_pid": 100, "foreground_processes": [{"pid": 100, "name": "zsh"}]}}),
+            ),
+            ("pane.send_input", json!({})),
+        ]);
+        client
+            .restart_pane_command("w1:p2", &["echo".into()], Duration::from_secs(2))
+            .expect("restart");
+        assert_eq!(server.join().expect("server").len(), 2);
+    }
+
+    #[test]
+    fn restart_refuses_a_direct_program_reported_as_shell_pid() {
+        let (_dir, client, server) = scripted_restart(vec![(
+            "pane.process_info",
+            json!({
+                "process_info": {"shell_pid": 200, "foreground_process_group_id": 200,
+                    "foreground_processes": [{"pid": 200, "name": "eventlog"}]}
+            }),
+        )]);
+        let result = client.restart_pane_command("w1:p2", &["echo".into()], Duration::from_secs(2));
+        assert!(
+            result
+                .expect_err("not a shell")
+                .to_string()
+                .contains("cannot restart in place")
+        );
+        assert_eq!(server.join().expect("server").len(), 1);
+    }
+
+    #[test]
+    fn create_pane_keeps_a_shell_for_later_restarts() {
+        let (_dir, client, server) = scripted_restart(vec![
+            (
+                "layout.apply",
+                json!({"layout": {"workspace_id": "w1", "tab_id": "w1:t1",
+                "root": {"type": "pane", "pane_id": "w1:p2"}}}),
+            ),
+            (
+                "pane.process_info",
+                json!({"process_info": {"shell_pid": 100, "foreground_process_group_id": 100,
+                    "foreground_processes": [{"pid": 100, "name": "pwsh.exe"}]}}),
+            ),
+            ("pane.send_input", json!({})),
+        ]);
+        let pane = Backend::create_pane(
+            &client,
+            "w1",
+            &PaneSpec {
+                command: Some(vec!["eventlog".into(), "view".into()]),
+                ..PaneSpec::default()
+            },
+        )
+        .expect("create pane");
+        assert_eq!(pane, "w1:p2");
+        let requests = server.join().expect("server");
+        assert!(requests[0]["params"]["root"].get("command").is_none());
+        assert_eq!(requests[2]["params"]["text"], "& 'eventlog' 'view'");
+    }
+
+    #[test]
+    fn restart_with_unknown_shell_refuses_to_send_keys_or_command() {
+        let (_dir, client, server) = scripted_restart(vec![(
+            "pane.process_info",
+            json!({"process_info": {"foreground_processes": []}}),
+        )]);
+        let error = client
+            .restart_pane_command("w1:p2", &["echo".into()], Duration::from_secs(2))
+            .expect_err("unknown shell");
+        assert!(error.to_string().contains("known shell pid"));
+        assert_eq!(server.join().expect("server").len(), 1);
+    }
+
+    #[test]
+    fn process_info_prefers_group_leader_over_transient_child() {
+        let raw: super::RawPaneProcessInfo = serde_json::from_value(json!({
+            "shell_pid": 100, "foreground_process_group_id": 200,
+            "foreground_processes": [
+                {"pid": 300, "name": "git", "argv": ["git", "for-each-ref"]},
+                {"pid": 200, "name": "lazygit", "argv": ["lazygit"]},
+            ],
+        }))
+        .expect("raw process info");
+        let info = raw.into_process_info().expect("process info");
+        assert_eq!(info.pid, Some(200));
+        assert_eq!(info.command, vec!["lazygit".to_owned()]);
     }
 
     #[test]

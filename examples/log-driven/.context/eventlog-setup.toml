@@ -1,0 +1,22 @@
+# eventlog setup v2 -- created by `eventlog setup`; this is project-managed
+# policy. Upgrade preserves valid custom settings and rejects malformed TOML.
+version = 2
+
+[commit]
+identity = "cursor-committer"
+model = "composer-2.5-fast"
+command = ["python3", ".context/bin/model-command.py", "commit"]
+timeout = "600s"
+
+[docs]
+identity = "doc-worker"
+model = "sonnet"
+timeout = "600s"
+roots = ["docs", "README.md", "AGENTS.md"]
+# Replace this argv list with a project-local command. It is executed directly,
+# never through a shell, so spaces and special characters are data, not code.
+command = ["python3", ".context/bin/model-command.py", "docs"]
+
+[invocation]
+# Use this executable in arbitrary Drovefiles or other supervisors.
+eventlog = "eventlog"

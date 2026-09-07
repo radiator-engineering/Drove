@@ -72,6 +72,11 @@ pub struct Observed {
     /// `Some(info)` for a running command, `None` for an idle shell or a
     /// pane the backend lost.
     pub process_info: Option<Option<ProcessInfo>>,
+    /// Whether Drove successfully started this pane's declared command after
+    /// creating the physical pane. `Some(false)` means a previous apply saved
+    /// the pane id after a post-create launch failure, so matching content
+    /// digest alone is not enough to consider it converged.
+    pub command_started: Option<bool>,
 }
 
 /// The ownership tokens `drove_name` (the map key), `drove_profile` and
@@ -108,6 +113,7 @@ impl Snapshot {
                     digest: digest.to_owned(),
                 }),
                 process_info: None,
+                command_started: None,
             },
         );
         self
@@ -128,6 +134,7 @@ impl Snapshot {
                 parent: parent.map(str::to_owned),
                 owner: None,
                 process_info: None,
+                command_started: None,
             },
         );
         self
@@ -140,6 +147,13 @@ impl Snapshot {
     pub fn with_process_info(mut self, identity: &str, process_info: Option<ProcessInfo>) -> Self {
         if let Some(observed) = self.resources.get_mut(identity) {
             observed.process_info = Some(process_info);
+        }
+        self
+    }
+
+    pub fn with_command_started(mut self, identity: &str, started: bool) -> Self {
+        if let Some(observed) = self.resources.get_mut(identity) {
+            observed.command_started = Some(started);
         }
         self
     }
@@ -755,6 +769,18 @@ fn plan_pane(
                 let converged_by_digest =
                     owner.digest == resource.digest || is_legacy_digest(&owner.digest);
                 if converged_by_digest {
+                    if serves
+                        && let Some(observed) = observed
+                        && observed.command_started == Some(false)
+                    {
+                        push_restart_command(
+                            &id,
+                            Some(observed.backend_id.clone()),
+                            "command start pending".to_owned(),
+                            ranked,
+                        );
+                        return;
+                    }
                     // Converged by digest: still worth a look at what's
                     // actually running, for a serve pane (D54) — same as
                     // the non-adopted path in `plan_normal_pane`, which an
@@ -864,6 +890,15 @@ fn plan_normal_pane(
 
     let converged_by_digest = owner.digest == resource.digest || is_legacy_digest(&owner.digest);
     if converged_by_digest && observed.parent.as_deref() == resource.parent.as_deref() {
+        if serves && observed.command_started == Some(false) {
+            push_restart_command(
+                id,
+                Some(observed.backend_id.clone()),
+                "command start pending".to_owned(),
+                ranked,
+            );
+            return;
+        }
         // Converged by digest (or recorded under a pre-D53 digest this
         // planner can't diff by category, so it's given the benefit of the
         // doubt — see `is_legacy_digest`): still worth a look at what's
@@ -1053,7 +1088,10 @@ fn push_pane_content_change(
         } else {
             "pane label or configuration changed".into()
         };
-        push_rename_pane(id, backend_id, reason, ranked);
+        push_rename_pane(id, backend_id.clone(), reason, ranked);
+        if observed.command_started == Some(false) {
+            push_restart_command(id, backend_id, "command start pending".to_owned(), ranked);
+        }
         return;
     }
 
@@ -1538,6 +1576,25 @@ mod tests {
         let snapshot = converged_from(&old);
         let plan = build_plan(&new, &snapshot).expect("plan");
         assert_eq!(kinds(&plan), [Action::Core(CoreAction::RenamePane)]);
+    }
+
+    #[test]
+    fn changed_label_with_pending_command_start_renames_then_restarts_in_one_plan() {
+        let old = pane_profile(json!({"name": "review", "label": "old", "serve": [["serve"]]}));
+        let new = pane_profile(json!({"name": "review", "label": "new", "serve": [["serve"]]}));
+        let snapshot = converged_from(&old).with_command_started("review", false);
+        let plan = build_plan(&new, &snapshot).expect("plan");
+        assert_eq!(
+            kinds(&plan),
+            [
+                Action::Core(CoreAction::RenamePane),
+                Action::Core(CoreAction::RestartCommand)
+            ]
+        );
+        assert_eq!(
+            plan.actions[1].reason, "command start pending",
+            "pending command start must be fixed in the same up, not deferred"
+        );
     }
 
     // D53 migration: a pane, workspace, or group still recorded under a

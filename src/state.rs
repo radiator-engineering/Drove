@@ -289,6 +289,9 @@ impl ManagedProfile {
                 profile,
                 &resource.digest,
             );
+            if let Some(command_started) = resource.command_started {
+                snapshot = snapshot.with_command_started(identity, command_started);
+            }
         }
         snapshot
     }
@@ -520,6 +523,10 @@ pub struct ManagedResource {
     /// Set only for a pane declaring `adopt = "caller"` (D24).
     #[serde(default)]
     pub adopted: Option<bool>,
+    /// `Some(false)` for a pane whose physical resource was created and saved
+    /// but whose declared command did not start successfully yet.
+    #[serde(default)]
+    pub command_started: Option<bool>,
     /// The outcome of the most recent task run (`"ok"`, `"failed"`,
     /// `"skipped"`), reported by `drove run` with no task name. Unused for
     /// non-task resources.
@@ -615,6 +622,7 @@ mod tests {
             label: None,
             cwd: None,
             adopted: None,
+            command_started: None,
             last_outcome: None,
         }
     }
@@ -1220,6 +1228,7 @@ mod tests {
                 label: None,
                 cwd: None,
                 adopted: None,
+                command_started: None,
                 last_outcome: None,
             },
         );
