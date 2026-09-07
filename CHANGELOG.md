@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-07
+
 ### Added
 
 - `drove down` stops and deletes the Herdr session it targets, once the
@@ -72,5 +74,6 @@ the live state of a backend, and reconciles the difference.
 
 - Windows CI leg and working-directory digest portability.
 
-[Unreleased]: https://github.com/radiator-engineering/Drove/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/radiator-engineering/Drove/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/radiator-engineering/Drove/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/radiator-engineering/Drove/releases/tag/v0.1.0
