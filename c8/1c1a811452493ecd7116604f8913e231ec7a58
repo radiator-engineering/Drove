@@ -1,0 +1,56 @@
+src/planner.rs
+  s_e94bdc75c06cee::t_585e7f335e9e45 142,155
+  s_e94bdc75c06cee::t_9d882f3d941c8a 32
+  s_e94bdc75c06cee::t_d01d67d49a315b 493-525,528-546
+  s_e94bdc75c06cee::t_547bedba6b92f3 588,590-594,598-608,610-638
+  s_e94bdc75c06cee::t_77befb609e6815 526,595-597,830-835,874-879,942-943,945-947,2022-2030,2070-2085,2120-2135,2147-2162,2263-2266
+  s_e94bdc75c06cee::t_118316bbfdfb08 2069
+  s_e94bdc75c06cee::t_d87e5ea43c51f7 159,1856-2021,2031-2068,2086-2089,2091-2118,2136-2145,2163-2262,2267-2279
+  s_e94bdc75c06cee::t_12ad6a0d78ae47 687-690
+  s_e94bdc75c06cee::t_2df1d98500abfb 527,609,2090
+  s_e94bdc75c06cee::t_c05a1649c2d16a 2119,2146
+  s_e94bdc75c06cee::t_e3c483ec058b2e 67-74
+  s_e94bdc75c06cee::t_cfea54dc8b25ba 290-308
+  s_e94bdc75c06cee::t_440ec11c593a71 110,130,135-141,143-154,156-158
+  s_e94bdc75c06cee::t_55dadc01ceea6c 836-873,880-924,927-929,932-936,938-941,948-1014,1021-1024,1026-1030,1032-1069,1071
+  s_e94bdc75c06cee::t_73083992931a35 1015-1020,1025,1031
+  s_e94bdc75c06cee::t_f1b8d869005960 790-796,826
+  s_e94bdc75c06cee::t_9012ae99ef26f0 66
+  s_e94bdc75c06cee::t_d43210e35b7600 589
+src/ir.rs
+  s_e94bdc75c06cee::t_fa7cc14ff1275d 184-212
+  s_e94bdc75c06cee::t_b8b281068505c0 256-260,266-278
+  s_e94bdc75c06cee::t_e863254bb0fbf4 94-109,111-124
+src/cli.rs
+  s_e94bdc75c06cee::t_a2ead31d35d211 341-346
+  s_e94bdc75c06cee::t_d72daa1b139d29 695-700
+CHANGELOG.md
+  s_e94bdc75c06cee::t_f7caafdbb0874f 28-37
+tests/examples.rs
+  s_e94bdc75c06cee::t_d14e00230b327d 39-43,53,57,64,68,72,76,80,84,88
+  s_e94bdc75c06cee::t_b64518899ad01d 35-38,44-49
+tests/cli.rs
+  s_e94bdc75c06cee::t_4a0b346b758437 1526
+  s_e94bdc75c06cee::t_f5e287863f8fea 1331,1397-1525,1527-1593
+docs/drovefile.md
+  s_e94bdc75c06cee::t_df221d33e4e4cb 132-146
+  s_e94bdc75c06cee::t_ac35fd789b9165 218-219
+src/paths.rs
+  s_e94bdc75c06cee::t_71d3b8e2a384a2 119-126,147,151,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c81c1a811452493ecd7116604f8913e231ec7a58",
+  "prompts": {},
+  "sessions": {
+    "s_e94bdc75c06cee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ba795ae-8700-4ee8-83eb-6782b659456c",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+src/planner.rs
+  s_e94bdc75c06cee::t_cf63e17ae9fc8a 1472,1482-1493,1515-1516,1518,1595
+  s_e94bdc75c06cee::t_f95649c2d4e62d 1521-1544,1560-1584,1587-1588
+  s_9c53b9f663fd37::t_68e0d27d5084a9 290-304,306-310,507,514,536-537,601,609-610,704,806-813,954-957,1462-1465,1469-1471,1476-1481,1494,1512-1514,1517,1519-1520,1545-1559,1585-1586,1589-1594
+src/cli.rs
+  s_9c53b9f663fd37::t_739b47eb1a3cbd 20,655-687,716,720-730,793
+tests/cli.rs
+  s_9c53b9f663fd37::t_ff11868d09c094 1594-1646
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b86f8d1df0c40929fc979c93b7413492af28ac6f",
+  "prompts": {},
+  "sessions": {
+    "s_9c53b9f663fd37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "595170ec-924f-4801-9cbc-e36bbf2bf3f4",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    },
+    "s_e94bdc75c06cee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ba795ae-8700-4ee8-83eb-6782b659456c",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Jacob Martin <martinjaco@gmail.com>"
+    }
+  }
+}
