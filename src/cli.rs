@@ -1694,7 +1694,7 @@ profile("default", workspaces = [control])
             depends_on: "ops".into(),
         });
 
-        let object = up_summary_json(&profile, &report);
+        let object = up_summary_json(&profile, &report, false);
         assert_eq!(object["failed"][0]["action"], "ops");
         assert_eq!(object["failed"][0]["error"], "boom");
         assert_eq!(object["skipped"][0]["action"], "ops/main");
