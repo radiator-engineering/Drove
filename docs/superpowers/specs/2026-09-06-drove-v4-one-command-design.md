@@ -202,3 +202,15 @@ Option<&str>` parameter. Tests: a fake Herdr records that the first tab's
 tab's did not; a pre-existing workspace never gets the reuse; the
 `tests/herdr_contract.rs` fixture for `workspace.create` includes the
 root tab.
+
+## 9. Amendment: `down` never aborts on a resource the session already lost (D50)
+
+Issue #29. `executor::down` calls `close_pane` for every recorded pane when `--purge` is set, and the first `pane_not_found` aborts the teardown: nothing is detached, the state file keeps the stale ids, and the D47 session stop never runs. D48 prunes stale ids for `up`, `plan` and `status` only.
+
+**Decision D50.** `down` treats a resource the session no longer has as already torn down.
+
+1. In `down_command`, when the backend is Herdr and a live snapshot can be fetched, run the D48 `prune_missing` on the managed profile before calling `down`. Pruned resources are detached from state without any backend call and reported under `"pruned": [ids]` (same shape as D48's `up` report) and one line `pruned <id> (not in session)` per resource. If the snapshot cannot be fetched (session not running, socket gone), `down` proceeds without a backend, prints `warning: session not reachable; detaching without closing panes`, and D47 still runs its stop/delete.
+2. In `executor::down`, a `close_pane` error no longer aborts the loop. The resource is still detached and saved; the error is collected in `DownReport::close_failed: Vec<(id, message)>`, printed as `warning: could not close <id>: <message>`, and reported in JSON as `"close_failed": [{"id","error"}]`. The exit status stays 0: `down`'s contract is that Drove stops tracking the resource, and the D47 session delete removes whatever is left.
+3. Ordering stays: hooks, detach/close, save, then D47 session stop.
+
+Tests: unit test in `src/executor.rs` with a fake backend whose `close_pane` fails for one id, asserting every id is detached, state is saved, and the report carries the failure; end-to-end test in `tests/cli.rs` with a state file that records a pane the fake session lacks, asserting `drove down --purge` exits 0, prints the `pruned` line, and the state file is empty afterwards; one test with the session unreachable asserting the warning and the D47 stop still running.
